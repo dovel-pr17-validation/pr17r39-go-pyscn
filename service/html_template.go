@@ -1,0 +1,398 @@
+package service
+
+import (
+	"fmt"
+	"html"
+	"strings"
+	"time"
+)
+
+// HTMLTemplate provides a standard HTML template for all reports
+type HTMLTemplate struct {
+	Title       string
+	Subtitle    string
+	GeneratedAt time.Time
+	Version     string
+	Duration    int64
+	ScoreValue  int
+	ScoreGrade  string
+	ShowScore   bool
+}
+
+type trustedHTML string
+
+// GenerateHTMLHeader generates the standard HTML header with consistent styling
+func (t *HTMLTemplate) GenerateHTMLHeader() string {
+	var scoreHTML string
+	if t.ShowScore {
+		scoreGrade := EscapeHTML(t.ScoreGrade)
+		scoreGradeClass := SafeHTMLID(strings.ToLower(t.ScoreGrade))
+		scoreHTML = fmt.Sprintf(`
+        <div class="score-badge grade-%s">
+            Health Score: %d/100 (Grade: %s)
+        </div>`, scoreGradeClass, t.ScoreValue, scoreGrade)
+	}
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>%s</title>
+    <style>
+        :root {
+            --color-success: #15803d;
+            --color-warning: #a16207;
+            --color-danger:  #b91c1c;
+            --color-text:    #0f172a;
+            --color-muted:   #334155;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f1f5f9;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .header h1 {
+            color: var(--color-text);
+            margin-bottom: 10px;
+        }
+        .header p {
+            color: #666;
+            font-size: 14px;
+        }
+        .score-badge {
+            display: inline-block;
+            padding: 10px 20px;
+            border-radius: 50px;
+            font-size: 24px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .grade-a { background: #14532d; color: white; }
+        .grade-b { background: #365314; color: white; }
+        .grade-c { background: #713f12; color: white; }
+        .grade-d { background: #7c2d12; color: white; }
+        .grade-f { background: #7f1d1d; color: white; }
+
+        .tabs {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .tab-buttons {
+            display: flex;
+            background: #f5f5f5;
+        }
+        .tab-button {
+            flex: 1;
+            padding: 15px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        .tab-button:hover {
+            background: #e0e0e0;
+        }
+        .tab-button.active {
+            background: white;
+            color: var(--color-muted);
+            font-weight: bold;
+            border-bottom: 2px solid var(--color-muted);
+        }
+        .tab-content {
+            display: none;
+            padding: 30px;
+            background: white;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        
+        .content {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .metric-card {
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            border-left: 4px solid #cbd5e1;
+        }
+        .metric-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: var(--color-text);
+        }
+        .metric-label {
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .section {
+            margin: 30px 0;
+        }
+        .section-header {
+            font-size: 24px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e9ecef;
+        }
+        
+        .table {
+            width: 100%%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        .table th {
+            background: #f1f5f9;
+            color: var(--color-muted);
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .table td {
+            padding: 12px;
+            border-bottom: 1px solid #e9ecef;
+        }
+        .table tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status-success { background: #d4edda; color: #155724; }
+        .status-warning { background: #fff3cd; color: #856404; }
+        .status-danger { background: #f8d7da; color: #721c24; }
+        .status-info { background: #d1ecf1; color: #0c5460; }
+        
+        .footer {
+            margin-top: 40px;
+            padding: 20px;
+            text-align: center;
+            color: #94a3b8;
+            font-size: 14px;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container { padding: 10px; }
+            .header { padding: 20px; }
+            .tab-button { font-size: 14px; padding: 10px; }
+            .metric-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>%s</h1>
+            <p>%s</p>
+            <p>Generated: %s | Duration: %dms | Version: %s</p>%s
+        </div>`,
+		EscapeHTML(t.Title),
+		EscapeHTML(t.Title),
+		EscapeHTML(t.Subtitle),
+		t.GeneratedAt.Format("2006-01-02 15:04:05"),
+		t.Duration,
+		EscapeHTML(t.Version),
+		scoreHTML)
+}
+
+// GenerateTabsStart generates the start of a tabbed interface
+func GenerateTabsStart() string {
+	return `
+        <div class="tabs">
+            <div class="tab-buttons">`
+}
+
+// GenerateTabButton generates a tab button
+func GenerateTabButton(id, label string, active bool) string {
+	activeClass := ""
+	if active {
+		activeClass = " active"
+	}
+	safeID := SafeHTMLID(id)
+	return fmt.Sprintf(`
+                <button class="tab-button%s" onclick="showTab('%s', this)">%s</button>`,
+		activeClass, safeID, EscapeHTML(label))
+}
+
+// GenerateTabsMiddle generates the middle section between tab buttons and content
+func GenerateTabsMiddle() string {
+	return `
+            </div>`
+}
+
+// GenerateTabContent generates a tab content wrapper
+func GenerateTabContent(id string, active bool, content string) string {
+	activeClass := ""
+	if active {
+		activeClass = " active"
+	}
+	safeID := SafeHTMLID(id)
+	return fmt.Sprintf(`
+            <div id="%s" class="tab-content%s">
+                %s
+            </div>`, safeID, activeClass, content)
+}
+
+// GenerateTabsEnd generates the end of a tabbed interface
+func GenerateTabsEnd() string {
+	return `
+        </div>`
+}
+
+// GenerateSinglePageContent generates a single page content wrapper (no tabs)
+func GenerateSinglePageContent(content string) string {
+	return fmt.Sprintf(`
+        <div class="content">
+            %s
+        </div>`, content)
+}
+
+// GenerateTabScript generates the JavaScript for tab switching
+func GenerateTabScript() string {
+	return `
+    <script>
+        function showTab(tabId, el) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(function(tab){
+                tab.classList.remove('active');
+            });
+            // Deactivate all buttons
+            document.querySelectorAll('.tab-button').forEach(function(btn){
+                btn.classList.remove('active');
+            });
+            // Show selected tab and activate clicked button
+            var tab = document.getElementById(tabId);
+            if (tab) { tab.classList.add('active'); }
+            if (el && el.classList) { el.classList.add('active'); }
+        }
+    </script>`
+}
+
+// RepositoryURL is the canonical GitHub repository for pyscn. Reports and CLI
+// output link here so users who only ever run the tool can still find the project.
+const RepositoryURL = "https://github.com/ludo-technologies/pyscn"
+
+// GenerateStarLink renders the GitHub call-to-action shown in report footers.
+// It is a plain link rather than a remote badge image so reports stay
+// self-contained and do not phone home when opened.
+func GenerateStarLink() string {
+	return `<a href="` + RepositoryURL + `" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none;border-bottom:1px solid currentColor;opacity:0.85;">&#9733; Star pyscn on GitHub</a>`
+}
+
+// GenerateHTMLFooter generates the standard HTML footer
+func GenerateHTMLFooter() string {
+	return `
+        <div class="footer">
+            Generated by pyscn - Python Static Code Analyzer<br>
+            ` + GenerateStarLink() + `
+        </div>
+    </div>
+    </body>
+</html>`
+}
+
+// GenerateMetricCard generates a metric card HTML
+func GenerateMetricCard(value, label string) string {
+	return generateMetricCardHTML(trustedHTML(EscapeHTML(value)), label)
+}
+
+func generateMetricCardHTML(valueHTML trustedHTML, label string) string {
+	return fmt.Sprintf(`
+        <div class="metric-card">
+            <div class="metric-value">%s</div>
+            <div class="metric-label">%s</div>
+        </div>`, valueHTML, EscapeHTML(label))
+}
+
+// GenerateSectionHeader generates a section header
+func GenerateSectionHeader(title string) string {
+	return fmt.Sprintf(`
+        <h2 class="section-header">%s</h2>`, EscapeHTML(title))
+}
+
+// GenerateStatusBadge generates a status badge based on severity
+func GenerateStatusBadge(text, severity string) string {
+	class := "status-info"
+	switch strings.ToLower(severity) {
+	case "success", "good", "low":
+		class = "status-success"
+	case "warning", "medium":
+		class = "status-warning"
+	case "danger", "high", "critical":
+		class = "status-danger"
+	}
+	return fmt.Sprintf(`<span class="status-badge %s">%s</span>`, class, EscapeHTML(text))
+}
+
+func EscapeHTML(value string) string {
+	return html.EscapeString(value)
+}
+
+func SafeHTMLID(value string) string {
+	var builder strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' ||
+			r == '_' {
+			builder.WriteRune(r)
+			continue
+		}
+		builder.WriteByte('_')
+	}
+	if builder.Len() == 0 {
+		return "id"
+	}
+	return builder.String()
+}
+
+func EscapeHTMLSlice(values []string) []string {
+	escaped := make([]string, 0, len(values))
+	for _, value := range values {
+		escaped = append(escaped, EscapeHTML(value))
+	}
+	return escaped
+}
+
+func JoinEscapedHTML(values []string, separator string) string {
+	return strings.Join(EscapeHTMLSlice(values), separator)
+}

@@ -1,0 +1,321 @@
+package integration
+
+import (
+	"bytes"
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/ludo-technologies/pyscn/app"
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/service"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const fastapiLayersDir = "../testdata/python/fastapi_layers"
+const responsibilityAnalysisDir = "../testdata/python/responsibility_analysis"
+const hexagonalPortsDir = "../testdata/python/hexagonal_ports"
+const cleanLayersDir = "../testdata/python/clean_layers"
+const mvcAppDir = "../testdata/python/mvc_app"
+
+func newArchitectureUseCase() *app.SystemAnalysisUseCase {
+	return app.NewSystemAnalysisUseCase(
+		service.NewSystemAnalysisService(),
+		service.NewFileReader(),
+		service.NewSystemAnalysisFormatter(),
+		service.NewSystemAnalysisConfigurationLoader(),
+	)
+}
+
+func analyzeArchitecture(t *testing.T, dir string) *domain.ArchitectureAnalysisResult {
+	t.Helper()
+	uc := newArchitectureUseCase()
+	var buf bytes.Buffer
+	projectRoot, err := filepath.Abs(dir)
+	require.NoError(t, err)
+	result, err := uc.AnalyzeArchitectureOnly(context.Background(), domain.SystemAnalysisRequest{
+		Paths:        []string{dir},
+		ConfigPath:   dir,
+		ProjectRoot:  projectRoot,
+		OutputFormat: domain.OutputFormatJSON,
+		OutputWriter: &buf,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	return result
+}
+
+// TestArchitecture_TOMLConfigLoading verifies that layers and rules defined in
+// .pyscn.toml are correctly parsed and propagated to the analysis request.
+// Regression test for PR #356 (TOML layers/rules silently ignored).
+func TestArchitecture_TOMLConfigLoading(t *testing.T) {
+	configLoader := service.NewSystemAnalysisConfigurationLoader()
+	cfg, err := configLoader.LoadConfig(fastapiLayersDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ArchitectureRules)
+
+	// Verify layers
+	require.Len(t, cfg.ArchitectureRules.Layers, 3)
+
+	layersByName := make(map[string]domain.Layer)
+	for _, l := range cfg.ArchitectureRules.Layers {
+		layersByName[l.Name] = l
+	}
+
+	presentation := layersByName["presentation"]
+	assert.ElementsMatch(t, []string{"routers", "pages"}, presentation.Packages)
+
+	domainLayer := layersByName["domain"]
+	assert.ElementsMatch(t, []string{"domain"}, domainLayer.Packages)
+
+	infra := layersByName["infrastructure"]
+	assert.ElementsMatch(t, []string{"repositories"}, infra.Packages)
+
+	// Verify rules
+	require.Len(t, cfg.ArchitectureRules.Rules, 3)
+
+	rulesByFrom := make(map[string]domain.LayerRule)
+	for _, r := range cfg.ArchitectureRules.Rules {
+		rulesByFrom[r.From] = r
+	}
+
+	assert.ElementsMatch(t, []string{"presentation", "domain", "infrastructure"},
+		rulesByFrom["presentation"].Allow)
+	assert.ElementsMatch(t, []string{"domain"},
+		rulesByFrom["domain"].Allow)
+	assert.ElementsMatch(t, []string{"infrastructure", "domain"},
+		rulesByFrom["infrastructure"].Allow)
+}
+
+// TestArchitecture_LayerClassificationAndCoupling verifies that modules are
+// assigned to the correct layers and the dependency directions are as expected.
+// Regression test for discussion #352 (routers misclassified as "domain").
+func TestArchitecture_LayerClassificationAndCoupling(t *testing.T) {
+	result := analyzeArchitecture(t, fastapiLayersDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	coupling := result.LayerAnalysis.LayerCoupling
+
+	// presentation -> domain: routers and pages import domain models
+	require.Contains(t, coupling, "presentation")
+	assert.Contains(t, coupling["presentation"], "domain")
+
+	// presentation -> infrastructure: item_router imports item_repo
+	assert.Contains(t, coupling["presentation"], "infrastructure")
+
+	// infrastructure -> domain: repos import domain models
+	require.Contains(t, coupling, "infrastructure")
+	assert.Contains(t, coupling["infrastructure"], "domain")
+
+	// domain must NOT have cross-layer outgoing dependencies to presentation
+	// (except for the intentional violation fixture in domain/services/)
+	// The violation fixture adds domain -> presentation, so we check that
+	// it IS detected rather than asserting it doesn't exist.
+	if domainDeps, ok := coupling["domain"]; ok {
+		if _, hasPresentationDep := domainDeps["presentation"]; hasPresentationDep {
+			// This is expected due to domain/services/user_service.py importing pages
+			t.Logf("domain -> presentation coupling detected (expected from violation fixture)")
+		}
+	}
+}
+
+// TestArchitecture_ViolationDetection verifies that a domain -> presentation
+// dependency is flagged as a violation. The fixture domain/services/user_service.py
+// intentionally imports from the presentation layer.
+func TestArchitecture_ViolationDetection(t *testing.T) {
+	result := analyzeArchitecture(t, fastapiLayersDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	// There must be at least one violation: domain -> presentation
+	assert.Greater(t, result.TotalViolations, 0,
+		"should detect domain -> presentation violation")
+	assert.Less(t, result.ComplianceScore, 1.0,
+		"compliance should be less than 100%% with violations")
+
+	// Find the specific domain -> presentation violation
+	var found bool
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		if v.FromLayer == "domain" && v.ToLayer == "presentation" {
+			found = true
+			assert.Contains(t, v.FromModule, "user_service",
+				"violation should originate from domain/services/user_service")
+			t.Logf("violation detected: %s (%s) -> %s (%s)", v.FromModule, v.FromLayer, v.ToModule, v.ToLayer)
+			break
+		}
+	}
+	assert.True(t, found, "should find a domain -> presentation layer violation")
+}
+
+// TestArchitecture_AllowedDepsNotFlagged verifies that dependencies permitted by
+// the rules (presentation -> domain, presentation -> infrastructure,
+// infrastructure -> domain) are NOT flagged as violations.
+func TestArchitecture_AllowedDepsNotFlagged(t *testing.T) {
+	result := analyzeArchitecture(t, fastapiLayersDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		// presentation -> anything is allowed per config
+		if v.FromLayer == "presentation" {
+			t.Errorf("unexpected violation from presentation: %s (%s) -> %s (%s)",
+				v.FromModule, v.FromLayer, v.ToModule, v.ToLayer)
+		}
+		// infrastructure -> domain is allowed per config
+		if v.FromLayer == "infrastructure" && v.ToLayer == "domain" {
+			t.Errorf("unexpected violation: infrastructure -> domain: %s -> %s",
+				v.FromModule, v.ToModule)
+		}
+	}
+}
+
+// hasLayerViolation reports whether the result contains a violation with the
+// given from/to layers.
+func hasLayerViolation(result *domain.ArchitectureAnalysisResult, fromLayer, toLayer string) bool {
+	if result.LayerAnalysis == nil {
+		return false
+	}
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		if v.FromLayer == fromLayer && v.ToLayer == toLayer {
+			return true
+		}
+	}
+	return false
+}
+
+// TestArchitecture_HexagonalPreset verifies that selecting style = "hexagonal"
+// applies the preset rules and flags a domain -> adapters dependency as a
+// Dependency Inversion violation, while leaving allowed edges (ports -> domain,
+// adapters -> ports/domain) untouched.
+func TestArchitecture_HexagonalPreset(t *testing.T) {
+	// The style is loaded from the fixture's .pyscn.toml.
+	configLoader := service.NewSystemAnalysisConfigurationLoader()
+	cfg, err := configLoader.LoadConfig(hexagonalPortsDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ArchitectureRules)
+	assert.Equal(t, "hexagonal", cfg.ArchitectureRules.Style,
+		"style should be loaded from .pyscn.toml")
+
+	result := analyzeArchitecture(t, hexagonalPortsDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	assert.True(t, hasLayerViolation(result, "domain", "adapters"),
+		"domain -> adapters must be flagged by the hexagonal preset")
+
+	// Allowed edges must not be flagged.
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		if v.FromLayer == "ports" && v.ToLayer == "domain" {
+			t.Errorf("ports -> domain should be allowed, got violation: %s -> %s", v.FromModule, v.ToModule)
+		}
+		if v.FromLayer == "adapters" {
+			t.Errorf("adapters -> %s should be allowed, got violation: %s -> %s", v.ToLayer, v.FromModule, v.ToModule)
+		}
+	}
+}
+
+// TestArchitecture_CleanPreset verifies that selecting style = "clean" applies
+// the preset rules and flags an outward use_cases -> interface_adapters
+// dependency, while leaving inward dependencies untouched.
+func TestArchitecture_CleanPreset(t *testing.T) {
+	configLoader := service.NewSystemAnalysisConfigurationLoader()
+	cfg, err := configLoader.LoadConfig(cleanLayersDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ArchitectureRules)
+	assert.Equal(t, "clean", cfg.ArchitectureRules.Style)
+
+	result := analyzeArchitecture(t, cleanLayersDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	assert.True(t, hasLayerViolation(result, "use_cases", "interface_adapters"),
+		"use_cases -> interface_adapters must be flagged by the clean preset")
+
+	// Inward dependencies must not be flagged.
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		if v.FromLayer == "frameworks" {
+			t.Errorf("frameworks -> %s should be allowed, got violation: %s -> %s", v.ToLayer, v.FromModule, v.ToModule)
+		}
+		if v.FromLayer == "interface_adapters" && (v.ToLayer == "use_cases" || v.ToLayer == "entities") {
+			t.Errorf("interface_adapters -> %s should be allowed, got violation: %s -> %s", v.ToLayer, v.FromModule, v.ToModule)
+		}
+	}
+}
+
+// TestArchitecture_MVCPreset verifies that selecting style = "mvc" flags a
+// direct view -> model dependency as a warning (not an error), and leaves
+// controller-mediated dependencies untouched.
+func TestArchitecture_MVCPreset(t *testing.T) {
+	configLoader := service.NewSystemAnalysisConfigurationLoader()
+	cfg, err := configLoader.LoadConfig(mvcAppDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ArchitectureRules)
+	assert.Equal(t, "mvc", cfg.ArchitectureRules.Style)
+
+	result := analyzeArchitecture(t, mvcAppDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	var found bool
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		if v.FromLayer == "view" && v.ToLayer == "model" {
+			found = true
+			assert.Equal(t, domain.ViolationSeverityWarning, v.Severity,
+				"view -> model must be a warning, not an error")
+		}
+		// Controller depending on model/view is allowed.
+		if v.FromLayer == "controller" {
+			t.Errorf("controller -> %s should be allowed, got violation: %s -> %s", v.ToLayer, v.FromModule, v.ToModule)
+		}
+	}
+	assert.True(t, found, "should flag the direct view -> model dependency")
+}
+
+func TestArchitecture_ResponsibilityAnalysisEndToEnd(t *testing.T) {
+	result := analyzeArchitecture(t, responsibilityAnalysisDir)
+
+	require.NotNil(t, result.ResponsibilityAnalysis)
+	require.Len(t, result.ResponsibilityAnalysis.SRPViolations, 1)
+
+	violation := result.ResponsibilityAnalysis.SRPViolations[0]
+	assert.Equal(t, "app.core.hub", violation.Module)
+	assert.ElementsMatch(t, []string{"api", "auth", "billing", "db", "reporting"}, violation.Responsibilities)
+	assert.Contains(t, result.ResponsibilityAnalysis.OverloadedModules, "app.core.hub")
+
+	require.NotNil(t, result.CohesionAnalysis)
+	assert.Contains(t, result.Violations, domain.ArchitectureViolation{
+		Type:        domain.ViolationTypeResponsibility,
+		Severity:    domain.ViolationSeverityError,
+		Module:      "app.core.hub",
+		Rule:        "single-responsibility",
+		Description: "Module 'app.core.hub' mixes 5 dependency concerns with fan-in 5 and fan-out 5",
+		Suggestion:  "Split 'app.core.hub' by concern so each module owns one stable responsibility boundary",
+	})
+}
+
+// TestArchitecture_NeutralPrefixesLayerClassification verifies that the
+// neutral_prefixes config option strips prefixes from module names before
+// layer matching. The fastapi_layers test fixture has neutral_prefixes = ["app"],
+// so "app.routers.user_router" should be classified as "presentation".
+func TestArchitecture_NeutralPrefixesLayerClassification(t *testing.T) {
+	// Verify the config is loaded with neutral_prefixes
+	configLoader := service.NewSystemAnalysisConfigurationLoader()
+	cfg, err := configLoader.LoadConfig(fastapiLayersDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ArchitectureRules)
+	assert.Equal(t, []string{"app"}, cfg.ArchitectureRules.NeutralPrefixes,
+		"neutral_prefixes should be loaded from .pyscn.toml")
+
+	// Verify that layer classification works correctly with prefix stripping
+	result := analyzeArchitecture(t, fastapiLayersDir)
+	require.NotNil(t, result.LayerAnalysis)
+
+	// The coupling map should show the expected layer relationships.
+	// With neutral_prefixes = ["app"], "app.routers.*" -> presentation,
+	// "app.domain.*" -> domain, "app.repositories.*" -> infrastructure.
+	coupling := result.LayerAnalysis.LayerCoupling
+	require.Contains(t, coupling, "presentation",
+		"presentation layer should exist (modules like app.routers.* matched via prefix stripping)")
+
+	// Verify violations still use original module names (not stripped)
+	for _, v := range result.LayerAnalysis.LayerViolations {
+		assert.Contains(t, v.FromModule, "app.",
+			"violation module names should use original (unstripped) names")
+	}
+}

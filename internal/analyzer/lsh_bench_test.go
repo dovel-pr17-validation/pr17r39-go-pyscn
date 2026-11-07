@@ -1,0 +1,42 @@
+package analyzer
+
+import (
+	"testing"
+
+	corelsh "github.com/ludo-technologies/polyscan/core/lsh"
+)
+
+func BenchmarkMinHasher_Signature(b *testing.B) {
+	mh := corelsh.NewMinHasher(128)
+	feats := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		feats = append(feats, string(rune('a')+rune(i%26))+"_feat_"+string(rune('A')+rune(i%26)))
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = mh.ComputeSignature(feats)
+	}
+}
+
+func BenchmarkLSHIndex_Candidates(b *testing.B) {
+	mh := corelsh.NewMinHasher(128)
+	idx := newLSHCandidateIndex(32, 4, 0)
+	// build 1000 signatures with small random overlap
+	for i := 0; i < 1000; i++ {
+		feats := []string{}
+		for j := 0; j < 30; j++ {
+			feats = append(feats, string(rune('a')+rune((i+j)%26))+"/"+string(rune('A')+rune((i+2*j)%26)))
+		}
+		_ = idx.AddFragment(i, mh.ComputeSignature(feats))
+	}
+	// Query signature similar to mid entries
+	qfeats := []string{}
+	for j := 0; j < 30; j++ {
+		qfeats = append(qfeats, string(rune('a')+rune((500+j)%26))+"/"+string(rune('A')+rune((500+2*j)%26)))
+	}
+	qsig := mh.ComputeSignature(qfeats)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = idx.FindCandidates(qsig)
+	}
+}

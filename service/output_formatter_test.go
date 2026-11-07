@@ -1,0 +1,848 @@
+package service
+
+import (
+	"encoding/csv"
+	"encoding/json"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+)
+
+// Test data helpers for output formatting
+func createTestComplexityResponse() *domain.ComplexityResponse {
+	return &domain.ComplexityResponse{
+		Functions: []domain.FunctionComplexity{
+			{
+				Name:      "simple_function",
+				ScopeKind: domain.AnalysisScopeFunction,
+				FilePath:  "test.py",
+				Metrics: domain.ComplexityMetrics{
+					Complexity:        2,
+					SLOC:              6,
+					Nodes:             5,
+					Edges:             4,
+					IfStatements:      1,
+					LoopStatements:    0,
+					ExceptionHandlers: 0,
+				},
+				RiskLevel: domain.RiskLevelLow,
+			},
+			{
+				Name:      "complex_function",
+				ScopeKind: domain.AnalysisScopeFunction,
+				FilePath:  "test.py",
+				Metrics: domain.ComplexityMetrics{
+					Complexity:        8,
+					SLOC:              120,
+					Nodes:             20,
+					Edges:             18,
+					IfStatements:      3,
+					LoopStatements:    2,
+					ExceptionHandlers: 1,
+				},
+				RiskLevel: domain.RiskLevelHigh,
+			},
+		},
+		ByDirectory: []domain.DirectoryComplexityMetrics{
+			{
+				DirectoryPath:         ".",
+				FunctionCount:         2,
+				AverageComplexity:     5,
+				MaxComplexity:         8,
+				HighRiskFunctionCount: 1,
+				AverageNestingDepth:   1.5,
+				MaxNestingDepth:       2,
+			},
+		},
+		Summary: domain.ComplexitySummary{
+			TotalFunctions:      2,
+			FunctionsParsed:     2,
+			AverageComplexity:   5.0,
+			MaxComplexity:       8,
+			MinComplexity:       2,
+			FilesAnalyzed:       1,
+			LowRiskFunctions:    1,
+			MediumRiskFunctions: 0,
+			HighRiskFunctions:   1,
+		},
+		RawMetrics: []domain.RawMetrics{
+			{
+				FilePath:       "test.py",
+				SLOC:           10,
+				LLOC:           8,
+				CommentLines:   2,
+				DocstringLines: 1,
+				BlankLines:     3,
+				TotalLines:     16,
+				CommentRatio:   2.0 / 12.0,
+			},
+		},
+		RawMetricsSummary: &domain.RawMetricsSummary{
+			FilesAnalyzed:  1,
+			SLOC:           10,
+			LLOC:           8,
+			CommentLines:   2,
+			DocstringLines: 1,
+			BlankLines:     3,
+			TotalLines:     16,
+			CommentRatio:   2.0 / 12.0,
+		},
+		Warnings: []string{
+			"Warning: High complexity detected in complex_function",
+		},
+		Errors: []string{
+			"Error: Could not parse some_file.py",
+		},
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Version:     "1.0.0",
+		Config: map[string]interface{}{
+			"min_complexity": 1,
+			"max_complexity": 20,
+		},
+		Request: &domain.ComplexityRequest{SortBy: domain.SortByComplexity},
+	}
+}
+
+func createMinimalComplexityResponse() *domain.ComplexityResponse {
+	return &domain.ComplexityResponse{
+		Functions: []domain.FunctionComplexity{},
+		Summary: domain.ComplexitySummary{
+			TotalFunctions:      0,
+			AverageComplexity:   0.0,
+			MaxComplexity:       0,
+			MinComplexity:       0,
+			FilesAnalyzed:       0,
+			LowRiskFunctions:    0,
+			MediumRiskFunctions: 0,
+			HighRiskFunctions:   0,
+		},
+		Warnings:    []string{},
+		Errors:      []string{},
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Version:     "1.0.0",
+		Config:      map[string]interface{}{},
+		Request:     &domain.ComplexityRequest{SortBy: domain.SortByComplexity},
+	}
+}
+
+func createClassScopeComplexityResponse() *domain.ComplexityResponse {
+	response := createTestComplexityResponse()
+	response.ClassScopes = []domain.FunctionComplexity{{
+		Name:      "Config",
+		ScopeKind: domain.AnalysisScopeClass,
+		FilePath:  "test.py",
+		StartLine: 20,
+		Metrics: domain.ComplexityMetrics{
+			Complexity: 4,
+		},
+		RiskLevel: domain.RiskLevelLow,
+	}}
+	response.Summary.TotalClassScopes = 1
+	return response
+}
+
+func TestOutputFormatterPublishesClassScopesAdditively(t *testing.T) {
+	formatter := NewOutputFormatter()
+	response := createClassScopeComplexityResponse()
+
+	for _, format := range []domain.OutputFormat{domain.OutputFormatJSON, domain.OutputFormatYAML} {
+		t.Run(string(format), func(t *testing.T) {
+			output, err := formatter.Format(response, format)
+			require.NoError(t, err)
+
+			var payload map[string]interface{}
+			if format == domain.OutputFormatJSON {
+				require.NoError(t, json.Unmarshal([]byte(output), &payload))
+			} else {
+				require.NoError(t, yaml.Unmarshal([]byte(output), &payload))
+			}
+
+			assert.Len(t, payload["results"], 2, "the established function collection must stay unchanged")
+			classScopes, ok := payload["class_scopes"].([]interface{})
+			require.True(t, ok)
+			require.Len(t, classScopes, 1)
+			assert.Equal(t, "class", classScopes[0].(map[string]interface{})["scope_kind"])
+			summary := payload["summary"].(map[string]interface{})
+			assert.EqualValues(t, 2, summary["total_functions"])
+			assert.EqualValues(t, 1, summary["total_class_scopes"])
+		})
+	}
+
+	textOutput, err := formatter.Format(response, domain.OutputFormatText)
+	require.NoError(t, err)
+	assert.Contains(t, textOutput, "CLASS SCOPE DETAILS")
+	assert.Contains(t, textOutput, "Config (class)")
+
+	htmlOutput, err := formatter.Format(response, domain.OutputFormatHTML)
+	require.NoError(t, err)
+	assert.Contains(t, htmlOutput, "Class Scope Details")
+	assert.Contains(t, htmlOutput, ">class<")
+
+	csvOutput, err := formatter.Format(response, domain.OutputFormatCSV)
+	require.NoError(t, err)
+	records, err := csv.NewReader(strings.NewReader(csvOutput)).ReadAll()
+	require.NoError(t, err)
+	assert.Len(t, records, 4)
+	assert.Equal(t, []string{"complex_function", "Config", "simple_function"}, []string{records[1][0], records[2][0], records[3][0]})
+	assert.Equal(t, "class", records[2][11])
+}
+
+func TestOutputFormatterTextPreservesScopeRiskLevels(t *testing.T) {
+	response := createClassScopeComplexityResponse()
+	response.Functions[1].RiskLevel = domain.RiskLevelHigh
+	response.ClassScopes[0].RiskLevel = domain.RiskLevelMedium
+
+	output, err := NewOutputFormatter().Format(response, domain.OutputFormatText)
+	require.NoError(t, err)
+	assert.Contains(t, output, ColorRed+string(RiskHigh)+ColorReset)
+	assert.Contains(t, output, ColorYellow+string(RiskMedium)+ColorReset)
+}
+
+func TestOutputFormatterHTMLResolvesLegacyScopeKind(t *testing.T) {
+	response := createTestComplexityResponse()
+	response.Functions[0].ScopeKind = domain.AnalysisScopeUnknown
+	output, err := NewOutputFormatter().Format(response, domain.OutputFormatHTML)
+	require.NoError(t, err)
+	assert.Contains(t, output, ">function<")
+}
+
+// TestOutputFormatter_Format tests the main Format method with different formats
+func TestOutputFormatter_Format(t *testing.T) {
+	tests := []struct {
+		name           string
+		response       *domain.ComplexityResponse
+		format         domain.OutputFormat
+		validateOutput func(t *testing.T, output string)
+		expectError    bool
+		errorMsg       string
+	}{
+		{
+			name:     "format as JSON",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatJSON,
+			validateOutput: func(t *testing.T, output string) {
+				// Verify valid JSON structure
+				var result map[string]interface{}
+				err := json.Unmarshal([]byte(output), &result)
+				assert.NoError(t, err, "Output should be valid JSON")
+
+				// Check for expected fields in actual JSON structure
+				assert.Contains(t, result, "results") // functions are in "results"
+				assert.Contains(t, result, "summary")
+				assert.Contains(t, result, "metadata") // contains generated_at and version
+				assert.Contains(t, result, "raw_metrics")
+				assert.Contains(t, result, "raw_metrics_summary")
+				assert.Contains(t, result, "by_directory")
+
+				// Verify results array (contains functions)
+				functions, ok := result["results"].([]interface{})
+				assert.True(t, ok)
+				assert.Len(t, functions, 2)
+
+				// Check first function structure
+				if len(functions) > 0 {
+					function := functions[0].(map[string]interface{})
+					assert.Contains(t, function, "function_name")
+					assert.Equal(t, "function", function["scope_kind"])
+					assert.Contains(t, function, "complexity")
+					assert.Contains(t, function, "risk_level")
+				}
+
+				// Verify metadata contains expected fields
+				metadata, ok := result["metadata"].(map[string]interface{})
+				assert.True(t, ok)
+				assert.Contains(t, metadata, "generated_at")
+				assert.Contains(t, metadata, "version")
+
+				rawMetrics, ok := result["raw_metrics"].([]interface{})
+				assert.True(t, ok)
+				assert.Len(t, rawMetrics, 1)
+
+				directories, ok := result["by_directory"].([]interface{})
+				require.True(t, ok)
+				require.Len(t, directories, 1)
+				directory := directories[0].(map[string]interface{})
+				assert.Equal(t, ".", directory["directory_path"])
+				assert.Equal(t, float64(2), directory["function_count"])
+				assert.Equal(t, 1.5, directory["average_nesting_depth"])
+			},
+			expectError: false,
+		},
+		{
+			name:     "format empty directory collection as JSON",
+			response: &domain.ComplexityResponse{},
+			format:   domain.OutputFormatJSON,
+			validateOutput: func(t *testing.T, output string) {
+				var result map[string]interface{}
+				require.NoError(t, json.Unmarshal([]byte(output), &result))
+				directories, ok := result["by_directory"].([]interface{})
+				require.True(t, ok)
+				assert.Empty(t, directories)
+			},
+			expectError: false,
+		},
+		{
+			name:     "format as CSV",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatCSV,
+			validateOutput: func(t *testing.T, output string) {
+				// Verify CSV structure
+				reader := csv.NewReader(strings.NewReader(output))
+				records, err := reader.ReadAll()
+				assert.NoError(t, err, "Output should be valid CSV")
+
+				assert.Len(t, records, 3, "Should have header plus 2 function rows")
+
+				// Check header
+				expectedHeaders := []string{"Function", "Complexity", "Cognitive Complexity", "Risk", "Nodes", "Edges", "Nesting Depth", "If Statements", "Loop Statements", "Exception Handlers", "SLOC", "Scope Kind"}
+				assert.Equal(t, expectedHeaders, records[0])
+
+				// Rows follow the requested sort across every execution-scope kind.
+				assert.Equal(t, "complex_function", records[1][0])
+				assert.Equal(t, "8", records[1][1])
+				assert.Equal(t, "0", records[1][2]) // Cognitive Complexity
+				assert.Equal(t, "high", records[1][3])
+
+				// Check second data row
+				assert.Equal(t, "simple_function", records[2][0])
+				assert.Equal(t, "2", records[2][1])
+				assert.Equal(t, "0", records[2][2]) // Cognitive Complexity
+				assert.Equal(t, "low", records[2][3])
+			},
+			expectError: false,
+		},
+		{
+			name:     "format as YAML",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatYAML,
+			validateOutput: func(t *testing.T, output string) {
+				// Verify valid YAML structure
+				var result map[string]interface{}
+				err := yaml.Unmarshal([]byte(output), &result)
+				assert.NoError(t, err, "Output should be valid YAML")
+
+				// Check for expected fields in actual YAML structure
+				assert.Contains(t, result, "results") // functions are in "results"
+				assert.Contains(t, result, "summary")
+				assert.Contains(t, result, "metadata") // contains generated_at and version
+				assert.Contains(t, result, "raw_metrics")
+				assert.Contains(t, result, "raw_metrics_summary")
+				assert.Contains(t, result, "by_directory")
+
+				// Verify results array (contains functions)
+				functions, ok := result["results"].([]interface{})
+				assert.True(t, ok)
+				assert.Len(t, functions, 2)
+
+				// Verify metadata contains expected fields
+				metadata, ok := result["metadata"].(map[string]interface{})
+				assert.True(t, ok)
+				assert.Contains(t, metadata, "generated_at")
+				assert.Contains(t, metadata, "version")
+
+				rawMetrics, ok := result["raw_metrics"].([]interface{})
+				assert.True(t, ok)
+				assert.Len(t, rawMetrics, 1)
+
+				directories, ok := result["by_directory"].([]interface{})
+				require.True(t, ok)
+				require.Len(t, directories, 1)
+				directory := directories[0].(map[string]interface{})
+				assert.Equal(t, ".", directory["directory_path"])
+				assert.Equal(t, 2, directory["function_count"])
+				assert.Equal(t, 1.5, directory["average_nesting_depth"])
+			},
+			expectError: false,
+		},
+		{
+			name:     "format as text",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatText,
+			validateOutput: func(t *testing.T, output string) {
+				// Verify text format contains expected sections
+				assert.Contains(t, output, "Complexity Analysis Report")
+				assert.Contains(t, output, "SUMMARY")
+				assert.Contains(t, output, "Total Functions: 2")
+				assert.Contains(t, output, "Average Complexity: 5.0")
+				assert.Contains(t, output, "RISK DISTRIBUTION")
+				assert.Contains(t, output, "High: 1")
+				assert.Contains(t, output, "Low: 1")
+				assert.Contains(t, output, "DIRECTORY COMPLEXITY")
+				assert.Contains(t, output, "Functions: 2")
+				assert.Contains(t, output, "Nesting: avg 1.50, max 2")
+				assert.Contains(t, output, "RAW CODE METRICS")
+				assert.Contains(t, output, "SLOC: 10")
+				assert.Contains(t, output, "Comment Ratio: 16.7%")
+				assert.Contains(t, output, "FUNCTION DETAILS")
+				assert.Contains(t, output, "simple_function")
+				assert.Contains(t, output, "complex_function")
+				assert.Contains(t, output, "WARNINGS")
+				assert.Contains(t, output, "High complexity detected")
+				assert.Contains(t, output, "ERRORS")
+				assert.Contains(t, output, "Could not parse some_file.py")
+				assert.Contains(t, output, "Generated at:")
+			},
+			expectError: false,
+		},
+		{
+			name:     "empty response JSON",
+			response: createMinimalComplexityResponse(),
+			format:   domain.OutputFormatJSON,
+			validateOutput: func(t *testing.T, output string) {
+				var result map[string]interface{}
+				err := json.Unmarshal([]byte(output), &result)
+				assert.NoError(t, err)
+
+				// Should have empty arrays but valid structure
+				functions := result["results"].([]interface{})
+				assert.Len(t, functions, 0)
+
+				summary := result["summary"].(map[string]interface{})
+				assert.Equal(t, float64(0), summary["total_functions"])
+			},
+			expectError: false,
+		},
+		{
+			name:     "empty response CSV",
+			response: createMinimalComplexityResponse(),
+			format:   domain.OutputFormatCSV,
+			validateOutput: func(t *testing.T, output string) {
+				reader := csv.NewReader(strings.NewReader(output))
+				records, err := reader.ReadAll()
+				assert.NoError(t, err)
+
+				// Should have only header row
+				assert.Len(t, records, 1, "Should have only header row")
+			},
+			expectError: false,
+		},
+		{
+			name:     "format as HTML",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatHTML,
+			validateOutput: func(t *testing.T, output string) {
+				// Verify HTML structure
+				assert.Contains(t, output, "<!DOCTYPE html>", "Should contain HTML doctype")
+				assert.Contains(t, output, "<title>", "Should contain title tag")
+				assert.Contains(t, output, "pyscn Code Quality Report", "Should contain report title")
+				assert.Contains(t, output, "Overall Score", "Should contain overall score")
+				assert.Contains(t, output, "<style>", "Should contain embedded CSS")
+				assert.Contains(t, output, "Complexity Score", "Should contain complexity score")
+
+				// Check for Lighthouse-style elements
+				assert.Contains(t, output, "score-circle", "Should have score circle element")
+				assert.Contains(t, output, "score-gauge", "Should have score gauge element")
+			},
+			expectError: false,
+		},
+		{
+			name:        "unsupported format error",
+			response:    createTestComplexityResponse(),
+			format:      domain.OutputFormat("invalid"),
+			expectError: true,
+			errorMsg:    "unsupported format",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			formatter := NewOutputFormatter()
+
+			output, err := formatter.Format(tt.response, tt.format)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+				assert.NotEmpty(t, output)
+
+				if tt.validateOutput != nil {
+					tt.validateOutput(t, output)
+				}
+			}
+		})
+	}
+}
+
+// TestOutputFormatter_Write tests writing formatted output to different writers
+func TestOutputFormatter_Write(t *testing.T) {
+	tests := []struct {
+		name           string
+		response       *domain.ComplexityResponse
+		format         domain.OutputFormat
+		writer         io.Writer
+		expectError    bool
+		errorMsg       string
+		validateWriter func(t *testing.T, writer *strings.Builder)
+	}{
+		{
+			name:     "write JSON to string builder",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatJSON,
+			writer:   &strings.Builder{},
+			validateWriter: func(t *testing.T, writer *strings.Builder) {
+				output := writer.String()
+				assert.NotEmpty(t, output)
+
+				// Verify it's valid JSON
+				var result map[string]interface{}
+				err := json.Unmarshal([]byte(output), &result)
+				assert.NoError(t, err)
+			},
+			expectError: false,
+		},
+		{
+			name:     "write text format to string builder",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatText,
+			writer:   &strings.Builder{},
+			validateWriter: func(t *testing.T, writer *strings.Builder) {
+				output := writer.String()
+				assert.Contains(t, output, "Complexity Analysis Report")
+				assert.Contains(t, output, "Total Functions: 2")
+			},
+			expectError: false,
+		},
+		{
+			name:     "write CSV to string builder",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatCSV,
+			writer:   &strings.Builder{},
+			validateWriter: func(t *testing.T, writer *strings.Builder) {
+				output := writer.String()
+				assert.Contains(t, output, "Function,Complexity,Cognitive Complexity,Risk")
+				assert.Contains(t, output, "simple_function")
+				assert.Contains(t, output, "complex_function")
+			},
+			expectError: false,
+		},
+		{
+			name:     "write YAML to string builder",
+			response: createTestComplexityResponse(),
+			format:   domain.OutputFormatYAML,
+			writer:   &strings.Builder{},
+			validateWriter: func(t *testing.T, writer *strings.Builder) {
+				output := writer.String()
+				assert.Contains(t, output, "results:")
+				assert.Contains(t, output, "summary:")
+				assert.Contains(t, output, "raw_metrics:")
+
+				// Verify it's valid YAML
+				var result map[string]interface{}
+				err := yaml.Unmarshal([]byte(output), &result)
+				assert.NoError(t, err)
+			},
+			expectError: false,
+		},
+		{
+			name:        "write with unsupported format",
+			response:    createTestComplexityResponse(),
+			format:      domain.OutputFormat("invalid"),
+			writer:      &strings.Builder{},
+			expectError: true,
+			errorMsg:    "unsupported format",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			formatter := NewOutputFormatter()
+
+			err := formatter.Write(tt.response, tt.format, tt.writer)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+
+				if tt.validateWriter != nil {
+					if builder, ok := tt.writer.(*strings.Builder); ok {
+						tt.validateWriter(t, builder)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestOutputFormatter_formatText tests detailed text formatting
+func TestOutputFormatter_formatText(t *testing.T) {
+	formatter := NewOutputFormatter()
+
+	tests := []struct {
+		name     string
+		response *domain.ComplexityResponse
+		validate func(t *testing.T, output string)
+	}{
+		{
+			name:     "text format with all sections",
+			response: createTestComplexityResponse(),
+			validate: func(t *testing.T, output string) {
+				// Check header (new unified format)
+				assert.Contains(t, output, "Complexity Analysis Report")
+				assert.Contains(t, output, "========================================")
+
+				// Check summary section (new unified format)
+				assert.Contains(t, output, "SUMMARY")
+				assert.Contains(t, output, "Total Functions: 2")
+				assert.Contains(t, output, "Average Complexity: 5.0")
+				assert.Contains(t, output, "Max Complexity: 8")
+				assert.Contains(t, output, "Min Complexity: 2")
+
+				// Check risk distribution (new unified format)
+				assert.Contains(t, output, "RISK DISTRIBUTION")
+				assert.Contains(t, output, "High: 1")
+				assert.Contains(t, output, "Medium: 0")
+				assert.Contains(t, output, "Low: 1")
+
+				// Check raw metrics section
+				assert.Contains(t, output, "RAW CODE METRICS")
+				assert.Contains(t, output, "Files Analyzed: 1")
+				assert.Contains(t, output, "SLOC: 10")
+				assert.Contains(t, output, "Comment Ratio: 16.7%")
+				assert.Contains(t, output, "File: test.py")
+
+				// Check function details (new unified format)
+				assert.Contains(t, output, "FUNCTION DETAILS")
+				assert.Contains(t, output, "Scope  Complexity  Cognitive  SLOC  Risk")
+				assert.Contains(t, output, "simple_function")
+				assert.Contains(t, output, "complex_function")
+
+				// Check warnings and errors sections
+				assert.Contains(t, output, "WARNINGS")
+				assert.Contains(t, output, "⚠")
+				assert.Contains(t, output, "High complexity detected")
+				assert.Contains(t, output, "ERRORS")
+				assert.Contains(t, output, "❌")
+				assert.Contains(t, output, "Could not parse some_file.py")
+
+				// Check footer (metadata section)
+				assert.Contains(t, output, "METADATA")
+				assert.Contains(t, output, "Generated at:")
+			},
+		},
+		{
+			name:     "text format with no functions",
+			response: createMinimalComplexityResponse(),
+			validate: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Complexity Analysis Report")
+				assert.Contains(t, output, "Total Functions: 0")
+
+				// Should not contain function details section
+				assert.NotContains(t, output, "RAW CODE METRICS")
+				assert.NotContains(t, output, "FUNCTION DETAILS")
+				assert.NotContains(t, output, "WARNINGS")
+				assert.NotContains(t, output, "ERRORS")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, err := formatter.formatText(tt.response)
+			assert.NoError(t, err)
+			assert.NotEmpty(t, output)
+
+			if tt.validate != nil {
+				tt.validate(t, output)
+			}
+		})
+	}
+}
+
+// TestOutputFormatter_formatJSON tests JSON formatting details
+func TestOutputFormatter_formatJSON(t *testing.T) {
+	formatter := NewOutputFormatter()
+	response := createTestComplexityResponse()
+
+	output, err := formatter.formatJSON(response)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, output)
+
+	// Parse the JSON to verify structure
+	var parsed map[string]interface{}
+	err = json.Unmarshal([]byte(output), &parsed)
+	assert.NoError(t, err)
+
+	// Verify top-level structure matches actual JSON format
+	assert.Contains(t, parsed, "results") // not "functions"
+	assert.Contains(t, parsed, "summary")
+	assert.Contains(t, parsed, "metadata") // contains generated_at, version, config
+	assert.Contains(t, parsed, "raw_metrics")
+	assert.Contains(t, parsed, "raw_metrics_summary")
+
+	// Verify results array structure (contains functions)
+	functions := parsed["results"].([]interface{})
+	assert.Len(t, functions, 2)
+
+	firstFunction := functions[0].(map[string]interface{})
+	assert.Equal(t, "simple_function", firstFunction["function_name"]) // not "name"
+	assert.Equal(t, "function", firstFunction["scope_kind"])
+	assert.Equal(t, float64(2), firstFunction["complexity"])
+	assert.Equal(t, "low", firstFunction["risk_level"])
+
+	// Verify summary structure
+	summary := parsed["summary"].(map[string]interface{})
+	assert.Equal(t, float64(2), summary["total_functions"])
+	assert.Equal(t, float64(2), summary["functions_parsed"])
+	assert.Equal(t, 5.0, summary["average_complexity"])
+
+	// Verify metadata structure
+	metadata := parsed["metadata"].(map[string]interface{})
+	assert.Contains(t, metadata, "generated_at")
+	assert.Contains(t, metadata, "version")
+	assert.Contains(t, metadata, "configuration")
+
+	rawMetricsSummary := parsed["raw_metrics_summary"].(map[string]interface{})
+	assert.Equal(t, float64(10), rawMetricsSummary["sloc"])
+
+	rawMetrics := parsed["raw_metrics"].([]interface{})
+	assert.Len(t, rawMetrics, 1)
+}
+
+// TestOutputFormatter_formatYAML tests YAML formatting details
+func TestOutputFormatter_formatYAML(t *testing.T) {
+	formatter := NewOutputFormatter()
+	response := createTestComplexityResponse()
+
+	output, err := formatter.formatYAML(response)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, output)
+
+	// Parse the YAML to verify structure
+	var parsed map[string]interface{}
+	err = yaml.Unmarshal([]byte(output), &parsed)
+	assert.NoError(t, err)
+
+	// Verify structure matches actual YAML format
+	assert.Contains(t, parsed, "results") // not "functions"
+	assert.Contains(t, parsed, "summary")
+	assert.Contains(t, parsed, "metadata") // contains generated_at, version
+	assert.Contains(t, parsed, "raw_metrics")
+	assert.Contains(t, parsed, "raw_metrics_summary")
+}
+
+// TestOutputFormatter_formatCSV tests CSV formatting details
+func TestOutputFormatter_formatCSV(t *testing.T) {
+	formatter := NewOutputFormatter()
+	response := createTestComplexityResponse()
+
+	output, err := formatter.formatCSV(response)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, output)
+
+	// Parse CSV
+	reader := csv.NewReader(strings.NewReader(output))
+	records, err := reader.ReadAll()
+	assert.NoError(t, err)
+
+	// Verify structure
+	assert.Len(t, records, 3) // Header + 2 functions
+
+	// Check header
+	expectedHeaders := []string{"Function", "Complexity", "Cognitive Complexity", "Risk", "Nodes", "Edges", "Nesting Depth", "If Statements", "Loop Statements", "Exception Handlers", "SLOC", "Scope Kind"}
+	assert.Equal(t, expectedHeaders, records[0])
+
+	// Check data rows (risk levels are lowercase in actual implementation)
+	assert.Equal(t, []string{"complex_function", "8", "0", "high", "20", "18", "0", "3", "2", "1", "120", "function"}, records[1])
+	assert.Equal(t, []string{"simple_function", "2", "0", "low", "5", "4", "0", "1", "0", "0", "6", "function"}, records[2])
+}
+
+// TestOutputFormatter_NewOutputFormatter tests service creation
+func TestOutputFormatter_NewOutputFormatter(t *testing.T) {
+	formatter := NewOutputFormatter()
+
+	assert.NotNil(t, formatter)
+	assert.IsType(t, &OutputFormatterImpl{}, formatter)
+}
+
+// TestOutputFormatter_ErrorHandling tests error cases
+func TestOutputFormatter_ErrorHandling(t *testing.T) {
+	formatter := NewOutputFormatter()
+
+	tests := []struct {
+		name        string
+		response    *domain.ComplexityResponse
+		format      domain.OutputFormat
+		expectError bool
+		errorMsg    string
+	}{
+		// Skip nil response test as it causes panic - this is expected behavior
+		{
+			name:        "unsupported format",
+			response:    createTestComplexityResponse(),
+			format:      domain.OutputFormat("unsupported"),
+			expectError: true,
+			errorMsg:    "unsupported format",
+		},
+		{
+			name:        "CSV requires resolved request metadata",
+			response:    &domain.ComplexityResponse{},
+			format:      domain.OutputFormatCSV,
+			expectError: true,
+			errorMsg:    "complexity request is missing from response",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := formatter.Format(tt.response, tt.format)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestFormatFunctionCoverage(t *testing.T) {
+	assert.Equal(t, "3", formatFunctionCoverage(3, 3))
+	assert.Equal(t, "0", formatFunctionCoverage(0, 0))
+	assert.Equal(t, "1 reported / 3 parsed", formatFunctionCoverage(1, 3))
+	assert.Equal(t, "0 reported / 5 parsed", formatFunctionCoverage(0, 5))
+}
+
+func TestOutputFormatter_FunctionCoverageDisclosure(t *testing.T) {
+	formatter := NewOutputFormatter()
+	response := createTestComplexityResponse()
+	// Simulate a presentation filter hiding two of three analyzed functions.
+	response.Functions = response.Functions[:1]
+	response.Summary.TotalFunctions = 3
+	response.Summary.FunctionsParsed = 3
+
+	t.Run("text shows reported vs parsed", func(t *testing.T) {
+		output, err := formatter.Format(response, domain.OutputFormatText)
+		assert.NoError(t, err)
+		assert.Contains(t, output, "Total Functions: 1 reported / 3 parsed")
+		assert.NotContains(t, output, "Functions Total")
+	})
+
+	t.Run("json keeps functions_parsed equal to total_functions", func(t *testing.T) {
+		output, err := formatter.Format(response, domain.OutputFormatJSON)
+		assert.NoError(t, err)
+
+		var result map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(output), &result))
+		summary := result["summary"].(map[string]interface{})
+		assert.Equal(t, float64(3), summary["total_functions"])
+		assert.Equal(t, float64(3), summary["functions_parsed"])
+		assert.NotContains(t, summary, "functions_total")
+	})
+}

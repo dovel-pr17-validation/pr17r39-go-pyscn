@@ -1,0 +1,779 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"time"
+
+	coreapted "github.com/ludo-technologies/polyscan/core/apted"
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/analyzer"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+)
+
+// CloneService implements the domain.CloneService interface
+type CloneService struct {
+}
+
+// NewCloneService creates a new clone service
+func NewCloneService() *CloneService {
+	return &CloneService{}
+}
+
+// DetectClones performs clone detection on the given request
+func (s *CloneService) DetectClones(ctx context.Context, req *domain.CloneRequest) (*domain.CloneResponse, error) {
+	// Input validation
+	if ctx == nil {
+		return nil, fmt.Errorf("context cannot be nil")
+	}
+	if req == nil {
+		return nil, fmt.Errorf("clone request cannot be nil")
+	}
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid clone request: %w", err)
+	}
+
+	// Use the files already collected by the usecase layer
+	// req.Paths now contains actual Python files to analyze
+	return s.DetectClonesInFiles(ctx, req.Paths, req)
+}
+
+// DetectClonesInFiles performs clone detection on specific files
+func (s *CloneService) DetectClonesInFiles(ctx context.Context, filePaths []string, req *domain.CloneRequest) (*domain.CloneResponse, error) {
+	// Input validation
+	if ctx == nil {
+		return nil, fmt.Errorf("context cannot be nil")
+	}
+	if req == nil {
+		return nil, fmt.Errorf("clone request cannot be nil")
+	}
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("file paths cannot be empty")
+	}
+
+	return s.detectClones(ctx, req, func(ctx context.Context, detector *analyzer.CloneDetector) (*fragmentExtraction, error) {
+		return s.extractFragmentsFromFiles(ctx, filePaths, detector)
+	})
+}
+
+// AnalyzeSnapshot performs clone detection from source captured by a project snapshot.
+func (s *CloneService) AnalyzeSnapshot(ctx context.Context, snapshot *ProjectSnapshot, req *domain.CloneRequest) (*domain.CloneResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context cannot be nil")
+	}
+	if snapshot == nil {
+		return nil, fmt.Errorf("project snapshot cannot be nil")
+	}
+	if req == nil {
+		return nil, fmt.Errorf("clone request cannot be nil")
+	}
+	if len(snapshot.Files) == 0 {
+		return nil, fmt.Errorf("project snapshot cannot be empty")
+	}
+
+	return s.detectClones(ctx, req, func(ctx context.Context, detector *analyzer.CloneDetector) (*fragmentExtraction, error) {
+		return s.extractFragmentsFromSnapshot(ctx, snapshot, detector, domain.PythonFileSelection{
+			IncludePatterns: req.IncludePatterns,
+			ExcludePatterns: req.ExcludePatterns,
+		})
+	})
+}
+
+type fragmentExtractor func(context.Context, *analyzer.CloneDetector) (*fragmentExtraction, error)
+
+func (s *CloneService) detectClones(ctx context.Context, req *domain.CloneRequest, extract fragmentExtractor) (*domain.CloneResponse, error) {
+	startTime := time.Now()
+	if req.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
+		defer cancel()
+	}
+
+	detectorConfig := s.createDetectorConfig(req)
+	detector := analyzer.NewCloneDetector(detectorConfig)
+	extraction, err := extract(ctx, detector)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.buildCloneResponse(ctx, startTime, detectorConfig, detector, extraction, req)
+}
+
+// fragmentExtraction is what a pass over the target files yielded, including
+// the files it could not use. Skipped files are reported rather than written
+// straight to os.Stderr so that callers - the check gate above all - can act
+// on them instead of only the user noticing a warning scroll past.
+type fragmentExtraction struct {
+	fragments     []*analyzer.CodeFragment
+	filesAnalyzed int
+	linesAnalyzed int
+	nodesAnalyzed int
+	issues        []analysisIssue
+}
+
+func (s *CloneService) extractFragmentsFromFiles(ctx context.Context, filePaths []string, detector *analyzer.CloneDetector) (*fragmentExtraction, error) {
+	pyParser := parser.New()
+	extraction := &fragmentExtraction{}
+
+	for _, filePath := range filePaths {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("clone analysis cancelled: %w", ctx.Err())
+		default:
+		}
+
+		content, err := readFileContent(filePath)
+		if err != nil {
+			extraction.issues = append(extraction.issues, analysisIssue{filePath: filePath, message: fmt.Sprintf("Failed to read file: %v", err), cause: err})
+			continue
+		}
+
+		parseResult, err := pyParser.Parse(ctx, content)
+		if err != nil {
+			extraction.issues = append(extraction.issues, analysisIssue{filePath: filePath, message: fmt.Sprintf("Parse error: %v", err), cause: err})
+			continue
+		}
+		if parseResult == nil || parseResult.AST == nil {
+			extraction.issues = append(extraction.issues, analysisIssue{filePath: filePath, message: "Parse error: parser returned no syntax tree"})
+			continue
+		}
+
+		extractCloneFragments(filePath, content, parseResult.AST, detector, extraction)
+	}
+
+	return extraction, nil
+}
+
+func (s *CloneService) extractFragmentsFromSnapshot(ctx context.Context, snapshot *ProjectSnapshot, detector *analyzer.CloneDetector, selection domain.PythonFileSelection) (*fragmentExtraction, error) {
+	extraction := &fragmentExtraction{}
+
+	selectedFiles, err := snapshot.selectedAnalysisProjectFiles(selection)
+	if err != nil {
+		return nil, fmt.Errorf("select clone files: %w", err)
+	}
+	for _, file := range selectedFiles {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("clone analysis cancelled: %w", ctx.Err())
+		default:
+		}
+
+		if issue, invalid := projectFileAnalysisIssue(file); invalid {
+			extraction.issues = append(extraction.issues, issue)
+			continue
+		}
+
+		extractCloneFragments(file.Path, file.source, file.AST, detector, extraction)
+	}
+
+	return extraction, nil
+}
+
+func extractCloneFragments(
+	filePath string,
+	source []byte,
+	ast *parser.Node,
+	detector *analyzer.CloneDetector,
+	extraction *fragmentExtraction,
+) {
+	extraction.filesAnalyzed++
+	extraction.linesAnalyzed += analyzer.CountSourceLines(source)
+
+	statsVisitor := parser.NewStatisticsVisitor()
+	ast.Accept(statsVisitor)
+	extraction.nodesAnalyzed += statsVisitor.TotalNodes
+
+	fragments := detector.ExtractFragmentsWithSource([]*parser.Node{ast}, filePath, source)
+	extraction.fragments = append(extraction.fragments, fragments...)
+}
+
+func (s *CloneService) buildCloneResponse(
+	ctx context.Context,
+	startTime time.Time,
+	detectorConfig *analyzer.CloneDetectorConfig,
+	detector *analyzer.CloneDetector,
+	extraction *fragmentExtraction,
+	req *domain.CloneRequest,
+) (*domain.CloneResponse, error) {
+	allFragments := analyzer.RetainIdenticalUndersizedFragments(extraction.fragments)
+	if len(allFragments) == 0 {
+		return &domain.CloneResponse{
+			Clones:      []*domain.Clone{},
+			ClonePairs:  []*domain.ClonePair{},
+			CloneGroups: []*domain.CloneGroup{},
+			Statistics: &domain.CloneStatistics{
+				TotalFragments: 0,
+				FilesAnalyzed:  extraction.filesAnalyzed,
+				LinesAnalyzed:  extraction.linesAnalyzed,
+				NodesAnalyzed:  extraction.nodesAnalyzed,
+			},
+			Request:  req,
+			Duration: time.Since(startTime).Milliseconds(),
+			Success:  true,
+			Errors:   analysisIssueMessages(extraction.issues),
+			Failures: analyzerFailures(domain.AnalysisKindClones, extraction.issues),
+		}, nil
+	}
+
+	// Determine whether to use LSH based on configuration and estimated exact-pair cost.
+	useLSH := domain.ShouldUseLSHWithPairEstimate(
+		req.LSHEnabled,
+		len(allFragments),
+		req.LSHAutoThreshold,
+		detectorConfig.MaxClonePairs,
+	)
+
+	// Update detector with LSH decision
+	detector.SetUseLSH(useLSH)
+
+	// Detect clones (detector will automatically use LSH or standard algorithm based on UseLSH setting)
+	detectionResult := detector.DetectClonesWithLSH(ctx, allFragments)
+
+	measureCloneComplexity(detectionResult)
+
+	// Convert to domain objects
+	domainClones, fragmentIDs := s.convertFragmentsToDomainClones(allFragments)
+	allClonePairs := s.convertClonePairsToDomain(detectionResult.Pairs, req.ShouldShowContent(), fragmentIDs)
+	allCloneGroups := s.convertCloneGroupsToDomain(detectionResult.Groups, req.ShouldShowContent(), fragmentIDs)
+
+	// The enabled clone types narrow what counts as a clone at all, so they
+	// define the population the duplication score is measured against.
+	scoredClonePairs := s.filterClonePairsByType(allClonePairs, req)
+	scoredCloneGroups := filterCloneGroupsByPairs(allCloneGroups, scoredClonePairs)
+	scoredCloneGroups = s.filterCloneGroupsByType(scoredCloneGroups, req)
+
+	// min_similarity/max_similarity are output filters on top of that
+	// population: they trim what the response shows without changing it.
+	domainClonePairs := s.filterClonePairsBySimilarity(scoredClonePairs, req)
+	domainCloneGroups := filterCloneGroupsByPairs(scoredCloneGroups, domainClonePairs)
+	domainCloneGroups = s.filterCloneGroupsBySimilarity(domainCloneGroups, req)
+	domainClones = filterClonesToReferencedFragments(domainClones, domainClonePairs, domainCloneGroups)
+
+	// Sort results
+	s.sortResults(domainClones, domainClonePairs, domainCloneGroups, req)
+
+	statistics := s.buildCloneStatistics(detectionResult, domainClonePairs, domainCloneGroups, scoredClonePairs, scoredCloneGroups, extraction.filesAnalyzed, extraction.linesAnalyzed, extraction.nodesAnalyzed)
+
+	duration := time.Since(startTime).Milliseconds()
+	// s.progress.Complete(fmt.Sprintf("Clone detection completed in %dms. Found %d clone pairs in %d groups.",
+	//	duration, len(domainClonePairs), len(domainCloneGroups)))
+
+	return &domain.CloneResponse{
+		Clones:      domainClones,
+		ClonePairs:  domainClonePairs,
+		CloneGroups: domainCloneGroups,
+		Statistics:  statistics,
+		Request:     req,
+		Duration:    duration,
+		Success:     true,
+		Errors:      analysisIssueMessages(extraction.issues),
+		Failures:    analyzerFailures(domain.AnalysisKindClones, extraction.issues),
+	}, nil
+}
+
+// ComputeSimilarity computes similarity between two code fragments
+func (s *CloneService) ComputeSimilarity(ctx context.Context, fragment1, fragment2 string) (float64, error) {
+	// Input validation
+	if fragment1 == "" || fragment2 == "" {
+		return 0.0, fmt.Errorf("fragments cannot be empty")
+	}
+
+	if ctx == nil {
+		return 0.0, fmt.Errorf("context cannot be nil")
+	}
+
+	// Check for excessively large fragments to prevent resource exhaustion
+	const maxFragmentSize = 1024 * 1024 // 1MB limit
+	if len(fragment1) > maxFragmentSize || len(fragment2) > maxFragmentSize {
+		return 0.0, fmt.Errorf("fragment size exceeds maximum allowed size of %d bytes", maxFragmentSize)
+	}
+
+	// Parse both fragments
+	pyParser := parser.New()
+
+	result1, err := pyParser.Parse(ctx, []byte(fragment1))
+	if err != nil {
+		return 0.0, fmt.Errorf("failed to parse fragment1: %w", err)
+	}
+	if result1 == nil || result1.AST == nil {
+		return 0.0, fmt.Errorf("fragment1 parsing returned nil result or AST")
+	}
+
+	result2, err := pyParser.Parse(ctx, []byte(fragment2))
+	if err != nil {
+		return 0.0, fmt.Errorf("failed to parse fragment2: %w", err)
+	}
+	if result2 == nil || result2.AST == nil {
+		return 0.0, fmt.Errorf("fragment2 parsing returned nil result or AST")
+	}
+
+	// Convert AST nodes to tree nodes for APTED
+	converter := analyzer.NewTreeConverter()
+	tree1 := converter.ConvertAST(result1.AST)
+	tree2 := converter.ConvertAST(result2.AST)
+
+	if tree1 == nil || tree2 == nil {
+		return 0.0, fmt.Errorf("failed to convert AST to tree nodes")
+	}
+
+	// Use APTED to compute similarity
+	costModel := analyzer.NewPythonCostModel()
+	aptedAnalyzer := coreapted.NewAPTEDAnalyzerWithNormalization(costModel, coreapted.NormalizeByMax)
+
+	similarity := aptedAnalyzer.ComputeSimilarity(tree1, tree2)
+	return similarity, nil
+}
+
+// createDetectorConfig creates a clone detector configuration from the domain request
+func (s *CloneService) createDetectorConfig(req *domain.CloneRequest) *analyzer.CloneDetectorConfig {
+	// Determine grouping defaults
+	groupMode := analyzer.GroupingMode(req.GroupMode)
+	if groupMode == "" {
+		groupMode = analyzer.GroupingMode(domain.DefaultCloneGroupMode)
+	}
+	groupThreshold := req.GroupThreshold
+	if groupThreshold <= 0 {
+		groupThreshold = req.SimilarityThreshold
+		if groupThreshold <= 0 {
+			groupThreshold = req.Type3Threshold
+		}
+	}
+	kVal := req.KCoreK
+	if kVal < 2 {
+		kVal = 2
+	}
+
+	return &analyzer.CloneDetectorConfig{
+		MinLines:            req.MinLines,
+		MinNodes:            req.MinNodes,
+		Type1Threshold:      req.Type1Threshold,
+		Type2Threshold:      req.Type2Threshold,
+		Type3Threshold:      req.Type3Threshold,
+		Type4Threshold:      req.Type4Threshold,
+		SimilarityThreshold: req.SimilarityThreshold, // User-configurable minimum similarity
+		MaxEditDistance:     req.MaxEditDistance,
+		IgnoreLiterals:      domain.BoolValue(req.IgnoreLiterals, false),
+		IgnoreIdentifiers:   domain.BoolValue(req.IgnoreIdentifiers, false),
+		SkipDocstrings:      domain.BoolValue(req.SkipDocstrings, true),
+		CostModelType:       "python", // Default to Python cost model
+		MaxClonePairs:       10000,    // Default max pairs
+		BatchSizeThreshold:  50,       // Default batch size threshold
+
+		// Advanced analysis
+		EnableDFAAnalysis: req.EnableDFA,
+
+		// Grouping
+		GroupingMode:      groupMode,
+		GroupingThreshold: groupThreshold,
+		KCoreK:            kVal,
+		// LSH (UseLSH will be set dynamically based on fragment count)
+		UseLSH:                 false, // Will be overridden after fragment extraction
+		LSHSimilarityThreshold: req.LSHSimilarityThreshold,
+		LSHBands:               req.LSHBands,
+		LSHRows:                req.LSHRows,
+		LSHMinHashCount:        req.LSHHashes,
+	}
+}
+
+// measureCloneComplexity fills in the cyclomatic complexity of every fragment
+// that is part of a detected pair or group. Only those fragments are reported,
+// so the rest are left unmeasured.
+func measureCloneComplexity(result *analyzer.CloneDetectionResult) {
+	if result == nil {
+		return
+	}
+	measure := func(fragment *analyzer.CodeFragment) {
+		if fragment != nil && fragment.Complexity == 0 {
+			fragment.Complexity = analyzer.FragmentComplexity(fragment)
+		}
+	}
+	for _, pair := range result.Pairs {
+		measure(pair.Fragment1)
+		measure(pair.Fragment2)
+	}
+	for _, group := range result.Groups {
+		for _, fragment := range group.Fragments {
+			measure(fragment)
+		}
+	}
+}
+
+// convertFragmentsToDomainClones converts analyzer fragments to domain clones.
+//
+// It also returns a fragment -> id map so that the same fragment receives the
+// same id everywhere it appears in the response (top-level clones[] and the
+// per-group clone_groups[].clones[]). The id is the fragment's 1-based index in
+// the analyzed fragment set, which is response-unique and stable.
+func (s *CloneService) convertFragmentsToDomainClones(
+	fragments []*analyzer.CodeFragment,
+) ([]*domain.Clone, map[*analyzer.CodeFragment]int) {
+	domainClones := make([]*domain.Clone, len(fragments))
+	fragmentIDs := make(map[*analyzer.CodeFragment]int, len(fragments))
+
+	for i, fragment := range fragments {
+		id := i + 1
+		fragmentIDs[fragment] = id
+		domainClones[i] = &domain.Clone{
+			ID: id,
+			Location: &domain.CloneLocation{
+				FilePath:  fragment.Location.FilePath,
+				StartLine: fragment.Location.StartLine,
+				EndLine:   fragment.Location.EndLine,
+				StartCol:  fragment.Location.StartCol,
+				EndCol:    fragment.Location.EndCol,
+			},
+			Content:    fragment.Content,
+			Hash:       fragment.Hash,
+			Size:       fragment.Size,
+			LineCount:  fragment.LineCount,
+			Complexity: fragment.Complexity,
+		}
+	}
+
+	return domainClones, fragmentIDs
+}
+
+// convertClonePairsToDomain converts analyzer clone pairs to domain clone pairs.
+func (s *CloneService) convertClonePairsToDomain(
+	clonePairs []*analyzer.ClonePair,
+	includeContent bool,
+	fragmentIDs map[*analyzer.CodeFragment]int,
+) []*domain.ClonePair {
+	domainPairs := make([]*domain.ClonePair, len(clonePairs))
+
+	for i, pair := range clonePairs {
+		clone1 := &domain.Clone{
+			ID:   fragmentIDs[pair.Fragment1],
+			Type: s.convertCloneType(pair.CloneType),
+			Location: &domain.CloneLocation{
+				FilePath:  pair.Fragment1.Location.FilePath,
+				StartLine: pair.Fragment1.Location.StartLine,
+				EndLine:   pair.Fragment1.Location.EndLine,
+				StartCol:  pair.Fragment1.Location.StartCol,
+				EndCol:    pair.Fragment1.Location.EndCol,
+			},
+			Hash:       pair.Fragment1.Hash,
+			Size:       pair.Fragment1.Size,
+			LineCount:  pair.Fragment1.LineCount,
+			Complexity: pair.Fragment1.Complexity,
+		}
+		clone2 := &domain.Clone{
+			ID:   fragmentIDs[pair.Fragment2],
+			Type: s.convertCloneType(pair.CloneType),
+			Location: &domain.CloneLocation{
+				FilePath:  pair.Fragment2.Location.FilePath,
+				StartLine: pair.Fragment2.Location.StartLine,
+				EndLine:   pair.Fragment2.Location.EndLine,
+				StartCol:  pair.Fragment2.Location.StartCol,
+				EndCol:    pair.Fragment2.Location.EndCol,
+			},
+			Hash:       pair.Fragment2.Hash,
+			Size:       pair.Fragment2.Size,
+			LineCount:  pair.Fragment2.LineCount,
+			Complexity: pair.Fragment2.Complexity,
+		}
+		if includeContent {
+			clone1.Content = pair.Fragment1.Content
+			clone2.Content = pair.Fragment2.Content
+		}
+
+		domainPairs[i] = &domain.ClonePair{
+			ID:         i + 1,
+			Clone1:     clone1,
+			Clone2:     clone2,
+			Similarity: pair.Similarity,
+			Distance:   pair.Distance,
+			Type:       s.convertCloneType(pair.CloneType),
+			Confidence: pair.Confidence,
+		}
+	}
+
+	return domainPairs
+}
+
+// filterClonesToReferencedFragments keeps the top-level clones list aligned
+// with the clone pairs/groups returned to users. Raw extracted fragments remain
+// available via statistics.total_fragments; clones[] should contain only
+// fragments that actually participate in a detected clone result.
+func filterClonesToReferencedFragments(
+	clones []*domain.Clone,
+	pairs []*domain.ClonePair,
+	groups []*domain.CloneGroup,
+) []*domain.Clone {
+	referenced := make(map[int]struct{})
+	add := func(clone *domain.Clone) {
+		if clone != nil && clone.ID > 0 {
+			referenced[clone.ID] = struct{}{}
+		}
+	}
+
+	for _, pair := range pairs {
+		add(pair.Clone1)
+		add(pair.Clone2)
+	}
+	for _, group := range groups {
+		for _, clone := range group.Clones {
+			add(clone)
+		}
+	}
+
+	filtered := make([]*domain.Clone, 0, len(referenced))
+	for _, clone := range clones {
+		if clone == nil {
+			continue
+		}
+		if _, ok := referenced[clone.ID]; ok {
+			filtered = append(filtered, clone)
+		}
+	}
+	return filtered
+}
+
+// convertCloneGroupsToDomain converts analyzer clone groups to domain clone groups.
+func (s *CloneService) convertCloneGroupsToDomain(
+	cloneGroups []*analyzer.CloneGroup,
+	includeContent bool,
+	fragmentIDs map[*analyzer.CodeFragment]int,
+) []*domain.CloneGroup {
+	domainGroups := make([]*domain.CloneGroup, len(cloneGroups))
+
+	for i, group := range cloneGroups {
+		domainGroup := &domain.CloneGroup{
+			ID:         group.ID,
+			Type:       s.convertCloneType(group.CloneType),
+			Similarity: group.Similarity,
+			Size:       group.Size,
+			Clones:     []*domain.Clone{},
+		}
+
+		// Convert fragments to clones
+		for _, fragment := range group.Fragments {
+			clone := &domain.Clone{
+				// Reuse the fragment's response-wide id so a group fragment
+				// matches the same fragment in top-level clones[] and ids stay
+				// unique across the response (not reset per group).
+				ID:   fragmentIDs[fragment],
+				Type: s.convertCloneType(group.CloneType),
+				Location: &domain.CloneLocation{
+					FilePath:  fragment.Location.FilePath,
+					StartLine: fragment.Location.StartLine,
+					EndLine:   fragment.Location.EndLine,
+					StartCol:  fragment.Location.StartCol,
+					EndCol:    fragment.Location.EndCol,
+				},
+				Hash:       fragment.Hash,
+				Size:       fragment.Size,
+				LineCount:  fragment.LineCount,
+				Complexity: fragment.Complexity,
+			}
+			if includeContent {
+				clone.Content = fragment.Content
+			}
+			domainGroup.AddClone(clone)
+		}
+
+		domainGroups[i] = domainGroup
+	}
+
+	return domainGroups
+}
+
+// convertCloneType converts analyzer clone type to domain clone type
+func (s *CloneService) convertCloneType(cloneType analyzer.CloneType) domain.CloneType {
+	switch cloneType {
+	case analyzer.Type1Clone:
+		return domain.Type1Clone
+	case analyzer.Type2Clone:
+		return domain.Type2Clone
+	case analyzer.Type3Clone:
+		return domain.Type3Clone
+	case analyzer.Type4Clone:
+		return domain.Type4Clone
+	default:
+		return domain.Type4Clone
+	}
+}
+
+// cloneTypeEnabled reports whether a detected clone is of a type the request
+// asked for. This is a detection-scope decision, not a display one.
+func cloneTypeEnabled(cloneType domain.CloneType, req *domain.CloneRequest) bool {
+	for _, enabledType := range req.CloneTypes {
+		if cloneType == enabledType {
+			return true
+		}
+	}
+	return false
+}
+
+// similarityInRange reports whether a detected clone passes the
+// min_similarity/max_similarity output filters.
+func similarityInRange(similarity float64, req *domain.CloneRequest) bool {
+	return similarity >= req.MinSimilarity && similarity <= req.MaxSimilarity
+}
+
+// filterClonePairsByType keeps the clone pairs whose type is in scope. The
+// result is the scored population: it must not depend on any output filter.
+func (s *CloneService) filterClonePairsByType(pairs []*domain.ClonePair, req *domain.CloneRequest) []*domain.ClonePair {
+	var filtered []*domain.ClonePair
+	for _, pair := range pairs {
+		if cloneTypeEnabled(pair.Type, req) {
+			filtered = append(filtered, pair)
+		}
+	}
+	return filtered
+}
+
+// filterClonePairsBySimilarity applies the similarity output filters to pairs
+// that are already in scope.
+func (s *CloneService) filterClonePairsBySimilarity(pairs []*domain.ClonePair, req *domain.CloneRequest) []*domain.ClonePair {
+	var filtered []*domain.ClonePair
+	for _, pair := range pairs {
+		if similarityInRange(pair.Similarity, req) {
+			filtered = append(filtered, pair)
+		}
+	}
+	return filtered
+}
+
+// filterCloneGroupsByType keeps the clone groups whose type is in scope. The
+// result is the scored population: it must not depend on any output filter.
+func (s *CloneService) filterCloneGroupsByType(groups []*domain.CloneGroup, req *domain.CloneRequest) []*domain.CloneGroup {
+	var filtered []*domain.CloneGroup
+	for _, group := range groups {
+		if cloneTypeEnabled(group.Type, req) {
+			filtered = append(filtered, group)
+		}
+	}
+	return filtered
+}
+
+// filterCloneGroupsBySimilarity applies the similarity output filters to groups
+// that are already in scope.
+func (s *CloneService) filterCloneGroupsBySimilarity(groups []*domain.CloneGroup, req *domain.CloneRequest) []*domain.CloneGroup {
+	var filtered []*domain.CloneGroup
+	for _, group := range groups {
+		if similarityInRange(group.Similarity, req) {
+			filtered = append(filtered, group)
+		}
+	}
+	return filtered
+}
+
+// sortResults sorts the results based on request criteria
+func (s *CloneService) sortResults(clones []*domain.Clone, pairs []*domain.ClonePair, groups []*domain.CloneGroup, req *domain.CloneRequest) {
+	// Implementation would depend on the specific sort criteria
+	// For now, we'll keep the default ordering from the detector
+}
+
+// buildCloneStatistics converts analyzer-level detection statistics into the
+// domain statistics attached to the response. The displayed counts come from
+// the filtered pairs and groups so that reported numbers always match what is
+// returned; DuplicatedFragments comes from the unfiltered scored population so
+// that it shares TotalFragments' population. DuplicatedLines covers source
+// lines from the same scored population, independent of output filters.
+func (s *CloneService) buildCloneStatistics(
+	result *analyzer.CloneDetectionResult,
+	pairs []*domain.ClonePair,
+	groups []*domain.CloneGroup,
+	scoredPairs []*domain.ClonePair,
+	scoredGroups []*domain.CloneGroup,
+	filesAnalyzed, linesAnalyzed, nodesAnalyzed int,
+) *domain.CloneStatistics {
+	stats := domain.NewCloneStatistics()
+	stats.TotalFragments = result.Statistics.TotalFragments
+	stats.DuplicatedFragments = countUniqueCloneFragments(scoredPairs, scoredGroups)
+	stats.DuplicatedLines = countDistinctCloneLines(scoredPairs, scoredGroups)
+	stats.TotalClones = countUniqueCloneFragments(pairs, groups)
+	stats.TotalClonePairs = len(pairs)
+	stats.TotalCloneGroups = len(groups)
+	stats.FilesAnalyzed = filesAnalyzed
+	stats.LinesAnalyzed = linesAnalyzed
+	stats.NodesAnalyzed = nodesAnalyzed
+
+	// Count by type
+	for _, pair := range pairs {
+		typeStr := pair.Type.String()
+		stats.ClonesByType[typeStr]++
+	}
+
+	// Calculate average similarity
+	if len(pairs) > 0 {
+		totalSimilarity := 0.0
+		for _, pair := range pairs {
+			totalSimilarity += pair.Similarity
+		}
+		stats.AverageSimilarity = totalSimilarity / float64(len(pairs))
+	}
+
+	return stats
+}
+
+// countUniqueCloneFragments counts distinct domain clones that participate in
+// at least one clone pair or group. Counting detected items separately from the
+// raw fragment collection prevents accidentally reporting the candidate count.
+func countUniqueCloneFragments(pairs []*domain.ClonePair, groups []*domain.CloneGroup) int {
+	type locKey struct {
+		file      string
+		startLine int
+		endLine   int
+	}
+	seen := make(map[locKey]struct{})
+	visitCloneLocations(pairs, groups, func(location *domain.CloneLocation) {
+		seen[locKey{location.FilePath, location.StartLine, location.EndLine}] = struct{}{}
+	})
+	return len(seen)
+}
+
+// countDistinctCloneLines merges overlapping clone spans within each file.
+func countDistinctCloneLines(pairs []*domain.ClonePair, groups []*domain.CloneGroup) int {
+	byFile := make(map[string][]*domain.CloneLocation)
+	visitCloneLocations(pairs, groups, func(location *domain.CloneLocation) {
+		if location.StartLine > 0 && location.EndLine >= location.StartLine {
+			byFile[location.FilePath] = append(byFile[location.FilePath], location)
+		}
+	})
+
+	total := 0
+	for _, locations := range byFile {
+		sort.Slice(locations, func(i, j int) bool {
+			return locations[i].StartLine < locations[j].StartLine
+		})
+		lastEnd := 0
+		for _, location := range locations {
+			start := max(location.StartLine, lastEnd+1)
+			if start <= location.EndLine {
+				total += location.EndLine - start + 1
+				lastEnd = location.EndLine
+			}
+		}
+	}
+	return total
+}
+
+func visitCloneLocations(pairs []*domain.ClonePair, groups []*domain.CloneGroup, visit func(*domain.CloneLocation)) {
+	visitClone := func(clone *domain.Clone) {
+		if clone != nil && clone.Location != nil {
+			visit(clone.Location)
+		}
+	}
+	for _, pair := range pairs {
+		visitClone(pair.Clone1)
+		visitClone(pair.Clone2)
+	}
+	for _, group := range groups {
+		for _, clone := range group.Clones {
+			visitClone(clone)
+		}
+	}
+}
+
+// readFileContent reads the content of a file
+func readFileContent(filePath string) ([]byte, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file %s: %w", filePath, err)
+	}
+	return content, nil
+}

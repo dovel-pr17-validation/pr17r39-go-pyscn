@@ -1,0 +1,361 @@
+package analyzer
+
+import (
+	"fmt"
+
+	corecfg "github.com/ludo-technologies/polyscan/core/cfg"
+	"github.com/ludo-technologies/pyscn/internal/config"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+)
+
+// ComplexityResult holds cyclomatic complexity metrics for a function or method
+type ComplexityResult struct {
+	// McCabe cyclomatic complexity
+	Complexity int
+
+	// Raw CFG metrics
+	Edges               int
+	Nodes               int
+	ConnectedComponents int
+
+	// Function/method information
+	FunctionName string
+	StartLine    int
+	StartCol     int
+	EndLine      int
+
+	// Nesting depth
+	NestingDepth        int
+	DeepestNestingLine  int
+	CognitiveComplexity int
+
+	// Decision points breakdown
+	IfStatements      int
+	LoopStatements    int
+	ExceptionHandlers int
+	SwitchCases       int
+
+	// SLOC is the source lines of code for this function.
+	SLOC int
+
+	// Risk assessment based on complexity thresholds
+	RiskLevel string // "low", "medium", "high"
+}
+
+// Interface methods for reporter compatibility
+
+func (cr *ComplexityResult) GetComplexity() int {
+	return cr.Complexity
+}
+
+func (cr *ComplexityResult) GetFunctionName() string {
+	return cr.FunctionName
+}
+
+func (cr *ComplexityResult) GetRiskLevel() string {
+	return cr.RiskLevel
+}
+
+func (cr *ComplexityResult) GetDetailedMetrics() map[string]int {
+	return map[string]int{
+		"nodes":                cr.Nodes,
+		"edges":                cr.Edges,
+		"cognitive_complexity": cr.CognitiveComplexity,
+		"if_statements":        cr.IfStatements,
+		"loop_statements":      cr.LoopStatements,
+		"exception_handlers":   cr.ExceptionHandlers,
+		"switch_cases":         cr.SwitchCases,
+	}
+}
+
+// String returns a human-readable representation of the complexity result
+func (cr *ComplexityResult) String() string {
+	return fmt.Sprintf("Function: %s, Complexity: %d, Risk: %s",
+		cr.FunctionName, cr.Complexity, cr.RiskLevel)
+}
+
+// CalculateComplexity computes McCabe cyclomatic complexity for a CFG using default thresholds
+func CalculateComplexity(cfg *CFG) *ComplexityResult {
+	defaultConfig := config.DefaultConfig()
+	return CalculateComplexityWithConfig(cfg, &defaultConfig.Complexity)
+}
+
+// CalculateComplexityWithConfig computes McCabe cyclomatic complexity using provided configuration
+func CalculateComplexityWithConfig(cfg *CFG, complexityConfig *config.ComplexityConfig) *ComplexityResult {
+	if cfg == nil {
+		return &ComplexityResult{
+			Complexity: 0,
+			RiskLevel:  "low",
+		}
+	}
+
+	coreResult, reachableBlocks := computeCoreComplexity(cfg)
+	conditionalDecisions, comprehensionDecisions := countConditionalDecisionBlocks(reachableBlocks)
+
+	// Primary method: count decision points + 1
+	// This is more reliable for CFGs with entry/exit nodes
+	sourceNode := cfgSourceNode(cfg)
+	astMetrics, hasASTMetrics := calculateASTComplexityMetrics(sourceNode)
+	reportedMetrics := resolveCoreComplexityMetrics(coreResult, conditionalDecisions, astMetrics, hasASTMetrics)
+	decisionPoints := countCoreDecisionPoints(conditionalDecisions, comprehensionDecisions, reportedMetrics, hasASTMetrics)
+	complexity := decisionPoints + 1
+
+	// Ensure minimum complexity of 1 for any execution scope.
+	if complexity < 1 {
+		complexity = 1
+	}
+
+	// Calculate nesting depth and location from the original AST node if available.
+	// The same node feeds CalculateCognitiveComplexity above via cfgSourceNode.
+	nestingDepth := 0
+	deepestNestingLine := 0
+	startLine := 0
+	startCol := 0
+	endLine := 0
+	if sourceNode != nil {
+		nesting := CalculateMaxNestingDepth(sourceNode)
+		nestingDepth = nesting.MaxDepth
+		deepestNestingLine = nesting.DeepestNestingLine
+
+		startLine = sourceNode.Location.StartLine
+		startCol = sourceNode.Location.StartCol
+		endLine = sourceNode.Location.EndLine
+	}
+
+	result := &ComplexityResult{
+		Complexity:          complexity,
+		Edges:               countCoreEdges(coreResult),
+		Nodes:               countCoreNodes(reachableBlocks),
+		ConnectedComponents: 1,
+		FunctionName:        cfg.Name,
+		StartLine:           startLine,
+		StartCol:            startCol,
+		EndLine:             endLine,
+		NestingDepth:        nestingDepth,
+		DeepestNestingLine:  deepestNestingLine,
+		CognitiveComplexity: reportedMetrics.CognitiveComplexity,
+		IfStatements:        reportedMetrics.IfStatements,
+		LoopStatements:      reportedMetrics.LoopStatements,
+		ExceptionHandlers:   reportedMetrics.ExceptionHandlers,
+		SwitchCases:         reportedMetrics.SwitchCases,
+		RiskLevel:           complexityConfig.AssessRiskLevel(complexity, reportedMetrics.CognitiveComplexity, nestingDepth),
+	}
+
+	return result
+}
+
+func computeCoreComplexity(graph *CFG) (*corecfg.ComplexityResult, map[string]*BasicBlock) {
+	reachability := corecfg.AnalyzeReachability(graph, corecfg.ReachabilityConfig{})
+	reachableBlocks := make(map[string]*BasicBlock, reachability.ReachableCount)
+	for id := range reachability.Reachable {
+		reachableBlocks[id] = graph.Blocks[id]
+	}
+
+	result, err := corecfg.ComputeComplexity(&corecfg.CFG{Blocks: reachableBlocks}, corecfg.ComplexityConfig{})
+	if err != nil {
+		panic(fmt.Sprintf("compute core CFG complexity: %v", err))
+	}
+	return result, reachableBlocks
+}
+
+// countConditionalDecisionBlocks counts blocks that branch on a condition, and
+// separately how many of them model a comprehension clause.
+func countConditionalDecisionBlocks(blocks map[string]*BasicBlock) (decisions, comprehensionDecisions int) {
+	for _, block := range blocks {
+		for _, edge := range block.Successors {
+			if edge.Type == EdgeCondTrue || edge.Type == EdgeCondFalse {
+				decisions++
+				if label := blockBaseLabel(block); label == LabelCompHeader || label == LabelCompFilter {
+					comprehensionDecisions++
+				}
+				break
+			}
+		}
+	}
+	return decisions, comprehensionDecisions
+}
+
+func resolveCoreComplexityMetrics(
+	result *corecfg.ComplexityResult,
+	conditionalDecisions int,
+	astMetrics astComplexityMetrics,
+	hasASTMetrics bool,
+) astComplexityMetrics {
+	if hasASTMetrics {
+		return astMetrics
+	}
+	return astComplexityMetrics{
+		IfStatements:      conditionalDecisions,
+		LoopStatements:    result.EdgeBreakdown[corecfg.EdgeLoop],
+		ExceptionHandlers: result.EdgeBreakdown[corecfg.EdgeException],
+	}
+}
+
+func countCoreDecisionPoints(conditionalDecisions, comprehensionDecisions int, metrics astComplexityMetrics, hasASTMetrics bool) int {
+	if hasASTMetrics {
+		// The CFG models only comprehensions that are the direct value of a
+		// statement, so the AST count replaces its comprehension decisions.
+		conditionalDecisions += metrics.ComprehensionDecisions - comprehensionDecisions - metrics.MatchStatements
+		if conditionalDecisions < 0 {
+			conditionalDecisions = 0
+		}
+		// The CFG never branches on a conditional expression, so each one
+		// is a decision only the AST sees.
+		conditionalDecisions += metrics.ConditionalExpressions
+	}
+	return conditionalDecisions + metrics.ExceptionHandlers + metrics.SwitchCases
+}
+
+func countCoreEdges(result *corecfg.ComplexityResult) int {
+	count := 0
+	for _, edgeCount := range result.EdgeBreakdown {
+		count += edgeCount
+	}
+	return count
+}
+
+func countCoreNodes(blocks map[string]*BasicBlock) int {
+	count := 0
+	for _, block := range blocks {
+		if !block.IsEntry && !block.IsExit {
+			count++
+		}
+	}
+	return count
+}
+
+type astComplexityMetrics struct {
+	CognitiveComplexity int
+	IfStatements        int
+	LoopStatements      int
+	ExceptionHandlers   int
+	MatchStatements     int
+	SwitchCases         int
+	// ComprehensionDecisions counts each for clause and if filter of every
+	// comprehension in the scope, wherever it appears.
+	ComprehensionDecisions int
+	// ConditionalExpressions counts each `a if c else b` in the scope,
+	// wherever it appears.
+	ConditionalExpressions int
+}
+
+func calculateASTComplexityMetrics(root *parser.Node) (astComplexityMetrics, bool) {
+	if root == nil {
+		return astComplexityMetrics{}, false
+	}
+
+	metrics := astComplexityMetrics{}
+	metrics.CognitiveComplexity = CalculateCognitiveComplexity(root).Total
+	for _, stmt := range root.Body {
+		collectASTStatementMetrics(stmt, &metrics)
+	}
+	return metrics, true
+}
+
+func collectASTStatementMetrics(node *parser.Node, metrics *astComplexityMetrics) {
+	if node == nil {
+		return
+	}
+
+	switch node.Type {
+	case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef, parser.NodeClassDef:
+		return
+	case parser.NodeMatch:
+		if len(node.Body) > 0 {
+			metrics.MatchStatements++
+		}
+	case parser.NodeIf, parser.NodeElifClause:
+		metrics.IfStatements++
+	case parser.NodeFor, parser.NodeAsyncFor, parser.NodeWhile:
+		metrics.LoopStatements++
+	case parser.NodeExceptHandler:
+		metrics.ExceptionHandlers++
+	case parser.NodeMatchCase:
+		metrics.SwitchCases++
+	case parser.NodeComprehension:
+		metrics.ComprehensionDecisions++
+		if node.Test != nil {
+			metrics.ComprehensionDecisions++
+		}
+	case parser.NodeIfExp:
+		metrics.ConditionalExpressions++
+	}
+
+	for _, child := range node.GetChildren() {
+		collectASTStatementMetrics(child, metrics)
+	}
+}
+
+// CalculateFileComplexity calculates complexity for all execution scopes in a collection of CFGs.
+func CalculateFileComplexity(cfgs []*CFG) []*ComplexityResult {
+	defaultConfig := config.DefaultConfig()
+	return CalculateFileComplexityWithConfig(cfgs, &defaultConfig.Complexity)
+}
+
+// CalculateFileComplexityWithConfig calculates execution-scope complexity using the provided configuration.
+func CalculateFileComplexityWithConfig(cfgs []*CFG, complexityConfig *config.ComplexityConfig) []*ComplexityResult {
+	results := make([]*ComplexityResult, 0, len(cfgs))
+
+	for _, cfg := range cfgs {
+		if cfg != nil {
+			result := CalculateComplexityWithConfig(cfg, complexityConfig)
+
+			// Only include results that should be reported according to config
+			if complexityConfig.ShouldReport(result.Complexity) {
+				results = append(results, result)
+			}
+		}
+	}
+
+	return results
+}
+
+// AggregateComplexity calculates aggregate metrics for multiple functions
+type AggregateComplexity struct {
+	TotalFunctions    int
+	AverageComplexity float64
+	MaxComplexity     int
+	MinComplexity     int
+	HighRiskCount     int
+	MediumRiskCount   int
+	LowRiskCount      int
+}
+
+// CalculateAggregateComplexity computes aggregate complexity metrics
+func CalculateAggregateComplexity(results []*ComplexityResult) *AggregateComplexity {
+	if len(results) == 0 {
+		return &AggregateComplexity{}
+	}
+
+	agg := &AggregateComplexity{
+		TotalFunctions: len(results),
+		MinComplexity:  results[0].Complexity,
+		MaxComplexity:  results[0].Complexity,
+	}
+
+	totalComplexity := 0
+
+	for _, result := range results {
+		totalComplexity += result.Complexity
+
+		if result.Complexity > agg.MaxComplexity {
+			agg.MaxComplexity = result.Complexity
+		}
+		if result.Complexity < agg.MinComplexity {
+			agg.MinComplexity = result.Complexity
+		}
+
+		switch result.RiskLevel {
+		case "high":
+			agg.HighRiskCount++
+		case "medium":
+			agg.MediumRiskCount++
+		case "low":
+			agg.LowRiskCount++
+		}
+	}
+
+	agg.AverageComplexity = float64(totalComplexity) / float64(len(results))
+
+	return agg
+}

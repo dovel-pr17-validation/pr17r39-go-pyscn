@@ -1,0 +1,469 @@
+package domain
+
+import "strings"
+
+// CloneThresholds defines the standard similarity thresholds for different types of code clones.
+// These values are based on research in clone detection and represent industry standards.
+//
+// References:
+// - Roy, C. K., & Cordy, J. R. (2007). A survey on software clone detection research
+// - Bellon, S., et al. (2007). Comparison and evaluation of clone detection tools
+const (
+	// DefaultType1CloneThreshold represents the similarity threshold for Type-1 clones.
+	// Type-1 clones are identical code fragments except for variations in whitespace,
+	// layout and comments. Allows whitespace/comment differences (≥85%).
+	DefaultType1CloneThreshold = 0.85
+
+	// DefaultType2CloneThreshold represents the similarity threshold for Type-2 clones.
+	// Type-2 clones are syntactically identical fragments except for variations in
+	// identifiers, literals, types, layout and comments. Allows identifier/literal changes (≥75%).
+	DefaultType2CloneThreshold = 0.75
+
+	// DefaultType3CloneThreshold represents the similarity threshold for Type-3 clones.
+	// Type-3 clones are copied fragments with further modifications such as changed,
+	// added or removed statements. Excluded by default; threshold maintains ordering (≥70%).
+	DefaultType3CloneThreshold = 0.70
+
+	// DefaultType4CloneThreshold represents the similarity threshold for Type-4 clones.
+	// Type-4 clones are syntactically different but functionally similar fragments.
+	// They perform the same computation but through different syntactic variants.
+	// Detects functional similarity (≥65%).
+	DefaultType4CloneThreshold = 0.65
+)
+
+// CloneTypeNames provides human-readable names for clone types
+var CloneTypeNames = map[int]string{
+	1: "Type-1 (Identical)",
+	2: "Type-2 (Renamed)",
+	3: "Type-3 (Near-Miss)",
+	4: "Type-4 (Semantic)",
+}
+
+// CloneTypeDescriptions provides detailed descriptions for each clone type
+var CloneTypeDescriptions = map[int]string{
+	1: "Identical code fragments except for whitespace, layout and comments",
+	2: "Syntactically identical except for variations in identifiers, literals and types",
+	3: "Copied fragments with further modifications (changed, added or removed statements)",
+	4: "Syntactically different but functionally similar code fragments",
+}
+
+// DFA (Data Flow Analysis) Feature Weights for semantic similarity comparison.
+// These weights determine how each DFA metric contributes to the overall similarity score.
+const (
+	// DefaultDFAPairCountWeight is the weight for total def-use pair count similarity.
+	// Higher pair count often indicates more complex data flow, which is a key semantic indicator.
+	DefaultDFAPairCountWeight = 0.25
+
+	// DefaultDFAChainLengthWeight is the weight for average chain length similarity.
+	// Chain length (uses per definition) indicates variable reuse patterns.
+	DefaultDFAChainLengthWeight = 0.20
+
+	// DefaultDFACrossBlockWeight is the weight for cross-block pair ratio similarity.
+	// Cross-block pairs indicate data dependencies across control flow, a key structural pattern.
+	DefaultDFACrossBlockWeight = 0.20
+
+	// DefaultDFADefKindWeight is the weight for definition kind distribution similarity.
+	// Different definition kinds (assign, param, loop) indicate different coding patterns.
+	DefaultDFADefKindWeight = 0.20
+
+	// DefaultDFAUseKindWeight is the weight for use kind distribution similarity.
+	// How variables are used (read, call, attribute) reflects access patterns.
+	DefaultDFAUseKindWeight = 0.15
+)
+
+// Combined Semantic Feature Weights for Type-4 clone detection.
+// When DFA analysis is enabled, both CFG and DFA features contribute to similarity.
+const (
+	// DefaultCFGFeatureWeight is the weight for CFG-based features in semantic similarity.
+	// CFG captures control flow structure (branches, loops, etc.).
+	DefaultCFGFeatureWeight = 0.60
+
+	// DefaultDFAFeatureWeight is the weight for DFA-based features in semantic similarity.
+	// DFA captures data flow patterns (variable definitions and uses).
+	DefaultDFAFeatureWeight = 0.40
+
+	// DefaultSemanticMinCyclomaticComplexity is the minimum cyclomatic complexity
+	// (McCabe's V(G) = E - N + 2) a fragment's CFG must have to be eligible for
+	// Type-4 (semantic) clone classification. Fully linear fragments (V(G)=1)
+	// produce saturated, indiscriminate CFG similarity scores — the "tiny linear
+	// function looks like every other tiny linear function" problem observed in
+	// cross-repo audits — because pyscn's CFG builder emits the same handful of
+	// entry/linear/exit blocks regardless of how many statements the body has.
+	//
+	// Gating on V(G) >= 2 cleanly admits any fragment with at least one decision
+	// (if / for / while / try / with) while rejecting purely linear shapes. Using
+	// cyclomatic complexity instead of raw block count avoids penalising standalone
+	// control-flow statement fragments (e.g. `NodeIf` without `else`), whose CFG
+	// happens to have fewer synthetic blocks than the equivalent function body.
+	DefaultSemanticMinCyclomaticComplexity = 2
+)
+
+// ============================================================================
+// Complexity Analysis Defaults
+// ============================================================================
+
+// Complexity thresholds based on McCabe cyclomatic complexity.
+// Reference: McCabe, T.J. (1976). A Complexity Measure
+const (
+	// DefaultComplexityLowThreshold is the upper bound for low-risk complexity.
+	// Functions with complexity <= 9 are considered simple and maintainable.
+	DefaultComplexityLowThreshold = 9
+
+	// DefaultComplexityMediumThreshold is the upper bound for medium-risk complexity.
+	// Functions with complexity 10-19 require attention but are acceptable.
+	DefaultComplexityMediumThreshold = 19
+
+	// DefaultComplexityMinFilter is the minimum complexity to include in reports.
+	// Default 1 means all functions are included.
+	DefaultComplexityMinFilter = 1
+
+	// DefaultComplexityMaxLimit is the maximum complexity limit for enforcement.
+	// 0 means no limit is enforced.
+	DefaultComplexityMaxLimit = 0
+
+	// DefaultCognitiveComplexityThreshold is the high-risk threshold for
+	// SonarQube-style cognitive complexity.
+	DefaultCognitiveComplexityThreshold = 25
+
+	// DefaultNestingDepthThreshold is the high-risk threshold for maximum
+	// nesting depth.
+	DefaultNestingDepthThreshold = 7
+
+	// DefaultFunctionSLOCWarnThreshold is the upper bound for function SLOC
+	// before a function is reported as long (analogous to LowThreshold for McCabe).
+	DefaultFunctionSLOCWarnThreshold = 50
+
+	// FunctionSLOCCriticalMultiplier separates the two long-function tiers. It
+	// also derives whichever tier the user leaves unset from the one they set.
+	FunctionSLOCCriticalMultiplier = 2
+
+	// DefaultFunctionSLOCCriticalThreshold is the upper bound for function SLOC
+	// before a function fails the check gate (analogous to MediumThreshold for McCabe).
+	DefaultFunctionSLOCCriticalThreshold = DefaultFunctionSLOCWarnThreshold * FunctionSLOCCriticalMultiplier
+)
+
+// ============================================================================
+// CBO (Coupling Between Objects) Defaults
+// ============================================================================
+
+// CBO thresholds based on Chidamber & Kemerer metrics suite.
+// Reference: Chidamber, S.R. & Kemerer, C.F. (1994). A Metrics Suite for OOD
+const (
+	// DefaultCBOLowThreshold is the upper bound for low-risk coupling.
+	// Classes with CBO <= 3 are well-encapsulated.
+	DefaultCBOLowThreshold = 3
+
+	// DefaultCBOMediumThreshold is the upper bound for medium-risk coupling.
+	// Classes with CBO 4-7 may need refactoring consideration.
+	DefaultCBOMediumThreshold = 7
+)
+
+// ============================================================================
+// Architecture Analysis Defaults
+// ============================================================================
+
+const (
+	// DefaultArchitectureMinCohesion is the minimum package cohesion score before a package is flagged.
+	DefaultArchitectureMinCohesion = 0.5
+
+	// DefaultArchitectureMaxResponsibilities is the maximum inferred responsibilities per module.
+	DefaultArchitectureMaxResponsibilities = 3
+)
+
+// ============================================================================
+// LCOM (Lack of Cohesion of Methods) Defaults
+// ============================================================================
+
+// LCOM4 thresholds based on Hitz & Montazeri graph-based algorithm.
+// Reference: Hitz, M. & Montazeri, B. (1995). Measuring Coupling and Cohesion in OO Systems
+const (
+	// DefaultLCOMLowThreshold is the upper bound for low-risk LCOM.
+	// Classes with LCOM4 <= 2 have high cohesion.
+	DefaultLCOMLowThreshold = 2
+
+	// DefaultLCOMMediumThreshold is the upper bound for medium-risk LCOM.
+	// Classes with LCOM4 3-5 have acceptable cohesion.
+	DefaultLCOMMediumThreshold = 5
+
+	// DefaultCommunityAlgorithm is the community detection algorithm identifier.
+	DefaultCommunityAlgorithm = "leiden"
+
+	// DefaultCommunityScope is the graph scope for community detection.
+	DefaultCommunityScope = "module"
+
+	// DefaultCommunityMinSize is the minimum community size after detection.
+	DefaultCommunityMinSize = 1
+
+	// DefaultCommunityResolution is the Leiden resolution parameter.
+	DefaultCommunityResolution = 1.0
+)
+
+// ============================================================================
+// Dead Code Detection Defaults
+// ============================================================================
+
+const (
+	// DefaultDeadCodeMinSeverity is the minimum severity level for dead code reports.
+	// Options: "info", "warning", "critical"
+	DefaultDeadCodeMinSeverity = "warning"
+
+	// DefaultDeadCodeContextLines is the number of context lines shown around dead code.
+	DefaultDeadCodeContextLines = 3
+
+	// DefaultDeadCodeSortBy is the default sort order for dead code results.
+	// Options: "severity", "file", "line"
+	DefaultDeadCodeSortBy = "severity"
+)
+
+// ============================================================================
+// Clone Analysis Defaults
+// ============================================================================
+
+const (
+	// DefaultCloneMinLines is the minimum SLOC (comments, blanks and docstrings
+	// excluded) for a code fragment to be considered.
+	DefaultCloneMinLines = 8
+
+	// DefaultCloneMinNodes is the minimum number of AST nodes for a code fragment.
+	DefaultCloneMinNodes = 20
+
+	// DefaultCloneMaxEditDistance is the maximum tree edit distance for clone comparison.
+	DefaultCloneMaxEditDistance = 50.0
+
+	// DefaultCloneSimilarityThreshold is the general similarity threshold for clone detection.
+	// Aligned with Type-4 threshold to include all detected clones in reports.
+	DefaultCloneSimilarityThreshold = 0.65
+
+	// DefaultCloneGroupingThreshold is the threshold for grouping related clones.
+	// Uses Type-4 threshold as default for grouping to include all detected clones.
+	DefaultCloneGroupingThreshold = DefaultType4CloneThreshold
+
+	// Clone grouping strategies. These are the accepted values for the
+	// [clones] grouping_mode config key and the --clone-group-mode flag.
+	CloneGroupModeConnected       = "connected"
+	CloneGroupModeStar            = "star"
+	CloneGroupModeCompleteLinkage = "complete_linkage"
+	CloneGroupModeKCore           = "k_core"
+	CloneGroupModeCentroid        = "centroid"
+
+	// DefaultCloneGroupMode is the grouping strategy used when none is configured.
+	// Complete linkage requires every member pair to clear the threshold, which
+	// keeps a group to fragments that were actually compared. Single-linkage
+	// ("connected") chains A~B and B~C into one group even when A and C were
+	// never scored, which produced package-wide groups with no refactoring value.
+	DefaultCloneGroupMode = CloneGroupModeCompleteLinkage
+)
+
+// CloneGroupModes lists the supported clone grouping strategies.
+var CloneGroupModes = []string{
+	CloneGroupModeConnected,
+	CloneGroupModeStar,
+	CloneGroupModeCompleteLinkage,
+	CloneGroupModeKCore,
+	CloneGroupModeCentroid,
+}
+
+// IsValidCloneGroupMode reports whether mode names a supported grouping strategy.
+func IsValidCloneGroupMode(mode string) bool {
+	for _, valid := range CloneGroupModes {
+		if mode == valid {
+			return true
+		}
+	}
+	return false
+}
+
+// ============================================================================
+// LSH (Locality-Sensitive Hashing) Acceleration Defaults
+// ============================================================================
+
+const (
+	// DefaultLSHAutoThreshold is the fragment count threshold for automatic LSH activation.
+	// When fragment count exceeds this, LSH acceleration is automatically enabled.
+	DefaultLSHAutoThreshold = 500
+
+	// DefaultLSHAutoPairThreshold is the estimated pair count threshold for
+	// automatic LSH activation. This catches small repos with enough fragments
+	// to make exact pairwise APTED comparisons too expensive.
+	DefaultLSHAutoPairThreshold = 10000
+
+	// DefaultLSHSimilarityThreshold is the minimum AST-feature Jaccard for a clone pair, with or without LSH.
+	DefaultLSHSimilarityThreshold = 0.50
+
+	// DefaultLSHBands and DefaultLSHRows split the MinHash signature into
+	// bands. Three rows per band make pairs at the default Jaccard floor (0.50)
+	// LSH candidates with ~99.6% probability, so LSH keeps the clones the
+	// exhaustive path finds. Four rows gave only ~87%.
+	DefaultLSHBands = 42
+
+	// DefaultLSHRows is the number of rows per band in the LSH algorithm.
+	DefaultLSHRows = 3
+
+	// DefaultLSHHashes is the total number of hash functions used.
+	DefaultLSHHashes = 128
+)
+
+// ============================================================================
+// Performance Defaults
+// ============================================================================
+
+const (
+	// DefaultMaxMemoryMB is the maximum memory usage in megabytes for batch processing.
+	DefaultMaxMemoryMB = 100
+
+	// DefaultBatchSize is the default batch size for processing files.
+	DefaultBatchSize = 100
+
+	// DefaultMaxGoroutines is the default number of concurrent goroutines.
+	DefaultMaxGoroutines = 4
+
+	// DefaultTimeoutSeconds is the default timeout in seconds for analysis operations.
+	DefaultTimeoutSeconds = 300
+)
+
+// ============================================================================
+// DI Anti-pattern Detection Defaults
+// ============================================================================
+
+const (
+	// DefaultDIConstructorParamThreshold is the maximum allowed constructor parameters.
+	// Classes with more than 5 parameters in __init__ are flagged as constructor over-injection.
+	// Reference: Martin, R.C. (2008). Clean Code - recommends max 3-4, we use 5 as threshold.
+	DefaultDIConstructorParamThreshold = 5
+
+	// DefaultDIMinSeverity is the minimum severity level for DI anti-pattern reports.
+	// Options: "info", "warning", "error"
+	DefaultDIMinSeverity = "warning"
+)
+
+// ServiceLocatorMethodNames returns the method names that indicate service locator pattern
+// Note: Generic .get() methods are excluded to avoid false positives with dict.get() etc.
+func ServiceLocatorMethodNames() []string {
+	return []string{
+		"get_service",
+		"resolve",
+		"get_instance",
+		"locate",
+		"get_component",
+		"get_dependency",
+		"get_bean",
+		"inject",
+	}
+}
+
+// ============================================================================
+// Mock Data Detection Defaults
+// ============================================================================
+
+const (
+	// DefaultMockDataMinSeverity is the minimum severity level for mock data reports.
+	// Options: "info", "warning", "error"
+	DefaultMockDataMinSeverity = "warning"
+
+	// DefaultMockDataSortBy is the default sort order for mock data results.
+	// Options: "severity", "file", "line", "type"
+	DefaultMockDataSortBy = "severity"
+
+	// DefaultMockDataIgnoreTests determines whether test files are ignored by default.
+	DefaultMockDataIgnoreTests = true
+)
+
+// DefaultMockDataKeywords returns the default keywords used to detect mock data.
+// These are common identifiers used in placeholder/mock data.
+func DefaultMockDataKeywords() []string {
+	return []string{
+		"mock", "fake", "dummy", "test", "sample", "example",
+		"placeholder", "stub", "fixture", "temp", "tmp",
+		"foo", "bar", "baz", "qux", "lorem", "ipsum",
+	}
+}
+
+// DefaultMockDataDomains returns the default domains that indicate mock data.
+// These are reserved domains per RFC 2606 and common test domains.
+func DefaultMockDataDomains() []string {
+	return []string{
+		"example.com", "example.org", "example.net",
+		"test.com", "test.org", "test.net",
+		"localhost", "invalid",
+		"foo.com", "bar.com",
+	}
+}
+
+// DefaultAnalysisIncludePatterns returns the canonical runtime source-file
+// globs used by implementation analyses.
+func DefaultAnalysisIncludePatterns() []string {
+	return DefaultPythonSourceIncludePatterns()
+}
+
+// DefaultPythonSourceIncludePatterns returns runtime Python implementation
+// files. Analyses that score executable code should use this contract.
+func DefaultPythonSourceIncludePatterns() []string {
+	return []string{"**/*.py"}
+}
+
+// DefaultPythonModuleIncludePatterns returns the full Python module surface.
+// Dependency analysis uses this because stub files define importable modules.
+func DefaultPythonModuleIncludePatterns() []string {
+	return pythonModulePatterns(DefaultPythonSourceIncludePatterns())
+}
+
+// ForModules expands implementation-file rules to cover matching stub modules
+// without broadening their configured directory scope.
+func (s PythonFileSelection) ForModules() PythonFileSelection {
+	return PythonFileSelection{
+		IncludePatterns: pythonModulePatterns(s.IncludePatterns),
+		ExcludePatterns: pythonModulePatterns(s.ExcludePatterns),
+	}
+}
+
+func pythonModulePatterns(sourcePatterns []string) []string {
+	patterns := make([]string, 0, len(sourcePatterns)*2)
+	seen := make(map[string]struct{}, len(sourcePatterns)*2)
+	for _, pattern := range sourcePatterns {
+		if _, exists := seen[pattern]; !exists {
+			patterns = append(patterns, pattern)
+			seen[pattern] = struct{}{}
+		}
+		if strings.HasSuffix(pattern, ".py") {
+			stubPattern := pattern + "i"
+			if _, exists := seen[stubPattern]; !exists {
+				patterns = append(patterns, stubPattern)
+				seen[stubPattern] = struct{}{}
+			}
+		}
+	}
+	return patterns
+}
+
+// DefaultAnalysisExcludePatterns returns the canonical default file-glob
+// patterns excluded from all analyses (CBO, complexity, dead code, clones,
+// LCOM, system analysis). Callers must copy before mutating.
+func DefaultAnalysisExcludePatterns() []string {
+	return []string{
+		"test_*.py",
+		"*_test.py",
+		"**/tests/**",
+		"**/test/**",
+		"**/testing/**",
+		"**/migrations/**",
+		// Standalone example and docs scripts repeat setup code on purpose.
+		"**/examples/**",
+		"**/docs/**",
+		"**/docs_src/**",
+		"**/demo/**",
+		"**/samples/**",
+	}
+}
+
+// DefaultMockDataTestPatterns returns the default patterns for test files to ignore.
+func DefaultMockDataTestPatterns() []string {
+	return []string{
+		"test_*.py",
+		"*_test.py",
+		"tests/",
+		"test/",
+		"testing/",
+		"__tests__/",
+		"conftest.py",
+	}
+}

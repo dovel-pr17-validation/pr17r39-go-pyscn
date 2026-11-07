@@ -1,0 +1,435 @@
+name: Python Package Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build-wheels:
+    name: Build wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: ubuntu-latest
+            platform: linux-amd64
+            goos: linux
+            goarch: amd64
+            wheel_platform: manylinux_2_34_x86_64
+
+          # Linux ARM64 (Graviton, arm64 containers on Apple Silicon)
+          # Needs a native runner: the tree-sitter bindings require CGO, which
+          # rules out cross-compiling from the amd64 runner.
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            goos: linux
+            goarch: arm64
+            wheel_platform: manylinux_2_34_aarch64
+
+          # Windows builds
+          - os: windows-latest
+            platform: windows-amd64
+            goos: windows
+            goarch: amd64
+            wheel_platform: win_amd64
+
+          # macOS Apple Silicon
+          - os: macos-14
+            platform: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            wheel_platform: macosx_11_0_arm64
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      id: setup-go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: true
+    
+    # Windows-specific setup
+    - name: Set up MSYS2 (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config zip unzip mingw-w64-x86_64-go
+    
+    - name: Install wheel verification tools
+      run: |
+        pip install --user twine
+      shell: bash
+    
+    - name: Verify Go module
+      run: |
+        go mod download
+        go mod verify
+    
+    - name: Build platform-specific wheel (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      run: |
+        python/scripts/build_platform_wheel.sh "${{ matrix.platform }}" "${{ matrix.wheel_platform }}"
+      shell: bash
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CC: ${{ (matrix.goos == 'darwin' && matrix.goarch == 'arm64') && 'clang -target arm64-apple-macos11' || (matrix.goos == 'darwin' && matrix.goarch == 'amd64') && 'clang -target x86_64-apple-macos10.13' || '' }}
+    
+    - name: Build platform-specific wheel (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        echo "=== Environment Check ==="
+        which go && go version
+        which gcc && gcc --version | head -1
+        which zip && zip --version | head -1
+
+        echo "=== Starting Build ==="
+        python/scripts/build_platform_wheel.sh "${{ matrix.platform }}" "${{ matrix.wheel_platform }}"
+      shell: msys2 {0}
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+    
+    - name: Verify wheels
+      run: |
+        # Check wheel metadata with twine
+        python -m twine check dist/*.whl
+        
+        # Validate RECORD file format in each wheel
+        echo "=== Validating RECORD files ==="
+        for whl in dist/*.whl; do
+          echo "Checking wheel: $whl"
+          rec=$(unzip -Z1 "$whl" | grep -E '\.dist-info/RECORD$')
+          echo "  RECORD path: $rec"
+          
+          # Extract and validate CSV format
+          unzip -p "$whl" "$rec" | awk -F, '
+            NF != 3 && $0 !~ /\.dist-info\/RECORD,,/ {
+              print "❌ Invalid RECORD line: " $0
+              print "   Expected 3 CSV fields, got " NF
+              exit 1
+            }
+          '
+          
+          if [ $? -eq 0 ]; then
+            echo "  ✅ RECORD file is valid CSV format"
+          else
+            echo "  ❌ RECORD file validation failed"
+            exit 1
+          fi
+        done
+        echo "=== All RECORD files validated successfully ==="
+      shell: bash
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.platform }}
+        path: dist/*.whl
+        retention-days: 7
+
+  test-wheels:
+    name: Test wheels
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        python-version: ['3.8', '3.13']
+    
+    steps:
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        path: wheels/
+        merge-multiple: true
+    
+    - name: Test wheel installation
+      shell: bash
+      run: |
+        wheel_count=$(ls wheels/*.whl 2>/dev/null | wc -l)
+        if [ $wheel_count -eq 0 ]; then
+          echo "No wheels found, skipping test"
+          exit 0
+        fi
+
+        echo "Available wheels:"
+        ls -la wheels/
+
+        # Test pyscn wheel
+        if pip install --no-index --find-links wheels/ pyscn; then
+          echo "Testing pyscn command..."
+          if pyscn --version; then
+            echo "✅ pyscn installation and execution successful!"
+          elif pyscn --help >/dev/null 2>&1; then
+            echo "✅ pyscn installation successful (version command failed but help works)"
+          else
+            echo "❌ pyscn command failed"
+            exit 1
+          fi
+        else
+          echo "❌ pyscn wheel installation failed"
+          exit 1
+        fi
+
+        # Test pyscn-mcp wheel
+        pip uninstall -y pyscn || true
+        if pip install --no-index --find-links wheels/ pyscn-mcp; then
+          echo "Testing pyscn-mcp command..."
+          if pyscn-mcp --help >/dev/null 2>&1; then
+            echo "✅ pyscn-mcp installation and execution successful!"
+          else
+            echo "❌ pyscn-mcp command failed"
+            exit 1
+          fi
+        else
+          echo "❌ pyscn-mcp wheel installation failed"
+          exit 1
+        fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')  # Only on version tags
+    
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyscn
+    
+    permissions:
+      contents: read  # For downloading artifacts
+    
+    steps:
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        path: all-wheels/
+        merge-multiple: true
+
+    - name: Filter pyscn wheels
+      run: |
+        mkdir -p dist
+        find all-wheels -name 'pyscn-*.whl' -exec cp {} dist/ \;
+
+    - name: List wheels to publish
+      run: ls -la dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        packages-dir: dist/
+        verbose: true
+
+  publish-test-pypi:
+    name: Publish to Test PyPI
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'  # Only on manual trigger
+    
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/pyscn
+    
+    permissions:
+      contents: read  # For downloading artifacts
+    
+    steps:
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        path: all-wheels/
+        merge-multiple: true
+
+    - name: Filter pyscn wheels
+      run: |
+        mkdir -p dist
+        find all-wheels -name 'pyscn-*.whl' -exec cp {} dist/ \;
+
+    - name: List wheels to publish
+      run: ls -la dist/
+
+    - name: Publish to Test PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        packages-dir: dist/
+        verbose: true
+
+  publish-mcp-pypi:
+    name: Publish pyscn-mcp to PyPI
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyscn-mcp
+
+    permissions:
+      contents: read
+
+    steps:
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        path: all-wheels/
+        merge-multiple: true
+
+    - name: Filter pyscn-mcp wheels
+      run: |
+        mkdir -p dist
+        find all-wheels -name 'pyscn_mcp-*.whl' -exec cp {} dist/ \;
+
+    - name: List wheels to publish
+      run: ls -la dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        packages-dir: dist/
+        verbose: true
+
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    # Must run after the PyPI upload: the registry verifies ownership by reading
+    # the mcp-name marker out of the published pyscn-mcp description.
+    needs: publish-mcp-pypi
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    # The registry's GitHub OIDC auth checks only the repository owner, so the
+    # token this job mints can publish or overwrite ANY server under
+    # io.github.ludo-technologies/*, not just this one. What keeps that from
+    # being reachable by everyone with write access is the release-tag-protection
+    # ruleset, which lets only DaisukeYoda create, update, or delete a v* tag.
+    # The environment adds a second condition: this job only runs off a v* tag.
+    # If that ruleset is ever relaxed, put required reviewers back on the
+    # mcp-registry environment.
+    environment:
+      name: mcp-registry
+      url: https://registry.modelcontextprotocol.io/v0/servers?search=pyscn
+
+    permissions:
+      contents: read
+      id-token: write  # OIDC token for registry authentication
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set version in server.json from the release tag
+      run: |
+        VERSION="${GITHUB_REF#refs/tags/v}"
+        jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+        mv server.tmp server.json
+        cat server.json
+
+    # publish-mcp-pypi only guarantees the upload returned. The registry
+    # verifies ownership against the PyPI JSON API, which lags behind by up to
+    # a few minutes, and a 404 or a stale description there fails the publish.
+    - name: Wait for PyPI to serve the new version
+      run: |
+        VERSION="${GITHUB_REF#refs/tags/v}"
+        MARKER="mcp-name: $(jq -r .name server.json)"
+        for attempt in $(seq 1 30); do
+          body=$(curl -fsSL "https://pypi.org/pypi/pyscn-mcp/${VERSION}/json" || true)
+          if [ -n "$body" ] && printf '%s' "$body" | jq -e --arg m "$MARKER" '.info.description | contains($m)' >/dev/null 2>&1; then
+            echo "PyPI is serving pyscn-mcp ${VERSION} with the ownership marker (attempt ${attempt})"
+            exit 0
+          fi
+          echo "attempt ${attempt}/30: version or marker not visible yet, retrying in 20s"
+          sleep 20
+        done
+        echo "::error::PyPI did not serve pyscn-mcp ${VERSION} with '${MARKER}' within 10 minutes"
+        exit 1
+
+    - name: Install mcp-publisher
+      run: |
+        curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+    - name: Authenticate to MCP Registry
+      run: ./mcp-publisher login github-oidc
+
+    - name: Publish server to MCP Registry
+      run: ./mcp-publisher publish
+
+  publish-mcp-test-pypi:
+    name: Publish pyscn-mcp to Test PyPI
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/pyscn-mcp
+
+    permissions:
+      contents: read
+
+    steps:
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        path: all-wheels/
+        merge-multiple: true
+
+    - name: Filter pyscn-mcp wheels
+      run: |
+        mkdir -p dist
+        find all-wheels -name 'pyscn_mcp-*.whl' -exec cp {} dist/ \;
+
+    - name: List wheels to publish
+      run: ls -la dist/
+
+    - name: Publish to Test PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        packages-dir: dist/
+        verbose: true
+
+  create-github-release:
+    name: Create GitHub Release
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+        path: wheels/
+        merge-multiple: true
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: wheels/*.whl
+        generate_release_notes: true
+        draft: false
+        prerelease: false

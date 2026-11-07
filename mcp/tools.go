@@ -1,0 +1,132 @@
+package mcp
+
+import (
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+)
+
+// RegisterTools registers all pyscn MCP tools with the server
+func RegisterTools(s *server.MCPServer, handlers *HandlerSet) {
+	// Tool 1: analyze_code - Comprehensive code analysis
+	s.AddTool(mcp.NewTool("analyze_code",
+		mcp.WithDescription("Comprehensive Python code quality analysis with complexity, dead code, clone detection, and coupling metrics"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code (file or directory) to analyze")),
+		mcp.WithArray("analyses",
+			mcp.WithStringEnumItems([]string{"complexity", "dead_code", "clone", "cbo", "lcom", "deps", "communities"}),
+			mcp.Description("Array of analyses to run. Options: complexity, dead_code, clone, cbo, lcom, deps, communities. Default: all analyses, including communities")),
+		mcp.WithBoolean("recursive",
+			mcp.Description("Recursively analyze directories (default: true)")),
+		mcp.WithString("output_mode",
+			mcp.Enum("summary", "full"),
+			mcp.Description("Response detail level. \"summary\" (default) returns health score and high-level metrics. \"full\" returns the complete report including community_analysis and its compact community_context_map when community detection runs")),
+	), handlers.HandleAnalyzeCode)
+
+	// Tool 2: check_complexity - Cyclomatic complexity analysis
+	s.AddTool(mcp.NewTool("check_complexity",
+		mcp.WithDescription("Analyze cyclomatic complexity of Python execution scopes"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+		mcp.WithNumber("min_complexity",
+			mcp.Description("Minimum complexity to report (default: 1)")),
+		mcp.WithNumber("max_complexity",
+			mcp.Description("Maximum allowed complexity (default: 10; 0 uses the default)")),
+		mcp.WithBoolean("show_details",
+			mcp.Description("Include detailed metrics (default: true)")),
+		mcp.WithString("output_mode",
+			mcp.Enum("summary", "detailed", "full"),
+			mcp.Description("Response detail level (default: summary)")),
+		mcp.WithInteger("max_results",
+			mcp.Min(0),
+			mcp.Description("Maximum findings in summary or detailed output; 0 means unlimited (default: 0)")),
+	), handlers.HandleCheckComplexity)
+
+	// Tool 3: detect_clones - Code clone detection
+	s.AddTool(mcp.NewTool("detect_clones",
+		mcp.WithDescription("Detect code clones using APTED tree edit distance and LSH acceleration"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+		mcp.WithNumber("similarity_threshold",
+			mcp.Description("Minimum similarity threshold 0.0-1.0 (default: 0.8)")),
+		mcp.WithNumber("min_lines",
+			mcp.Description("Minimum SLOC to consider as clone (default: 8)")),
+		mcp.WithBoolean("group_clones",
+			mcp.Description("Group related clones together (default: true)")),
+		mcp.WithString("output_mode",
+			mcp.Enum("summary", "detailed", "full"),
+			mcp.Description("Response detail level (default: summary)")),
+		mcp.WithInteger("max_results",
+			mcp.Min(0),
+			mcp.Description("Maximum findings in summary or detailed output; 0 means unlimited (default: 0)")),
+	), handlers.HandleDetectClones)
+
+	// Tool 4: check_coupling - Class coupling analysis
+	s.AddTool(mcp.NewTool("check_coupling",
+		mcp.WithDescription("Analyze class coupling (CBO - Coupling Between Objects) metrics"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+		mcp.WithInteger("min_cbo",
+			mcp.Min(0),
+			mcp.Description("Minimum CBO for high-coupling findings (default: 10)")),
+		mcp.WithString("output_mode",
+			mcp.Enum("summary", "detailed", "full"),
+			mcp.Description("Response detail level (default: summary)")),
+		mcp.WithInteger("max_results",
+			mcp.Min(0),
+			mcp.Description("Maximum findings in summary or detailed output; 0 means unlimited (default: 0)")),
+	), handlers.HandleCheckCoupling)
+
+	// Tool 5: check_cohesion - Class cohesion (LCOM4) analysis
+	s.AddTool(mcp.NewTool("check_cohesion",
+		mcp.WithDescription("Analyze class cohesion (LCOM4 - Lack of Cohesion of Methods) metrics"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+		mcp.WithString("output_mode",
+			mcp.Enum("summary", "detailed", "full"),
+			mcp.Description("Response detail level (default: summary)")),
+		mcp.WithInteger("max_results",
+			mcp.Min(0),
+			mcp.Description("Maximum findings in summary or detailed output; 0 means unlimited (default: 0)")),
+	), handlers.HandleCheckCohesion)
+
+	// Tool 6: find_dead_code - Dead code detection
+	s.AddTool(mcp.NewTool("find_dead_code",
+		mcp.WithDescription("Find unreachable code using Control Flow Graph (CFG) analysis"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+		mcp.WithString("min_severity",
+			mcp.Description("Minimum severity: info, warning, error (default: warning)")),
+		mcp.WithString("output_mode",
+			mcp.Enum("summary", "detailed", "full"),
+			mcp.Description("Response detail level (default: summary)")),
+		mcp.WithInteger("max_results",
+			mcp.Min(0),
+			mcp.Description("Maximum findings in summary or detailed output; 0 means unlimited (default: 0)")),
+	), handlers.HandleFindDeadCode)
+
+	// Tool 7: get_health_score - Overall code health score
+	s.AddTool(mcp.NewTool("get_health_score",
+		mcp.WithDescription("Get overall code health score (0-100) with grade and category scores"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+	), handlers.HandleGetHealthScore)
+
+	// Tool 7: detect_di_antipatterns - DI anti-pattern detection
+	s.AddTool(mcp.NewTool("detect_di_antipatterns",
+		mcp.WithDescription("Detect Dependency Injection anti-patterns in Python code (constructor over-injection, hidden dependencies, concrete dependencies, service locator)"),
+		mcp.WithString("path",
+			mcp.Required(),
+			mcp.Description("Path to Python code to analyze")),
+		mcp.WithNumber("constructor_param_threshold",
+			mcp.Description("Maximum allowed constructor parameters (default: 5)")),
+		mcp.WithString("min_severity",
+			mcp.Description("Minimum severity: info, warning, error (default: warning)")),
+	), handlers.HandleDetectDIAntipatterns)
+}

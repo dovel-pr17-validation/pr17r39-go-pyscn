@@ -1,0 +1,787 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/analyzer"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newDefaultDeadCodeRequest(paths ...string) domain.DeadCodeRequest {
+	if len(paths) == 0 {
+		paths = []string{"../testdata/python/simple/control_flow.py"}
+	}
+	return domain.DeadCodeRequest{
+		Paths:                     paths,
+		OutputFormat:              domain.OutputFormatJSON,
+		MinSeverity:               domain.DeadCodeSeverityInfo,
+		SortBy:                    domain.DeadCodeSortByFile,
+		ShowContext:               domain.BoolPtr(false),
+		ContextLines:              2,
+		Recursive:                 domain.BoolPtr(false),
+		DetectAfterReturn:         domain.BoolPtr(true),
+		DetectAfterBreak:          domain.BoolPtr(true),
+		DetectAfterContinue:       domain.BoolPtr(true),
+		DetectAfterRaise:          domain.BoolPtr(true),
+		DetectUnreachableBranches: domain.BoolPtr(true),
+	}
+}
+
+func TestNewDeadCodeService(t *testing.T) {
+	service := NewDeadCodeService()
+
+	assert.NotNil(t, service)
+	assert.NotNil(t, service.parser)
+}
+
+func TestDeadCodeService_Analyze(t *testing.T) {
+	service := NewDeadCodeService()
+	ctx := context.Background()
+
+	t.Run("successful analysis with Python file containing functions", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest("../testdata/python/simple/control_flow.py")
+
+		response, err := service.Analyze(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.NotEmpty(t, response.GeneratedAt)
+		assert.NotEmpty(t, response.Version)
+		assert.NotNil(t, response.Config)
+		assert.GreaterOrEqual(t, response.Summary.TotalFiles, 1)
+
+		// Verify response structure
+		for _, file := range response.Files {
+			assert.NotEmpty(t, file.FilePath)
+			assert.GreaterOrEqual(t, file.TotalFunctions, 0)
+
+			for _, function := range file.Functions {
+				assert.NotEmpty(t, function.Name)
+				assert.NotEmpty(t, function.FilePath)
+				assert.GreaterOrEqual(t, function.TotalBlocks, 0)
+				assert.GreaterOrEqual(t, function.DeadBlocks, 0)
+				assert.GreaterOrEqual(t, function.ReachableRatio, 0.0)
+				assert.LessOrEqual(t, function.ReachableRatio, 1.0)
+
+				for _, finding := range function.Findings {
+					assert.NotEmpty(t, finding.Location.FilePath)
+					assert.Greater(t, finding.Location.StartLine, 0)
+					assert.Contains(t, []domain.DeadCodeSeverity{
+						domain.DeadCodeSeverityInfo,
+						domain.DeadCodeSeverityWarning,
+						domain.DeadCodeSeverityCritical,
+					}, finding.Severity)
+				}
+			}
+		}
+	})
+
+	t.Run("analyze file with no functions should return valid response", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest("../testdata/python/simple/imports.py")
+
+		response, err := service.Analyze(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.Equal(t, 1, response.Summary.TotalFiles)
+		// File with no functions should still be analyzed but may have no findings
+	})
+
+	t.Run("analyze with severity filtering", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest("../testdata/python/simple/control_flow.py")
+		req.MinSeverity = domain.DeadCodeSeverityWarning // Only warning and critical
+
+		response, err := service.Analyze(ctx, req)
+
+		assert.NoError(t, err)
+		if response != nil {
+			for _, file := range response.Files {
+				for _, function := range file.Functions {
+					for _, finding := range function.Findings {
+						assert.True(t, finding.Severity.IsAtLeast(domain.DeadCodeSeverityWarning))
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("clean file serializes files as empty list", func(t *testing.T) {
+		filePath := t.TempDir() + "/clean.py"
+		require.NoError(t, os.WriteFile(filePath, []byte("def f():\n    return 1\n"), 0o644))
+
+		response, err := service.Analyze(ctx, newDefaultDeadCodeRequest(filePath))
+
+		require.NoError(t, err)
+		require.NotNil(t, response.Files)
+		assert.Empty(t, response.Files)
+		data, err := json.Marshal(response)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"files":[]`)
+	})
+
+	t.Run("module rollups ignore severity filters", func(t *testing.T) {
+		filePath := "../testdata/python/edge_cases/dead_code_examples.py"
+		infoRequest := newDefaultDeadCodeRequest(filePath)
+		infoRequest.MinSeverity = domain.DeadCodeSeverityInfo
+		infoResponse, err := service.Analyze(ctx, infoRequest)
+		require.NoError(t, err)
+
+		criticalRequest := newDefaultDeadCodeRequest(filePath)
+		criticalRequest.MinSeverity = domain.DeadCodeSeverityCritical
+		criticalResponse, err := service.Analyze(ctx, criticalRequest)
+		require.NoError(t, err)
+
+		assert.Equal(t, infoResponse.ModuleRollups, criticalResponse.ModuleRollups)
+		assert.Greater(t, infoResponse.ModuleRollups[filePath].DeadCodeFindingCount, 0)
+	})
+
+	t.Run("class scopes carry explicit ownership", func(t *testing.T) {
+		filePath := t.TempDir() + "/class_scope.py"
+		source := `class Config:
+    raise RuntimeError("stop")
+    mode = "unreachable"
+
+    def resolve(self):
+        return self.mode
+        print("unreachable")
+`
+		require.NoError(t, os.WriteFile(filePath, []byte(source), 0o644))
+
+		response, err := service.Analyze(ctx, newDefaultDeadCodeRequest(filePath))
+		require.NoError(t, err)
+		require.Len(t, response.Files, 1)
+		file := response.Files[0]
+		assert.Equal(t, 1, file.TotalFunctions)
+		assert.Equal(t, 1, file.AffectedFunctions)
+		assert.Equal(t, 1, file.TotalClassScopes)
+		assert.Equal(t, 1, file.AffectedClassScopes)
+		require.Len(t, file.Functions, 1)
+		require.Len(t, file.ClassScopes, 1)
+		assert.Equal(t, 1, response.Summary.TotalFunctions)
+		assert.Equal(t, 1, response.Summary.FunctionsWithDeadCode)
+		assert.Equal(t, 1, response.Summary.TotalClassScopes)
+		assert.Equal(t, 1, response.Summary.ClassScopesWithDeadCode)
+		assert.Equal(t, 2, response.Summary.TotalFindings)
+
+		scopesByKind := make(map[domain.AnalysisScopeKind]domain.FunctionDeadCode)
+		for _, scope := range file.ExecutionScopes() {
+			scopesByKind[scope.ScopeKind] = scope
+			for _, finding := range scope.Findings {
+				assert.Equal(t, scope.ScopeKind, finding.ScopeKind)
+			}
+		}
+		assert.Equal(t, "Config", scopesByKind[domain.AnalysisScopeClass].Name)
+		assert.Equal(t, "Config.resolve", scopesByKind[domain.AnalysisScopeFunction].Name)
+		assert.NotEmpty(t, scopesByKind[domain.AnalysisScopeClass].Findings)
+		assert.NotEmpty(t, scopesByKind[domain.AnalysisScopeFunction].Findings)
+
+		output, err := NewDeadCodeFormatter().Format(response, domain.OutputFormatJSON)
+		require.NoError(t, err)
+		var decoded domain.DeadCodeResponse
+		require.NoError(t, json.Unmarshal([]byte(output), &decoded))
+		require.Len(t, decoded.Files, 1)
+		require.Len(t, decoded.Files[0].Functions, 1)
+		require.Len(t, decoded.Files[0].ClassScopes, 1)
+		assert.Equal(t, domain.AnalysisScopeFunction, decoded.Files[0].Functions[0].ScopeKind)
+		assert.Equal(t, domain.AnalysisScopeClass, decoded.Files[0].ClassScopes[0].ScopeKind)
+	})
+
+	t.Run("analyze multiple files", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest(
+			"../testdata/python/simple/functions.py",
+			"../testdata/python/simple/control_flow.py",
+		)
+
+		response, err := service.Analyze(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.Equal(t, 2, response.Summary.TotalFiles)
+	})
+
+	t.Run("error handling for non-existent file", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest("../testdata/non_existent_file.py")
+
+		response, err := service.Analyze(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.NotEmpty(t, response.Errors)
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+
+		req := newDefaultDeadCodeRequest("../testdata/python/simple/functions.py")
+
+		_, err := service.Analyze(ctx, req)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cancelled")
+	})
+
+	t.Run("analyze with context enabled", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest("../testdata/python/simple/control_flow.py")
+		req.ShowContext = domain.BoolPtr(true)
+		req.ContextLines = 3
+
+		response, err := service.Analyze(ctx, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		// When context is enabled, findings may have context information
+	})
+}
+
+func TestDeadCodeService_AnalyzeFile(t *testing.T) {
+	service := NewDeadCodeService()
+	ctx := context.Background()
+
+	t.Run("analyze single file", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest()
+		req.Paths = nil // Remove paths since AnalyzeFile provides the path separately
+
+		file, err := service.AnalyzeFile(ctx, "../testdata/python/simple/functions.py", req)
+
+		assert.NoError(t, err)
+		if file != nil {
+			assert.NotEmpty(t, file.FilePath)
+			assert.GreaterOrEqual(t, file.TotalFunctions, 0)
+		}
+	})
+
+	t.Run("analyze file with errors should return error", func(t *testing.T) {
+		req := newDefaultDeadCodeRequest()
+		req.Paths = nil // Remove paths since AnalyzeFile provides the path separately
+
+		_, err := service.AnalyzeFile(ctx, "../testdata/non_existent_file.py", req)
+
+		assert.Error(t, err)
+	})
+}
+
+func TestDeadCodeService_ConvertSeverity(t *testing.T) {
+	// Note: This is testing internal package types, so we'll focus on the public interface
+	// The actual analyzer.SeverityLevel types are in the internal package
+	// We can test the conversion through the service behavior instead
+	// This test is a placeholder for now
+	assert.True(t, true)
+}
+
+func TestDeadCodeService_FilterFiles(t *testing.T) {
+	service := NewDeadCodeService()
+
+	// Create test files with different severity levels
+	files := []domain.FileDeadCode{
+		{
+			FilePath: "file1.py",
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name: "func1",
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityInfo},
+						{Severity: domain.DeadCodeSeverityWarning},
+					},
+					CriticalCount: 0,
+					WarningCount:  1,
+					InfoCount:     1,
+				},
+			},
+		},
+		{
+			FilePath: "file2.py",
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name: "func2",
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityCritical},
+					},
+					CriticalCount: 1,
+					WarningCount:  0,
+					InfoCount:     0,
+				},
+			},
+		},
+		{
+			FilePath: "file3.py",
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name: "func3",
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityInfo},
+					},
+					CriticalCount: 0,
+					WarningCount:  0,
+					InfoCount:     1,
+				},
+			},
+		},
+		{
+			FilePath: "class.py",
+			ClassScopes: []domain.FunctionDeadCode{{
+				Name:      "Config",
+				ScopeKind: domain.AnalysisScopeClass,
+				Findings: []domain.DeadCodeFinding{{
+					Severity: domain.DeadCodeSeverityCritical,
+				}},
+				CriticalCount: 1,
+			}},
+		},
+	}
+
+	t.Run("filter by warning severity", func(t *testing.T) {
+		req := domain.DeadCodeRequest{
+			MinSeverity: domain.DeadCodeSeverityWarning,
+		}
+
+		filtered := service.filterFiles(files, req)
+
+		// Should include files with warning or critical findings
+		assert.Len(t, filtered, 3)
+		assert.Equal(t, "file1.py", filtered[0].FilePath)
+		assert.Equal(t, "file2.py", filtered[1].FilePath)
+		assert.Equal(t, "class.py", filtered[2].FilePath)
+		assert.NotNil(t, filtered[2].Functions)
+		assert.Empty(t, filtered[2].Functions)
+		require.Len(t, filtered[2].ClassScopes, 1)
+		assert.Equal(t, 1, filtered[2].AffectedClassScopes)
+	})
+
+	t.Run("filter by critical severity", func(t *testing.T) {
+		req := domain.DeadCodeRequest{
+			MinSeverity: domain.DeadCodeSeverityCritical,
+		}
+
+		filtered := service.filterFiles(files, req)
+
+		// Should include only files with critical findings
+		assert.Len(t, filtered, 2)
+		assert.Equal(t, "file2.py", filtered[0].FilePath)
+		assert.Equal(t, "class.py", filtered[1].FilePath)
+	})
+
+	t.Run("filter by info severity includes all", func(t *testing.T) {
+		req := domain.DeadCodeRequest{
+			MinSeverity: domain.DeadCodeSeverityInfo,
+		}
+
+		filtered := service.filterFiles(files, req)
+
+		// Should include all files
+		assert.Len(t, filtered, 4)
+	})
+}
+
+func TestDeadCodeService_FilterFindingsBySeverity(t *testing.T) {
+	service := NewDeadCodeService()
+
+	findings := []domain.DeadCodeFinding{
+		{Severity: domain.DeadCodeSeverityInfo, Reason: "info1"},
+		{Severity: domain.DeadCodeSeverityWarning, Reason: "warning1"},
+		{Severity: domain.DeadCodeSeverityCritical, Reason: "critical1"},
+		{Severity: domain.DeadCodeSeverityInfo, Reason: "info2"},
+	}
+
+	t.Run("filter by warning severity", func(t *testing.T) {
+		filtered := service.filterFindingsBySeverity(findings, domain.DeadCodeSeverityWarning)
+
+		assert.Len(t, filtered, 2)
+		assert.Equal(t, "warning1", filtered[0].Reason)
+		assert.Equal(t, "critical1", filtered[1].Reason)
+	})
+
+	t.Run("filter by critical severity", func(t *testing.T) {
+		filtered := service.filterFindingsBySeverity(findings, domain.DeadCodeSeverityCritical)
+
+		assert.Len(t, filtered, 1)
+		assert.Equal(t, "critical1", filtered[0].Reason)
+	})
+
+	t.Run("filter by info severity includes all", func(t *testing.T) {
+		filtered := service.filterFindingsBySeverity(findings, domain.DeadCodeSeverityInfo)
+
+		assert.Len(t, filtered, 4)
+	})
+
+	t.Run("no matches yields empty list, not nil", func(t *testing.T) {
+		filtered := service.filterFindingsBySeverity(findings[:1], domain.DeadCodeSeverityCritical)
+
+		require.NotNil(t, filtered)
+		assert.Empty(t, filtered)
+	})
+}
+
+func TestDeadCodeService_SortFiles(t *testing.T) {
+	service := NewDeadCodeService()
+
+	files := []domain.FileDeadCode{
+		{
+			FilePath: "c_file.py",
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name: "func1",
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityInfo},
+					},
+				},
+			},
+		},
+		{
+			FilePath: "a_file.py",
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name: "func2",
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityCritical},
+					},
+				},
+			},
+		},
+		{
+			FilePath: "b_file.py",
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name: "func3",
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityWarning},
+					},
+				},
+			},
+		},
+	}
+
+	t.Run("sort by file path", func(t *testing.T) {
+		sorted := service.sortFiles(files, domain.DeadCodeSortByFile)
+
+		require.Len(t, sorted, 3)
+		assert.Equal(t, "a_file.py", sorted[0].FilePath)
+		assert.Equal(t, "b_file.py", sorted[1].FilePath)
+		assert.Equal(t, "c_file.py", sorted[2].FilePath)
+	})
+
+	t.Run("sort by severity", func(t *testing.T) {
+		sorted := service.sortFiles(files, domain.DeadCodeSortBySeverity)
+
+		require.Len(t, sorted, 3)
+		// Should be sorted by highest severity first
+		assert.Equal(t, "a_file.py", sorted[0].FilePath) // Critical
+		assert.Equal(t, "b_file.py", sorted[1].FilePath) // Warning
+		assert.Equal(t, "c_file.py", sorted[2].FilePath) // Info
+	})
+
+	t.Run("sort by default (file)", func(t *testing.T) {
+		sorted := service.sortFiles(files, domain.DeadCodeSortCriteria("unknown"))
+
+		require.Len(t, sorted, 3)
+		assert.Equal(t, "a_file.py", sorted[0].FilePath)
+		assert.Equal(t, "b_file.py", sorted[1].FilePath)
+		assert.Equal(t, "c_file.py", sorted[2].FilePath)
+	})
+}
+
+func TestDeadCodeService_GetHighestSeverityLevel(t *testing.T) {
+	service := NewDeadCodeService()
+
+	t.Run("file with critical severity", func(t *testing.T) {
+		file := domain.FileDeadCode{
+			Functions: []domain.FunctionDeadCode{
+				{
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityInfo},
+						{Severity: domain.DeadCodeSeverityCritical},
+						{Severity: domain.DeadCodeSeverityWarning},
+					},
+				},
+			},
+		}
+
+		level := service.getHighestSeverityLevel(file)
+		assert.Equal(t, 3, level) // Critical = 3
+	})
+
+	t.Run("file with warning severity", func(t *testing.T) {
+		file := domain.FileDeadCode{
+			Functions: []domain.FunctionDeadCode{
+				{
+					Findings: []domain.DeadCodeFinding{
+						{Severity: domain.DeadCodeSeverityInfo},
+						{Severity: domain.DeadCodeSeverityWarning},
+					},
+				},
+			},
+		}
+
+		level := service.getHighestSeverityLevel(file)
+		assert.Equal(t, 2, level) // Warning = 2
+	})
+
+	t.Run("file with no findings", func(t *testing.T) {
+		file := domain.FileDeadCode{
+			Functions: []domain.FunctionDeadCode{
+				{
+					Findings: []domain.DeadCodeFinding{},
+				},
+			},
+		}
+
+		level := service.getHighestSeverityLevel(file)
+		assert.Equal(t, 0, level)
+	})
+}
+
+func TestDeadCodeService_GenerateSummary(t *testing.T) {
+	service := NewDeadCodeService()
+
+	files := []domain.FileDeadCode{
+		{
+			FilePath:            "file1.py",
+			TotalFunctions:      2,
+			AffectedFunctions:   1,
+			TotalClassScopes:    1,
+			AffectedClassScopes: 1,
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name:          "func1",
+					TotalBlocks:   10,
+					DeadBlocks:    2,
+					CriticalCount: 1,
+					WarningCount:  1,
+					InfoCount:     0,
+					Findings: []domain.DeadCodeFinding{
+						{Reason: "unreachable_after_return"},
+						{Reason: "dead_branch"},
+					},
+				},
+			},
+			ClassScopes: []domain.FunctionDeadCode{{
+				Name:          "Config",
+				ScopeKind:     domain.AnalysisScopeClass,
+				TotalBlocks:   4,
+				DeadBlocks:    1,
+				CriticalCount: 1,
+				Findings: []domain.DeadCodeFinding{{
+					Reason: "unreachable_after_raise",
+				}},
+			}},
+		},
+		{
+			FilePath:          "file2.py",
+			TotalFunctions:    1,
+			AffectedFunctions: 1,
+			Functions: []domain.FunctionDeadCode{
+				{
+					Name:          "func2",
+					TotalBlocks:   5,
+					DeadBlocks:    1,
+					CriticalCount: 0,
+					WarningCount:  0,
+					InfoCount:     2,
+					Findings: []domain.DeadCodeFinding{
+						{Reason: "unreachable_after_return"},
+						{Reason: "unused_variable"},
+					},
+				},
+			},
+		},
+	}
+
+	// The population covers all 3 analyzed files, including the one without findings.
+	population := deadCodePopulation{Files: 3, Functions: 4, ClassScopes: 2, Blocks: 40}
+
+	t.Run("generate summary with files", func(t *testing.T) {
+		req := domain.DeadCodeRequest{}
+		summary := service.generateSummary(files, population, req)
+
+		assert.Equal(t, 3, summary.TotalFiles)
+		assert.Equal(t, 2, summary.FilesWithDeadCode)
+		assert.Equal(t, 4, summary.TotalFunctions)        // from the population, not the finding files
+		assert.Equal(t, 2, summary.FunctionsWithDeadCode) // 1 + 1
+		assert.Equal(t, 2, summary.TotalClassScopes)      // from the population
+		assert.Equal(t, 1, summary.ClassScopesWithDeadCode)
+		assert.Equal(t, 5, summary.TotalFindings) // 2 + 1 + 2
+		assert.Equal(t, 2, summary.CriticalFindings)
+		assert.Equal(t, 1, summary.WarningFindings)
+		assert.Equal(t, 2, summary.InfoFindings)
+		assert.Equal(t, 40, summary.TotalBlocks) // every analyzed scope, not just 10 + 4 + 5
+		assert.Equal(t, 4, summary.DeadBlocks)   // 2 + 1 + 1
+		assert.InDelta(t, 4.0/40.0, summary.OverallDeadRatio, 1e-9)
+
+		// Check findings by reason
+		assert.Equal(t, 2, summary.FindingsByReason["unreachable_after_return"])
+		assert.Equal(t, 1, summary.FindingsByReason["dead_branch"])
+		assert.Equal(t, 1, summary.FindingsByReason["unused_variable"])
+		assert.Equal(t, 1, summary.FindingsByReason["unreachable_after_raise"])
+	})
+
+	t.Run("generate summary with no files", func(t *testing.T) {
+		req := domain.DeadCodeRequest{}
+		summary := service.generateSummary([]domain.FileDeadCode{}, deadCodePopulation{Files: 5, Functions: 7, Blocks: 21}, req)
+
+		assert.Equal(t, 5, summary.TotalFiles)
+		assert.Equal(t, 0, summary.FilesWithDeadCode)
+		assert.Equal(t, 7, summary.TotalFunctions)
+		assert.Equal(t, 0, summary.FunctionsWithDeadCode)
+		assert.Equal(t, 0, summary.TotalFindings)
+		assert.Equal(t, 21, summary.TotalBlocks)
+		assert.Equal(t, 0, summary.DeadBlocks)
+		assert.Equal(t, 0.0, summary.OverallDeadRatio)
+	})
+}
+
+func TestDeadCodeService_CountTotalFindings(t *testing.T) {
+	service := NewDeadCodeService()
+
+	functions := []domain.FunctionDeadCode{
+		{
+			Findings: []domain.DeadCodeFinding{
+				{Reason: "finding1"},
+				{Reason: "finding2"},
+			},
+		},
+		{
+			Findings: []domain.DeadCodeFinding{
+				{Reason: "finding3"},
+			},
+		},
+		{
+			Findings: []domain.DeadCodeFinding{},
+		},
+	}
+
+	total := service.countTotalFindings(functions)
+	assert.Equal(t, 3, total)
+}
+
+func TestDeadCodeService_BuildConfigForResponse(t *testing.T) {
+	service := NewDeadCodeService()
+
+	req := domain.DeadCodeRequest{
+		MinSeverity:               domain.DeadCodeSeverityWarning,
+		SortBy:                    domain.DeadCodeSortBySeverity,
+		ShowContext:               domain.BoolPtr(true),
+		ContextLines:              3,
+		DetectAfterReturn:         domain.BoolPtr(true),
+		DetectAfterBreak:          domain.BoolPtr(false),
+		DetectAfterContinue:       domain.BoolPtr(true),
+		DetectAfterRaise:          domain.BoolPtr(false),
+		DetectUnreachableBranches: domain.BoolPtr(true),
+		IncludePatterns:           []string{"**/*.py"},
+		ExcludePatterns:           []string{"test_*.py"},
+		IgnorePatterns:            []string{"# TODO"},
+	}
+
+	config := service.buildConfigForResponse(req)
+
+	configMap, ok := config.(map[string]interface{})
+	require.True(t, ok)
+
+	assert.Equal(t, domain.DeadCodeSeverityWarning, configMap["min_severity"])
+	assert.Equal(t, domain.DeadCodeSortBySeverity, configMap["sort_by"])
+	assert.Equal(t, true, configMap["show_context"])
+	assert.Equal(t, 3, configMap["context_lines"])
+	assert.Equal(t, true, configMap["detect_after_return"])
+	assert.Equal(t, false, configMap["detect_after_break"])
+	assert.Equal(t, true, configMap["detect_after_continue"])
+	assert.Equal(t, false, configMap["detect_after_raise"])
+	assert.Equal(t, true, configMap["detect_unreachable_branches"])
+	assert.Equal(t, []string{"**/*.py"}, configMap["include_patterns"])
+	assert.Equal(t, []string{"test_*.py"}, configMap["exclude_patterns"])
+	assert.Equal(t, []string{"# TODO"}, configMap["ignore_patterns"])
+}
+
+func TestDeadCodeService_DetectionFlagsFilterFindings(t *testing.T) {
+	service := NewDeadCodeService()
+	req := newDefaultDeadCodeRequest("../testdata/python/simple/dead_code_simple.py")
+	req.DetectAfterReturn = domain.BoolPtr(false)
+
+	response, err := service.Analyze(context.Background(), req)
+	require.NoError(t, err)
+	for _, file := range response.Files {
+		for _, function := range file.Functions {
+			for _, finding := range function.Findings {
+				assert.NotEqual(t, string(analyzer.ReasonUnreachableAfterReturn), finding.Reason)
+			}
+		}
+	}
+}
+
+func TestDeadCodeService_ResponseMetadata(t *testing.T) {
+	service := NewDeadCodeService()
+	ctx := context.Background()
+
+	req := newDefaultDeadCodeRequest("../testdata/python/simple/functions.py")
+
+	beforeTime := time.Now()
+	response, err := service.Analyze(ctx, req)
+	afterTime := time.Now()
+
+	assert.NoError(t, err)
+	require.NotNil(t, response)
+
+	// Verify timestamp is within expected range
+	assert.NotEmpty(t, response.GeneratedAt)
+	generatedTime, err := time.Parse(time.RFC3339, response.GeneratedAt)
+	assert.NoError(t, err)
+	assert.True(t, generatedTime.After(beforeTime.Add(-time.Second)) && generatedTime.Before(afterTime.Add(time.Second)),
+		"Generated time %v should be between %v and %v", generatedTime, beforeTime, afterTime)
+
+	// Verify version is present
+	assert.NotEmpty(t, response.Version)
+
+	// Verify config is present
+	assert.NotNil(t, response.Config)
+}
+
+// TestDeadCodeService_SummaryCoversFilesWithoutFindings pins the contract that the
+// analyzed totals cover every file, not just the ones that produced findings. When
+// they were summed over the findings-filtered list, a repo whose dead code sat in
+// one file reported that file's function count as the whole project's and divided
+// OverallDeadRatio by that file's blocks, overstating dead-code density by orders
+// of magnitude.
+func TestDeadCodeService_SummaryCoversFilesWithoutFindings(t *testing.T) {
+	service := NewDeadCodeService()
+	ctx := context.Background()
+
+	fixture := []string{
+		"../testdata/python/deadcode_summary_population/clean1.py",
+		"../testdata/python/deadcode_summary_population/clean2.py",
+		"../testdata/python/deadcode_summary_population/dirty.py",
+	}
+
+	response, err := service.Analyze(ctx, newDefaultDeadCodeRequest(fixture...))
+	require.NoError(t, err)
+
+	// Only dirty.py holds dead code, so it is the only file reported.
+	require.Len(t, response.Files, 1)
+	require.Equal(t, fixture[2], response.Files[0].FilePath)
+	require.Equal(t, 1, response.Summary.TotalFindings)
+
+	summary := response.Summary
+	assert.Equal(t, 3, summary.TotalFiles)
+	assert.Equal(t, 1, summary.FilesWithDeadCode)
+	// clean1: 3, clean2: 3 functions + 1 method, dirty: 2.
+	assert.Equal(t, 9, summary.TotalFunctions)
+	assert.Equal(t, 1, summary.FunctionsWithDeadCode)
+	// The executable class suite in clean2.py, which holds no findings at all.
+	assert.Equal(t, 1, summary.TotalClassScopes)
+	assert.Equal(t, 0, summary.ClassScopesWithDeadCode)
+
+	// The blocks of the one reported scope must be a strict subset of the population.
+	reportedBlocks := 0
+	for _, scope := range response.Files[0].ExecutionScopes() {
+		reportedBlocks += scope.TotalBlocks
+	}
+	assert.Greater(t, summary.TotalBlocks, reportedBlocks,
+		"total_blocks must count every analyzed scope, not only the ones with findings")
+	assert.Equal(t, 1, summary.DeadBlocks)
+	assert.InDelta(t, float64(summary.DeadBlocks)/float64(summary.TotalBlocks), summary.OverallDeadRatio, 1e-9)
+	assert.Less(t, summary.OverallDeadRatio, 0.1,
+		"one dead block in a mostly clean fixture must not read as a double-digit dead ratio")
+}

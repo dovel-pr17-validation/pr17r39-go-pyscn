@@ -1,0 +1,153 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyscn"
+dynamic = ["version"]
+description = "An intelligent Python code quality analyzer with architectural guidance"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "DaisukeYoda", email = "daisukeyoda@users.noreply.github.com"}
+]
+maintainers = [
+    {name = "DaisukeYoda", email = "daisukeyoda@users.noreply.github.com"}
+]
+keywords = [
+    "python",
+    "static-analysis",
+    "code-quality",
+    "complexity",
+    "linter",
+    "ast",
+    "cfg",
+    "dead-code"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "build>=0.7.0",
+    "twine>=3.0.0",
+]
+
+[project.scripts]
+pyscn = "pyscn.__main__:main"
+pyscn-mcp = "pyscn.mcp_main:main"
+
+[project.urls]
+Homepage = "https://github.com/ludo-technologies/pyscn"
+Documentation = "https://github.com/ludo-technologies/pyscn/tree/main/docs"
+Repository = "https://github.com/ludo-technologies/pyscn"
+Issues = "https://github.com/ludo-technologies/pyscn/issues"
+Changelog = "https://github.com/ludo-technologies/pyscn/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["pyscn"]
+package-dir = {"" = "python/src"}
+
+[tool.setuptools.package-data]
+pyscn = ["bin/*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.py[co]", "__pycache__", "*.so", "*.pyd"]
+
+[tool.setuptools_scm]
+# Default configuration - gets version from git tags
+
+[build]
+exclude = [
+    "*.pyc",
+    "*.pyo", 
+    "__pycache__",
+    ".git",
+    ".gitignore",
+    "*.md",
+    "tests/",
+    "docs/"
+]
+
+# pyscn clone detection configuration (flat structure)
+[tool.pyscn.clones]
+# Analysis settings
+min_lines = 5
+min_nodes = 10
+max_edit_distance = 50.0
+ignore_literals = false
+ignore_identifiers = false
+cost_model_type = "python"
+
+# Threshold settings for clone type classification
+type1_threshold = 0.98
+type2_threshold = 0.95
+type3_threshold = 0.85
+type4_threshold = 0.70
+similarity_threshold = 0.9
+
+# Input settings
+paths = ["."]
+recursive = true
+include_patterns = ["*.py"]
+exclude_patterns = ["test_*.py", "*_test.py", "__pycache__/*"]
+
+# Output settings
+format = "text"
+show_details = false
+show_content = false
+sort_by = "similarity"
+group_clones = true
+
+# Filtering settings
+min_similarity = 0.0
+max_similarity = 1.0
+enabled_clone_types = ["type1", "type2", "type4"]
+max_results = 10000
+
+# Grouping settings
+grouping_mode = "complete_linkage"
+grouping_threshold = 0.85
+k_core_k = 2
+
+# LSH acceleration settings
+lsh_enabled = "auto"
+lsh_auto_threshold = 500
+lsh_similarity_threshold = 0.78
+lsh_bands = 32
+lsh_rows = 4
+lsh_hashes = 128
+
+# Performance settings
+max_memory_mb = 100
+batch_size = 100
+enable_batching = true
+max_goroutines = 4
+timeout_seconds = 300
+
+[tool.uv]
+# Restrict the dev/build toolchain lock (uv.lock) to Python >= 3.10.
+# pyscn ships as a Go binary with zero Python runtime dependencies, so the
+# wheel keeps requires-python = ">=3.8" (see [project]); this only affects the
+# dev environment resolved by `uv sync`. Older Python forks (3.8/3.9, both EOL)
+# pinned dev tools such as urllib3/requests/pytest to versions that can no
+# longer receive security fixes, since the patched releases require >= 3.10.
+environments = ["python_full_version >= '3.10'"]

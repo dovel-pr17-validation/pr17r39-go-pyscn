@@ -1,0 +1,220 @@
+<div align="center">
+
+[English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [Français](README.fr.md)
+
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img alt="pyscn" src="assets/logo-light.svg" width="320">
+</picture>
+
+**Analyse de la qualité du code Python à l'ère du codage par IA.**
+
+Vous développez avec Cursor, Claude ou ChatGPT ? pyscn garde le code généré par IA maintenable grâce à une analyse structurelle.
+
+[![Article](https://img.shields.io/badge/dev.to-Article-0A0A0A?style=flat-square&logo=dev.to)](https://dev.to/daisukeyoda/pyscn-the-code-quality-analyzer-for-vibe-coders-18hk)
+[![PyPI](https://img.shields.io/pypi/v/pyscn?style=flat-square&logo=pypi)](https://pypi.org/project/pyscn/)
+[![Downloads](https://img.shields.io/pypi/dm/pyscn?style=flat-square&logo=pypi&label=downloads)](https://pypi.org/project/pyscn/)
+[![Go](https://img.shields.io/github/go-mod/go-version/ludo-technologies/pyscn?style=flat-square&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/github/license/ludo-technologies/pyscn?style=flat-square)](LICENSE)
+
+<a href="https://github.com/apps/polyscan-app/installations/select_target"><img alt="Install Polyscan App for free" src="https://img.shields.io/badge/Polyscan_App-Install_for_free-2ea44f?style=for-the-badge&logo=github&logoColor=white" height="44"></a>
+
+</div>
+
+## Démarrage rapide
+
+```bash
+# Lancer l'analyse sans installation
+uvx pyscn@latest analyze .
+# ou
+pipx run pyscn analyze .
+```
+
+## Démo
+
+<img alt="pyscn analysis report" src="https://raw.githubusercontent.com/ludo-technologies/pyscn/main/assets/demo-report.png" width="720">
+
+## Fonctionnalités
+
+Une seule commande note l'ensemble de votre base de code (0-100 avec une note de A à F) et génère un rapport HTML qui montre quoi corriger en premier.
+
+pyscn analyse votre code sous cinq angles :
+
+- 🧹 **Code mort** - le code inatteignable que vous pouvez supprimer sans risque
+- 📋 **Code dupliqué** - le code copié-collé ou structurellement similaire qui mérite d'être fusionné (détection de clones Type 1-4)
+- 🌀 **Complexité** - les fonctions difficiles à lire et à tester (complexité cyclomatique et cognitive)
+- 🏗️ **Architecture** - imports circulaires, violations de règles de couches (préréglages clean / layered / hexagonal / MVC) et détection automatique de communautés de modules qui révèlent la structure réelle de votre code
+- 🧩 **Conception des classes** - les classes qui en font trop ou dépendent de trop de choses (couplage CBO, cohésion LCOM4)
+
+**100 000+ lignes/s** • Construit avec Go + tree-sitter
+
+## Autres langages
+
+pyscn est l'analyseur Python de [polyscan](https://github.com/ludo-technologies/polyscan). Pour JavaScript, TypeScript, Go, Rust et C++, lancez :
+
+```bash
+npx polyscan analyze .
+```
+
+Les mêmes cinq angles, le même score de 0 à 100, un seul rapport HTML.
+
+## Polyscan pour GitHub
+
+[Polyscan App](https://github.com/apps/polyscan-app/installations/select_target) publie chaque semaine un rapport d'audit sous forme d'issue GitHub. Gratuit pour les dépôts publics.
+
+<a href="https://github.com/apps/polyscan-app/installations/select_target"><img alt="Install Polyscan App for free" src="https://img.shields.io/badge/Polyscan_App-Install_for_free-2ea44f?style=for-the-badge&logo=github&logoColor=white" height="44"></a>
+
+## Intégration avec les agents IA
+
+pyscn fournit des Agent Skills qui apprennent aux agents de codage IA quand et comment lancer chaque analyse : bilan de santé, refactorisation, revue d'architecture et rapports adaptés à la CI.
+
+### Agent Skills (recommandé)
+
+```bash
+uvx add-skills ludo-technologies/pyscn
+```
+
+Cette commande installe les Skills dans votre projet. Elles fonctionnent avec Claude Code, Cursor, Codex, Gemini CLI et [de nombreux autres agents](https://github.com/ludo-technologies/add-skills) (ajoutez `--agent cursor` pour cibler un agent, `--global` pour tous vos projets).
+
+Il suffit ensuite de demander à votre agent :
+
+1. « Analyse la qualité du code du répertoire app/ »
+
+2. « Trouve le code dupliqué et aide-moi à le refactoriser »
+
+3. « Montre-moi le code complexe et aide-moi à le simplifier »
+
+### Serveur MCP (optionnel)
+
+Pour une intégration plus poussée, le serveur `pyscn-mcp` intégré expose les mêmes analyses sous forme d'outils MCP à Claude Code, Cursor, ChatGPT et autres clients MCP.
+
+**Plugin Claude Code (configure le serveur MCP et les Skills ensemble) :**
+
+```bash
+claude plugin marketplace add ludo-technologies/pyscn
+claude plugin install pyscn-mcp@pyscn-marketplace
+```
+
+**Configuration manuelle pour Claude Code :**
+
+```bash
+claude mcp add pyscn-mcp uvx -- pyscn-mcp
+```
+
+**Cursor / Claude Desktop :** ajoutez à vos paramètres MCP (`~/.config/claude-desktop/config.json` ou les paramètres Cursor) :
+
+```json
+{
+  "mcpServers": {
+    "pyscn-mcp": {
+      "command": "uvx",
+      "args": ["pyscn-mcp"],
+      "env": {
+        "PYSCN_CONFIG": "/path/to/.pyscn.toml"
+      }
+    }
+  }
+}
+```
+
+Consultez `mcp/README.md` pour les guides de configuration et `docs/MCP_INTEGRATION.md` pour les détails d'architecture.
+
+## Installation
+
+```bash
+# Installer avec pipx (recommandé)
+pipx install pyscn
+
+# Ou avec uv
+uv tool install pyscn
+```
+
+<details>
+<summary>Autres méthodes d'installation</summary>
+
+### Compilation depuis les sources
+```bash
+git clone https://github.com/ludo-technologies/pyscn.git
+cd pyscn
+make build
+```
+
+### Go install
+```bash
+go install github.com/ludo-technologies/pyscn/cmd/pyscn@latest
+```
+
+</details>
+
+## Commandes courantes
+
+### `pyscn analyze`
+Lance une analyse complète avec rapport HTML
+```bash
+pyscn analyze .                              # Toutes les analyses avec rapport HTML
+pyscn analyze --json .                       # Générer un rapport JSON
+pyscn analyze --select complexity .          # Analyse de complexité uniquement
+pyscn analyze --select deps .                # Analyse de dépendances uniquement
+pyscn analyze --select complexity,deps,deadcode . # Analyses multiples
+pyscn analyze --skip-communities .           # Ignorer la détection de communautés de modules
+```
+
+### `pyscn check`
+Garde-fou qualité rapide pour la CI
+```bash
+pyscn check .                         # Vérification rapide réussite/échec
+pyscn check --max-complexity 15 .     # Seuils personnalisés
+pyscn check --max-cycles 0 .          # Autoriser uniquement 0 dépendance cyclique
+pyscn check --select deps .           # Vérifier uniquement les dépendances circulaires
+pyscn check --select di .             # Détecter les anti-patterns d'injection de dépendances (optionnel)
+pyscn check --allow-circular-deps .   # Autoriser les dépendances circulaires (avertissement uniquement)
+```
+
+### `pyscn init`
+Créer un fichier de configuration
+```bash
+pyscn init                         # Générer .pyscn.toml
+```
+
+> 💡 Exécutez `pyscn --help` ou `pyscn <command> --help` pour toutes les options
+
+## Configuration
+
+Créez un fichier `.pyscn.toml` ou ajoutez `[tool.pyscn]` à votre `pyproject.toml` :
+
+```toml
+# .pyscn.toml
+[complexity]
+max_complexity = 15
+
+[dead_code]
+min_severity = "warning"
+
+[output]
+directory = "reports"
+```
+
+> ⚙️ Exécutez `pyscn init` pour générer un fichier de configuration complet avec toutes les options disponibles
+
+---
+
+## Documentation
+
+📖 **[Site de documentation pyscn](https://docs.codescan.dev/pyscn/fr/)** — installation, catalogue de règles, référence CLI, configuration, spécification des sorties
+
+Pour les contributeurs : **[Guide de développement](docs/DEVELOPMENT.md)** • **[Architecture](docs/ARCHITECTURE.md)** • **[Tests](docs/TESTING.md)**
+
+## Support entreprise
+
+Pour un support commercial, des intégrations personnalisées ou des services de conseil, contactez-nous à contact@ludo-tech.org
+
+## Licence
+
+MIT License — voir [LICENSE](LICENSE)
+
+---
+
+*Construit avec ❤️ en utilisant Go et tree-sitter*

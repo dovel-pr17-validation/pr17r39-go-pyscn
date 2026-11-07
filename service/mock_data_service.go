@@ -1,0 +1,413 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/mockdetector"
+	"github.com/ludo-technologies/pyscn/internal/version"
+)
+
+// MockDataServiceImpl implements the MockDataService interface
+type MockDataServiceImpl struct {
+	detector      *mockdetector.Detector
+	fixedDetector bool
+}
+
+// NewMockDataService creates a new mock data service implementation
+func NewMockDataService() *MockDataServiceImpl {
+	return &MockDataServiceImpl{
+		detector: mockdetector.NewDetector(nil, nil), // Use defaults
+	}
+}
+
+// NewMockDataServiceWithConfig creates a mock data service with custom configuration
+func NewMockDataServiceWithConfig(keywords, domains []string) *MockDataServiceImpl {
+	return &MockDataServiceImpl{
+		detector:      mockdetector.NewDetector(keywords, domains),
+		fixedDetector: true,
+	}
+}
+
+// Analyze performs mock data analysis on multiple files
+func (s *MockDataServiceImpl) Analyze(ctx context.Context, req domain.MockDataRequest) (*domain.MockDataResponse, error) {
+	var allFiles []domain.FileMockData
+	var warnings []string
+	var errors []string
+	var diagnostics []domain.AnalysisDiagnostic
+	filesProcessed := 0
+	detector := s.detectorForRequest(req)
+	ignorePatterns, err := compileMockDataIgnorePatterns(req.IgnorePatterns)
+	if err != nil {
+		return nil, fmt.Errorf("compile mock-data ignore patterns: %w", err)
+	}
+
+	for _, filePath := range req.Paths {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("mock data analysis cancelled: %w", ctx.Err())
+		default:
+		}
+		if matchesMockDataIgnorePattern(filePath, ignorePatterns) {
+			continue
+		}
+
+		// Check if this is a test file and should be ignored
+		if domain.BoolValue(req.IgnoreTests, domain.DefaultMockDataIgnoreTests) {
+			if s.isTestFile(filePath) {
+				continue
+			}
+		}
+
+		// Analyze single file
+		fileResult, fileWarnings, fileDiagnostics := s.analyzeFile(ctx, filePath, req, detector)
+
+		if len(fileDiagnostics) > 0 {
+			diagnostics = append(diagnostics, fileDiagnostics...)
+			errors = append(errors, diagnosticMessages(fileDiagnostics)...)
+			continue // Skip this file but continue with others
+		}
+
+		// Only include files that have findings
+		if fileResult != nil && fileResult.HasFindings() {
+			allFiles = append(allFiles, *fileResult)
+		}
+
+		warnings = append(warnings, fileWarnings...)
+		filesProcessed++
+	}
+
+	// Filter and sort results
+	filteredFiles := s.filterFiles(allFiles, req)
+	sortedFiles := s.sortFiles(filteredFiles, req.SortBy)
+
+	// Generate summary
+	summary := s.generateSummary(sortedFiles, filesProcessed)
+
+	return &domain.MockDataResponse{
+		Files:       sortedFiles,
+		Summary:     summary,
+		Warnings:    warnings,
+		Errors:      errors,
+		Diagnostics: diagnostics,
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Version:     version.Version,
+		Config:      s.buildConfigForResponse(req),
+	}, nil
+}
+
+// AnalyzeSnapshot performs mock-data detection from the canonical parsed
+// project without rereading or reparsing source files.
+func (s *MockDataServiceImpl) AnalyzeSnapshot(ctx context.Context, snapshot *ProjectSnapshot, req domain.MockDataRequest) (*domain.MockDataResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context is required")
+	}
+	if snapshot == nil {
+		return nil, fmt.Errorf("project snapshot is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("mock-data analysis cancelled: %w", err)
+	}
+	ignorePatterns, err := compileMockDataIgnorePatterns(req.IgnorePatterns)
+	if err != nil {
+		return nil, fmt.Errorf("compile mock-data ignore patterns: %w", err)
+	}
+	detector := s.detectorForRequest(req)
+	var files []domain.FileMockData
+	var failures []domain.AnalysisFailure
+	filesProcessed := 0
+	selection := domain.PythonFileSelection{
+		IncludePatterns: req.IncludePatterns,
+		ExcludePatterns: req.ExcludePatterns,
+	}
+	var diagnostics []domain.AnalysisDiagnostic
+	selectedFiles, err := snapshot.selectedAnalysisProjectFiles(selection)
+	if err != nil {
+		return nil, fmt.Errorf("select mock-data files: %w", err)
+	}
+	for _, file := range selectedFiles {
+		if matchesMockDataIgnorePattern(file.Path, ignorePatterns) ||
+			(domain.BoolValue(req.IgnoreTests, domain.DefaultMockDataIgnoreTests) && s.isTestFile(file.Path)) {
+			continue
+		}
+		if diagnostic, invalid := projectFileDiagnostic(file); invalid {
+			diagnostics = append(diagnostics, diagnostic)
+			continue
+		}
+		result, err := detector.DetectParsed(ctx, file.parseResult.RootNode, file.source, file.Path)
+		if err != nil {
+			failures = append(failures, domain.NewAnalysisFailure(domain.AnalysisKindMockData, domain.AnalysisFailureCodeExecution, file.Path, err.Error(), err))
+			continue
+		}
+		fileResult := s.mockDataFileResult(file.Path, result.Findings, req)
+		if fileResult.HasFindings() {
+			files = append(files, *fileResult)
+		}
+		filesProcessed++
+	}
+	files = s.sortFiles(s.filterFiles(files, req), req.SortBy)
+	return &domain.MockDataResponse{
+		Files:       files,
+		Summary:     s.generateSummary(files, filesProcessed),
+		Errors:      failureMessages(failures),
+		Diagnostics: diagnostics,
+		Failures:    failures,
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Version:     version.Version,
+		Config:      s.buildConfigForResponse(req),
+	}, nil
+}
+
+// AnalyzeFile analyzes a single Python file for mock data
+func (s *MockDataServiceImpl) AnalyzeFile(ctx context.Context, filePath string, req domain.MockDataRequest) (*domain.FileMockData, error) {
+	ignorePatterns, err := compileMockDataIgnorePatterns(req.IgnorePatterns)
+	if err != nil {
+		return nil, fmt.Errorf("compile mock-data ignore patterns: %w", err)
+	}
+	if matchesMockDataIgnorePattern(filePath, ignorePatterns) ||
+		(domain.BoolValue(req.IgnoreTests, domain.DefaultMockDataIgnoreTests) && s.isTestFile(filePath)) {
+		return &domain.FileMockData{FilePath: filePath}, nil
+	}
+
+	fileResult, _, diagnostics := s.analyzeFile(ctx, filePath, req, s.detectorForRequest(req))
+
+	if len(diagnostics) > 0 {
+		return nil, domain.NewAnalysisError(fmt.Sprintf("failed to analyze file %s", filePath), fmt.Errorf("%v", diagnosticMessages(diagnostics)))
+	}
+
+	return fileResult, nil
+}
+
+// analyzeFile performs mock data analysis on a single file
+func (s *MockDataServiceImpl) analyzeFile(ctx context.Context, filePath string, req domain.MockDataRequest, detector *mockdetector.Detector) (*domain.FileMockData, []string, []domain.AnalysisDiagnostic) {
+	var warnings []string
+	var diagnostics []domain.AnalysisDiagnostic
+
+	// Read the file
+	content, err := s.readFile(filePath)
+	if err != nil {
+		diagnostics = append(diagnostics, domain.AnalysisDiagnostic{FilePath: filePath, Code: domain.DiagnosticCodeRead, Message: err.Error()})
+		return nil, warnings, diagnostics
+	}
+
+	// Detect mock data
+	result, err := detector.Detect(ctx, content, filePath)
+	if err != nil {
+		diagnostics = append(diagnostics, domain.AnalysisDiagnostic{FilePath: filePath, Code: domain.DiagnosticCodeParse, Message: err.Error()})
+		return nil, warnings, diagnostics
+	}
+
+	return s.mockDataFileResult(filePath, result.Findings, req), warnings, diagnostics
+}
+
+func (s *MockDataServiceImpl) mockDataFileResult(filePath string, findings []domain.MockDataFinding, req domain.MockDataRequest) *domain.FileMockData {
+	for index := range findings {
+		findings[index].Location.FilePath = filePath
+	}
+	fileResult := &domain.FileMockData{FilePath: filePath, Findings: s.filterByType(findings, req.EnabledTypes)}
+	fileResult.CalculateSeverityCounts()
+	return fileResult
+}
+
+func (s *MockDataServiceImpl) detectorForRequest(req domain.MockDataRequest) *mockdetector.Detector {
+	if s.fixedDetector && s.detector != nil {
+		return s.detector
+	}
+	if len(req.Keywords) > 0 || len(req.Domains) > 0 {
+		return mockdetector.NewDetector(req.Keywords, req.Domains)
+	}
+	if s.detector != nil {
+		return s.detector
+	}
+	return mockdetector.NewDetector(nil, nil)
+}
+
+func compileMockDataIgnorePatterns(patterns []string) ([]*regexp.Regexp, error) {
+	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	for _, pattern := range patterns {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid mock data ignore pattern %q: %w", pattern, err)
+		}
+		compiled = append(compiled, re)
+	}
+	return compiled, nil
+}
+
+func matchesMockDataIgnorePattern(filePath string, patterns []*regexp.Regexp) bool {
+	normalizedPath := filepath.ToSlash(filePath)
+	for _, pattern := range patterns {
+		if pattern.MatchString(normalizedPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// readFile reads the content of a file
+func (s *MockDataServiceImpl) readFile(filePath string) ([]byte, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	return content, nil
+}
+
+// isTestFile checks if a file path matches test file patterns
+func (s *MockDataServiceImpl) isTestFile(filePath string) bool {
+	base := filepath.Base(filePath)
+	dir := filepath.Dir(filePath)
+
+	// Check filename patterns
+	if strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.py") {
+		return true
+	}
+
+	// Check if in test directory
+	testDirs := []string{"tests", "test", "testing", "__tests__"}
+	parts := strings.Split(dir, string(filepath.Separator))
+	for _, part := range parts {
+		for _, testDir := range testDirs {
+			if part == testDir {
+				return true
+			}
+		}
+	}
+
+	// Check for conftest.py
+	if base == "conftest.py" {
+		return true
+	}
+
+	return false
+}
+
+// filterByType filters findings to only include specified types
+func (s *MockDataServiceImpl) filterByType(findings []domain.MockDataFinding, enabledTypes []domain.MockDataType) []domain.MockDataFinding {
+	// If no types specified, include all
+	if len(enabledTypes) == 0 {
+		return findings
+	}
+
+	typeSet := make(map[domain.MockDataType]bool)
+	for _, t := range enabledTypes {
+		typeSet[t] = true
+	}
+
+	var filtered []domain.MockDataFinding
+	for _, finding := range findings {
+		if typeSet[finding.Type] {
+			filtered = append(filtered, finding)
+		}
+	}
+	return filtered
+}
+
+// filterFiles filters files based on minimum severity
+func (s *MockDataServiceImpl) filterFiles(files []domain.FileMockData, req domain.MockDataRequest) []domain.FileMockData {
+	var filtered []domain.FileMockData
+
+	for _, file := range files {
+		filteredFindings := file.GetFindingsAtSeverity(req.MinSeverity)
+		if len(filteredFindings) > 0 {
+			fileCopy := file
+			fileCopy.Findings = filteredFindings
+			fileCopy.CalculateSeverityCounts()
+			filtered = append(filtered, fileCopy)
+		}
+	}
+
+	return filtered
+}
+
+// sortFiles sorts files based on the specified criteria
+func (s *MockDataServiceImpl) sortFiles(files []domain.FileMockData, sortBy domain.MockDataSortCriteria) []domain.FileMockData {
+	sorted := make([]domain.FileMockData, len(files))
+	copy(sorted, files)
+
+	switch sortBy {
+	case domain.MockDataSortByFile:
+		sort.Slice(sorted, func(i, j int) bool {
+			return sorted[i].FilePath < sorted[j].FilePath
+		})
+	case domain.MockDataSortBySeverity:
+		sort.Slice(sorted, func(i, j int) bool {
+			// Sort by highest severity finding (descending)
+			maxI := s.getMaxSeverity(sorted[i].Findings)
+			maxJ := s.getMaxSeverity(sorted[j].Findings)
+			if maxI != maxJ {
+				return maxI > maxJ
+			}
+			return sorted[i].TotalFindings > sorted[j].TotalFindings
+		})
+	case domain.MockDataSortByLine:
+		// Sort findings within each file by line
+		for i := range sorted {
+			sort.Slice(sorted[i].Findings, func(a, b int) bool {
+				return sorted[i].Findings[a].Location.StartLine < sorted[i].Findings[b].Location.StartLine
+			})
+		}
+	case domain.MockDataSortByType:
+		sort.Slice(sorted, func(i, j int) bool {
+			if len(sorted[i].Findings) == 0 || len(sorted[j].Findings) == 0 {
+				return len(sorted[i].Findings) > len(sorted[j].Findings)
+			}
+			return sorted[i].Findings[0].Type < sorted[j].Findings[0].Type
+		})
+	}
+
+	return sorted
+}
+
+// getMaxSeverity returns the maximum severity level in a list of findings
+func (s *MockDataServiceImpl) getMaxSeverity(findings []domain.MockDataFinding) int {
+	maxLevel := 0
+	for _, f := range findings {
+		if level := f.Severity.Level(); level > maxLevel {
+			maxLevel = level
+		}
+	}
+	return maxLevel
+}
+
+// generateSummary generates aggregate statistics
+func (s *MockDataServiceImpl) generateSummary(files []domain.FileMockData, filesProcessed int) domain.MockDataSummary {
+	summary := domain.MockDataSummary{
+		TotalFiles:        filesProcessed,
+		FilesWithMockData: len(files),
+		FindingsByType:    make(map[domain.MockDataType]int),
+	}
+
+	for _, file := range files {
+		summary.TotalFindings += file.TotalFindings
+		summary.ErrorFindings += file.ErrorCount
+		summary.WarningFindings += file.WarningCount
+		summary.InfoFindings += file.InfoCount
+
+		for _, finding := range file.Findings {
+			summary.FindingsByType[finding.Type]++
+		}
+	}
+
+	return summary
+}
+
+// buildConfigForResponse creates a config representation for the response
+func (s *MockDataServiceImpl) buildConfigForResponse(req domain.MockDataRequest) map[string]interface{} {
+	return map[string]interface{}{
+		"min_severity":    string(req.MinSeverity),
+		"sort_by":         string(req.SortBy),
+		"ignore_tests":    domain.BoolValue(req.IgnoreTests, domain.DefaultMockDataIgnoreTests),
+		"keywords":        req.Keywords,
+		"domains":         req.Domains,
+		"ignore_patterns": req.IgnorePatterns,
+	}
+}

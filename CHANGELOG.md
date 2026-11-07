@@ -1,0 +1,915 @@
+# Changelog
+
+## [Unreleased]
+
+## [1.33.1] - 2026-10-29
+
+### Fixed
+- Attribute package initializer imports to their own package (#863)
+- Exclude isolated modules from coupling averages (#854)
+- Report clone fragment complexity instead of always 0 (#864)
+- Count sibling modules as one concern in SRP analysis (#866)
+- Don't count inherited calls as variables in LCOM4 (#865)
+
+## [1.33.0] - 2026-10-24
+
+### BREAKING
+- Change `analyze.summary.code_duplication_percentage` from a cloned-fragment ratio to the percentage of analyzed source lines covered by clones; `schema_version` is now 2 (#857)
+
+### Added
+- Report distinct `clone.statistics.duplicated_lines` in analysis output (#857)
+
+### Fixed
+- Count physical source lines consistently in clone and module statistics, without an extra line for a terminal newline (#857)
+- Count conditional expressions in McCabe complexity (#853)
+- Stop auto-detected layers from claiming the root package (#855)
+
+## [1.32.5] - 2026-10-16
+
+### Fixed
+- Count comprehensions wherever they appear in McCabe complexity (#848)
+- Make LSH a pure speedup for clone detection (#842)
+- Separate loop shapes and call-free operators in Type-4 clone detection (#841)
+
+## [1.32.4] - 2026-10-08
+
+### Fixed
+- Leave isolated stateless methods out of LCOM4 (#836)
+- Dedup the pair groups created for uncovered clone pairs (#835)
+- Keep one dead code region as one finding (#834)
+
+## [1.32.3] - 2026-10-03
+
+### Fixed
+- Make circular dependency detection match Python's import-time behavior (#830)
+
+## [1.32.2] - 2026-10-01
+
+### Fixed
+- Connect Python protocol dispatch in LCOM (#824)
+- Don't pair flat if/elif dispatch chains as Type-4 clones (#823)
+- Drop Type-4 pairs shadowed by much stronger syntactic matches (#821)
+- Derive the dead code unreachable reason from the CFG (#818)
+- Stop counting method references as instance variables in LCOM (#817)
+- Include the try header in unreachable try ranges (#812)
+- Penalize asymmetric call evidence in Type-4 clone detection (#806)
+
+### Changed
+- Report single-statement fragments only as identical clones (#820)
+- Exclude `examples`, `docs`, `demo` and `samples` directories by default (#816)
+- Measure clone `min_lines` in SLOC and lower the default to 8 (#813)
+
+## [1.32.1] - 2026-09-20
+
+### Added
+- Report identical short method bodies as clones (#802)
+
+### Fixed
+- Summarize dead code over the full analyzed population (#804)
+- Align clone group members with filtered pairs (#801)
+- Re-split clone groups after member suppression (#799)
+- Weight Type-4 semantic operation overlap to stop CFG-shape false clones (#796)
+- Score duplication against the full clone population, not the displayed subset (#795)
+- Score CBO and LCOM against the full class population, not the displayed subset (#788)
+- Rework `community_score` so it measures structure, not sparsity (#787)
+- Stop an ancestor `.pyscn.toml` from relocating the project root (#783)
+
+### Changed
+- Clone grouping defaults to `complete_linkage`, and unknown config keys are rejected (#797)
+- Documentation is served at docs.codescan.dev/pyscn/ (#786)
+
+## [1.32.0] - 2026-09-15
+
+### Added
+- Write a `.gitignore` into the output directory (#778)
+
+### Fixed
+- List cohesion and responsibility violations in the HTML architecture card (#779)
+- Exclude docstrings from `min_lines`/`min_nodes` when `skip_docstrings` is set (#777)
+- Stop reporting the bare `yield` that keeps a function a generator as dead code (#773)
+
+## [1.31.3] - 2026-09-11
+
+### Fixed
+- Accept unparenthesized `except` lists with three or more types (PEP 758) (#769)
+
+## [1.31.2] - 2026-09-10
+
+### Added
+- Publish Linux arm64 wheels (#758)
+
+### Fixed
+- Skip Protocol and Enum classes and exclude stub methods from LCOM4 (#766)
+- Stop treating an explicit `--config` file's directory as the project root (#765)
+- Tag Linux wheels as `manylinux_2_34` so pip refuses them on unsupported glibc (#762)
+
+### Changed
+- CBO no longer counts type-hint dependencies in `coupling_count` or the risk level; they remain visible in `type_hint_dependencies`. The `from __future__ import annotations` special case is removed (#761)
+- Document the `pyscn-pre-commit` mirror instead of a `repo: local` hook (#759)
+
+## [1.31.1] - 2026-09-09
+
+### Added
+- `analyze` writes every requested report format from a single run instead of one per invocation (#752)
+- Top-level `schema_version` field on `analyze` JSON/YAML output, and migration docs for the v1.30.0 key rename (#750)
+
+### Fixed
+- Group `from pkg import mod` namespace members in CBO the same way as `import pkg as mod` (#751)
+
+## [1.31.0] - 2026-09-07
+
+### Added
+- `-o, --output <path>` flag for `analyze`; `-` streams the report to stdout and skips `.pyscn/reports/` (#748)
+
+### Fixed
+- Serialize empty `complexity.functions` and `dead_code` collections as `[]` instead of `null` (#747)
+- Cap semantic Type-4 clone similarity below the Type-1 threshold, matching the other clone types (#735)
+
+## [1.30.2] - 2026-09-06
+
+### Fixed
+- Prefer the discovered config directory as the project root, add an optional `project_root` config key, and report internal import resolution counts in all reports (#740)
+- Keep system analysis `LoadDefaultConfig` free of config discovery (#745)
+
+### Changed
+- Bump Go dependencies (#725)
+
+## [1.30.1] - 2026-09-03
+
+### Fixed
+- Add LCOM4 rows to the analyze text and CSV reports (#730)
+- Stop counting `elif` arms as extra nesting levels (#729)
+- Record the actual dependency kind for imported names in the CBO breakdown (#727)
+- Report the unclamped code duplication percentage (#726)
+- Restore the "reported / parsed" function indicator and fail fast on unset `AnalyzedFunctions` (#723)
+
+## [1.30.0] - 2026-08-26
+
+### Added
+- Report class-body complexity in its own scope across CLI, JSON, YAML, CSV, HTML, and MCP (#709)
+
+### Changed
+- Redesign the analyze HTML report: five tabs, a rebuilt Overview, and dark mode (#717)
+- Build aggregate analyze, check, and MCP runs from one canonical project snapshot (#704)
+- Adopt the polyscan core dependency chain finder; `deps_max_depth` now matches the top-ranked chain (#711)
+- Replace the README demo video with a report screenshot (#716)
+- **BREAKING**: Rename every `analyze` JSON/YAML object key to snake_case (#718). The `complexity`, `cbo`, `lcom`, and `system` objects emitted Go PascalCase field names, and the `config` objects of `cbo`, `lcom`, and `community_analysis` emitted lowerCamelCase. Consumers reading those keys must be updated; see the [output schemas](https://docs.codescan.dev/output/schemas/).
+  - Migration: every affected key is the old name converted to snake_case with acronyms lowercased. Commonly read keys: `Functions` -> `functions`, `Metrics` -> `metrics`, `Summary` -> `summary`, `Classes` -> `classes`, `Name` -> `name`, `FilePath` -> `file_path`, `StartLine` -> `start_line`, `EndLine` -> `end_line`, `RiskLevel` -> `risk_level`, `Complexity` -> `complexity`, `CognitiveComplexity` -> `cognitive_complexity`, `NestingDepth` -> `nesting_depth`, `SLOC` -> `sloc`, `CouplingCount` -> `coupling_count`, `DependentClasses` -> `dependent_classes`, `AverageCBO` -> `average_cbo`, `LCOM4` -> `lcom4`, `AverageLCOM` -> `average_lcom`, `ProjectRoot` -> `project_root`, `DependencyAnalysis` -> `dependency_analysis`, `CircularDependencies` -> `circular_dependencies`, `ArchitectureAnalysis` -> `architecture_analysis`, `SRPViolations` -> `srp_violations`.
+  - The `complexity.request` and `dead_code.request` objects follow the same rule (`Paths` -> `paths`, `MinComplexity` -> `min_complexity`, `MinSeverity` -> `min_severity`, ...). The `config` objects change from lowerCamelCase: `minCBO` -> `min_cbo`, `maxLCOM` -> `max_lcom`, `lowThreshold` -> `low_threshold`, `sortBy` -> `sort_by`, `minCommunitySize` -> `min_community_size`, `includeStdLib` -> `include_std_lib`, ...
+  - Unchanged: the top-level keys, `summary`, the `dead_code` findings, `clone`, `community_analysis` (other than `config`), `module_quality`, and `suggestions` were already snake_case.
+- **BREAKING**: Narrow `check --allow-parse-errors` to syntax and parser failures (#704). Missing, unreadable, and permission-denied files still fail the gate.
+- **BREAKING**: Match bare file globs against basenames at every directory depth (#704). For example, `main*.py` now also matches `pkg/main_utils.py`; add a directory segment to constrain the rule.
+
+### Fixed
+- Exclude constructors from the LCOM4 graph (#718). `__init__`, `__new__`, and `__post_init__` initialize every attribute of a class, so keeping them in the graph joined all the responsibility clusters they set up. The attributes they introduce still count toward `instance_variables`.
+
+## [1.29.1] - 2026-08-16
+
+### Added
+- Per-function SLOC metric and long-function warnings in check and the HTML report (#660)
+
+### Changed
+- Adopt polyscan core parse-error penalty (#714)
+- Bump polyscan core to v0.2.2 with APTED/LSH optimizations (#707)
+- Make dependency analysis scale on large graphs (#695)
+- Translate remaining Japanese code comments to English (#713)
+
+### Fixed
+- Stop cognitive complexity from crossing scope boundaries (#661)
+- Gate all analyzed functions in `check`, not just the reported ones (#712)
+- Make class ranking ties deterministic (#710)
+- Fail the `check` gate on files that cannot be parsed and gate clone detection (#703)
+- Reject legacy Python 2 syntax that no Python 3 release accepts (#702)
+- Discover config from the analyzed target and stop at its repository root (#701)
+- Derive single-responsibility concerns from fan-out only (#700)
+- Keep `--min-complexity` from shrinking the analyzed function set and health score (#697)
+
+## [1.29.0] - 2026-07-28
+
+### Added
+- Per-module quality hotspot metrics in analyze reports (#686)
+- Per-directory complexity rollups in analyze reports (#687)
+
+### Changed
+- Serve documentation at docs.codescan.dev (#685)
+
+### Fixed
+- Dedupe architecture suggestions and add `file_path`/`start_line` (#648)
+
+## [1.28.0] - 2026-07-25
+
+### Added
+- List the pyscn MCP server in the official MCP Registry and Glama (#682)
+
+### Changed
+- Point the cross-language link to polyscan instead of the archived jscan (#681)
+
+## [1.27.0] - 2026-07-25
+
+### Added
+- Link HTML reports and CLI output back to the pyscn GitHub repository (#679)
+
+### Changed
+- Adopt polyscan core clone grouping, dedup, similarity gates, and classification (#664)
+- Adopt polyscan core APTED tree edit distance (#669)
+- Adopt polyscan core CFG analyses (#670)
+- Adopt polyscan core graph analyses (#672)
+- Adopt polyscan core LSH, LCOM, DFA, and semantic evidence (#673)
+- Adopt polyscan core scoring and grade mapping (#674)
+- Redesign the website homepage with a CFG diagram hero (#671)
+- Document Agent Skills as a recommended AI integration on the website (#668)
+
+### Fixed
+- Exclude Cython primitive types from CBO dependent classes (#646)
+- Fix module-qualified enum coupling in CBO (#675)
+
+## [1.26.4] - 2026-07-17
+
+### Changed
+- Unify request bool override semantics with sparse optional fields (#649)
+- Correct MCP configuration discovery documentation (#650)
+
+### Fixed
+- Default architecture strict mode to false when auto-detecting layers without user config (#662)
+- Propagate `recursive` override in MCP analyze tool (#656)
+- Fail `check` command on malformed discovered `.pyscn.toml` (#654)
+- Publish only implemented output controls in MCP tool schemas (#651)
+- Exclude same-file top-level peer classes from CBO coupling (#639)
+
+## [1.26.3] - 2026-07-11
+
+### Added
+- Report pre-filter function count (`functions_total`) in complexity summary (#635)
+
+### Fixed
+- Ignore imported module constants (e.g. `re.DOTALL`) in CBO dependencies (#638)
+
+## [1.26.2] - 2026-07-09
+
+### Changed
+- Unify config merge logic on zero-value sentinels and remove the legacy FlagTracker mechanism (#640)
+
+### Fixed
+- Exclude abstract methods from LCOM4 grouping so abstract base classes aren't penalized (#559)
+- Apply exclude patterns when all input paths are pre-resolved files (#590)
+- Exclude annotation-only dependencies from CBO under PEP 563 future annotations (#628)
+- Report only clone fragments referenced by returned clone pairs/groups (#631)
+- Honor explicit complexity threshold overrides that equal the default (#553)
+
+## [1.26.1] - 2026-07-06
+
+### Fixed
+- Test-file exclude patterns (`test_*.py`, `*_test.py`) not matching files in nested directories (#532)
+
+### Changed
+- Refresh README Features section with five analysis angles (#621)
+- Clarify DI anti-pattern detection is opt-in in README (#622)
+
+## [1.26.0] - 2026-07-03
+
+### Added
+- Add `cli-analysis` Agent Skill for CI setup and report generation without MCP
+
+### Changed
+- Split the plugin's single skill into `health-check`, `refactoring`, and `architecture-review` skills for better trigger accuracy
+
+### Fixed
+- Move the plugin skill into `skills/<name>/SKILL.md` so Claude Code discovers it; the previous flat `skills/SKILL.md` layout was never loaded
+- Document the plugin install path on the website MCP page and correct the Claude Code setup instructions (`claude mcp add`, not `claude_desktop_config.json`)
+- Don't count a class defined within a class as CBO coupling (#562)
+
+## [1.25.0] - 2026-07-02
+
+### Added
+- Build a community graph from the dependency graph (#579)
+- Deterministic Leiden community detection (#580)
+- Domain types, service, and use-case wiring for community analysis (#582)
+- CLI `--select communities` and `[communities]` config, opt-in (#583)
+- Community analysis JSON formatter (#584)
+- Text/HTML/YAML/CSV/DOT community summary output (#585)
+- Package mismatch scoring (#600)
+- Layer mismatch scoring (#601)
+- Community risk score with Health Score integration (#602)
+- Interactive macro-architecture graph in the HTML report (#603)
+- AI-agent context map and MCP documentation (#604)
+
+### Changed
+- Run module community detection in default `pyscn analyze`; opt out with `--skip-communities` or `[communities] enabled = false` (#605)
+- Bump Go dependencies (#614)
+
+### Fixed
+- Drop clone groups without backing pairs (#615)
+- Resolve src-layout community graph imports (#613)
+- Collapse enum member CBO dependencies (#594)
+
+## [1.24.3] - 2026-06-21
+
+### Changed
+- Integrate clone statistics into detector result types (#561)
+
+### Fixed
+- Count self.<property> reads as method-call edges in LCOM (#558)
+
+## [1.24.2] - 2026-06-15
+
+### Changed
+- Use cognitive complexity metrics for complexity risk assessment (#552)
+- Change duplication metric from group density to fragment ratio (#555)
+
+### Fixed
+- Prefer highest-similarity clone type for group classification (#556)
+- Group namespace import members so CBO isn't inflated by member explosion (#554)
+
+## [1.24.1] - 2026-06-13
+
+### Fixed
+- Populate fragment hash in clone output (#549)
+- Suppress clone groups covered by another group's larger windows (#548)
+- Calibrate progress bar with actual task timings (#541)
+
+## [1.24.0] - 2026-06-11
+
+### Changed
+- Speed up clone detection by reusing APTED DP matrices and parallelizing pair comparison (#538)
+
+### Fixed
+- Preserve every elif in a chain so complexity isn't undercounted (#537)
+
+## [1.23.2] - 2026-06-10
+
+### Fixed
+- Stop counting imported function calls as class dependencies in CBO analysis (#535)
+- Penalize Type-4 similarity for disjoint string literal vocabularies (#534)
+
+## [1.23.1] - 2026-06-09
+
+### Changed
+- Soften CBO coupling scoring calibration (#528)
+- Soften LCOM cohesion scoring calibration (#530)
+
+## [1.23.0] - 2026-06-07
+
+### Added
+- Architecture style presets (`layered`, `hexagonal`, `clean`, `mvc`) for dependency rule configuration (#520, #521, #523, #526)
+
+### Fixed
+- Merge overlapping unreachable findings in dead code detection (#519)
+
+## [1.22.9] - 2026-06-04
+
+### Fixed
+- Clear dependency CVEs and suppress math/rand false positive in security report (#513)
+- Exclude lazy function-body imports from circular dependency detection while retaining them as edges (#514)
+
+### Changed
+- Consolidate cognitive complexity into the analyzer layer (#515)
+
+## [1.22.8] - 2026-06-03
+
+### Fixed
+- Register plugin MCP server by moving the manifest into a nested `.claude-plugin/` directory (#509)
+
+### Changed
+- Bump Go dependencies (#504)
+- Upgrade golangci-lint-action to v7 (#507)
+
+## [1.22.7] - 2026-06-02
+
+### Fixed
+- Collect module imports from else/except/finally branches with branch-aware TYPE_CHECKING filtering (#502)
+- Populate per-fragment `id` and `type` in clone group output (#503)
+- Reuse detector-owned clone feature cache when building LSH MinHash signatures (#505)
+
+## [1.22.6] - 2026-05-31
+
+### Fixed
+- Propagate nested function CFGs and reset builder state between builds (#497)
+- Fix DFA compound-statement use contracts: match pattern bindings, definition scopes, and parameter/function-header uses (#498)
+- Skip trailing-semicolon empty statements in dead code detection (#500)
+
+## [1.22.5] - 2026-05-31
+
+### Fixed
+- Fix analyzer import and report contracts (dependency traversal, module imports, comprehension fields) (#495)
+- Escape HTML report output to prevent markup injection (#495)
+
+## [1.22.4] - 2026-05-28
+
+### Fixed
+- Exclude Django migration files from analysis defaults (#489)
+- Compute TotalClones from clone group membership, not all fragments (#487)
+
+## [1.22.3] - 2026-05-26
+
+### Fixed
+- Preserve clone group type classification (#484)
+- Preserve `skip_docstrings` config in clone detection (#483)
+- Detect external ctypes fields and broaden ctypes base detection in LCOM (#480)
+
+## [1.22.2] - 2026-05-24
+
+### Fixed
+- Resolve CBO dependency identity and tighten import contracts to fix coupling miscounts (#474)
+- Expose `WeightedViolations` so architecture `ComplianceScore` is reproducible (#476)
+
+## [1.22.1] - 2026-05-23
+
+### Fixed
+- Populate `SystemAnalysisResponse.Summary` so analyze reports aggregate system metrics correctly (#472)
+
+### Documentation
+- Add French translation (#470)
+- Tidy mkdocs header logo (#469)
+
+## [1.22.0] - 2026-05-23
+
+### Fixed
+- Preserve complexity metric fallbacks and use AST counts for consistent reporting (#466)
+- Compute module-level cognitive complexity metrics (#464)
+- Honor APTED cost model and tighten distance handling for large trees (#454)
+
+### Documentation
+- Clarify that large-tree APTED is a bounded heuristic for clone detection (#467)
+
+### Testing
+- Add LCOM use case unit tests (#459)
+- Add unit tests for `app/di_antipattern_usecase.go` (#461)
+
+## [1.21.1] - 2026-05-19
+
+### Fixed
+- Gate Type-4 clone classification on minimum CFG cyclomatic complexity to cut linear-shape false positives (#450)
+
+## [1.21.0] - 2026-05-19
+
+### Performance
+- Speed up the full `analyze` pipeline by reusing parsed files and the system dependency graph, scoring APTED pairs once, and using integer LSH candidates (#438)
+
+### Fixed
+- Count rule invocations (not violations) in architecture `ComplianceScore` denominator (#448, #426)
+- Exit non-zero when output generation fails in the `analyze` command (#437, #249)
+
+## [1.20.0] - 2026-05-16
+
+### Added
+- Honor semantic Type-4 clone classification with unified parser traversal and DFA field contracts (#435)
+
+### Fixed
+- Drop strict-subset members from clone groups and keep dedupe outputs consistent (#432, #416)
+- Auto-enable LSH for high pair counts in clone detection (#433, #427)
+
+## [1.19.3] - 2026-05-14
+
+### Fixed
+- Fix DFA extraction for `with` statement alias targets (#424)
+- Honor analyze config flags by preserving system defaults and validating selection (#425)
+- Avoid resolving stdlib imports to shadowing project modules (#429)
+- Structurally model `with`-statement aliases in DFA via `NodeWithItem` (#430)
+
+## [1.19.2] - 2026-05-11
+
+### Fixed
+- Report module-scope code as `<module>` instead of `__main__` in complexity output (#417)
+- Include `with` context expressions in LCOM4 instance variable access detection (#419)
+
+## [1.19.1] - 2026-05-08
+
+### Fixed
+- Tighten Type-2 clone classification to reduce class body false positives (#411)
+- Preserve f-string interpolation expressions so LCOM4 detects `self.<ivar>` accesses (#415)
+
+## [1.19.0] - 2026-05-06
+
+### Added
+- Main sequence architecture metrics with abstractness, instability, and zone classification (#407)
+
+### Documentation
+- Sync ja/zh schemas with AbstractClassCount field (#409)
+
+## [1.18.1] - 2026-05-02
+
+### Fixed
+- Emit real line range for synthetic `__main__` complexity record (#403)
+
+### Documentation
+- Sync rule catalog and config reference with v1.13–v1.18 releases (#406)
+
+## [1.18.0] - 2026-04-30
+
+### Added
+- Package responsibility analysis with cohesion and SRP checks (#398)
+
+### Fixed
+- Require text match for Type-1 clones and cap non-textual similarity (#399)
+- Make clone trees expression-aware to avoid mismatched payloads (#401)
+
+## [1.17.0] - 2026-04-28
+
+### Performance
+- Optimize complete-linkage grouping with sparse matrix and cached similarities (#391)
+
+### Fixed
+- Make grouping clone-type tie breaks deterministic (#389)
+
+### Documentation
+- Add user-facing documentation site with MkDocs Material (#387)
+- Default to uvx and link README to docs site (#388)
+- Add Japanese and Simplified Chinese translations (#392)
+
+### Testing
+- Add clone detector benchmarks (#393)
+
+### CI
+- Auto-assign PR author on open/reopen (#390)
+
+## [1.16.0] - 2026-04-14
+
+### Added
+- DI (Dependency Injection) anti-pattern detection for Python code (#308)
+
+### Fixed
+- Honor complexity config settings in analyze (#382)
+- Preserve clone `show_content` config in analyze (#384)
+
+### Refactored
+- Remove internal/config import from AnalyzeUseCase (#383)
+- Reuse visited state in return reachability walk (#385)
+
+## [1.15.0] - 2026-04-09
+
+### Added
+- Add raw code metrics to complexity analysis (#380)
+
+### Refactored
+- Use system analysis in check command (#379)
+
+## [1.14.0] - 2026-04-01
+
+### Added
+- Add Cognitive Complexity metric with SonarQube-style calculation (#370)
+- Improve display of `__main__` top-level code suggestions (#375)
+
+### Refactored
+- Remove top suggestions from terminal output (#369)
+- Refactor AnalyzeUseCase to depend on AnalyzeOutputFormatter interface (#376)
+
+## [1.13.0] - 2026-03-22
+
+### Added
+- Add neutral_prefixes config for architecture layer detection (#365)
+
+### Fixed
+- Add missing IsAbstract and Description fields to TOML layer/rule types (#362)
+- Use match position as tie-breaker in findLayerForModule (#361)
+- Replace detectLayerFromModule heuristic with findLayerForModule (#360)
+- Resolve layer misclassification for ambiguous module paths (#359)
+- Propagate architecture layers and rules from TOML config (#356)
+
+### Refactored
+- Extract color hex values into CSS custom properties and Go constants (#351)
+
+### Testing
+- Add architecture layer integration tests (#363)
+
+## [1.12.0] - 2026-03-03
+
+### Added
+- Add actionable suggestions to analyze output (#347)
+
+### Dependencies
+- Bump the go-dependencies group with 2 updates (#349)
+
+## [1.11.1] - 2026-02-22
+
+### Fixed
+- Generate default_config.toml dynamically from domain defaults (#343)
+
+### Style
+- Restyle HTML output with professional data-first palette (#345)
+
+### Documentation
+- Update README.md
+
+## [1.11.0] - 2026-02-17
+
+### Added
+- Add LCOM4 class cohesion metric (#340)
+- Show README badge snippet after health score output (#331)
+
+### Fixed
+- Shorten HTML tab labels to prevent wrapping (#341)
+- Exclude Type-3 from default enabled clone types (#338)
+- Correct APTED key-root DP ordering (#337)
+
+### Performance
+- Add Jaccard pre-filter to minimize APTED calls (#339)
+
+### Documentation
+- Add algorithm documentation for all analysis engines (#330)
+- Redesign README header with centered logo (#329)
+
+### Testing
+- Add unit tests for MCP server handlers (#332)
+
+## [1.10.2] - 2026-02-07
+
+### Fixed
+- Calibrate clone detection thresholds and scoring (#327)
+- Improve CBO analysis with Union type support and score calibration (#326)
+- Extend clone memory test timeout to 180s (#325)
+
+## [1.10.1] - 2026-02-06
+
+### Added
+- Add CFG support for Walrus operator (#322)
+- Add missing error code constants (#320)
+
+### Fixed
+- Improve config file discovery from target paths (#323)
+
+### Enhanced
+- Add test coverage for ast_features.go (#321)
+
+## [1.9.3] - 2026-02-03
+
+### Fixed
+- Detect circular dependencies through `__init__.py` re-exports (#318)
+
+### Changed
+- Bump the go-dependencies group with 2 updates (#307)
+
+## [1.9.2] - 2026-02-01
+
+### Fixed
+- Prevent Type-3 clone false positives for different class/function names (#313)
+- Reduce clone detection false positives for framework patterns (#312)
+- Exclude test modules from layer detection (#311)
+
+## [1.9.1] - 2026-01-28
+
+### Fixed
+- Reduce false positives in Type-3/Type-4 clone detection (#305)
+
+## [1.9.0] - 2026-01-27
+
+### Added
+- Add `pyscn-mcp` skill for MCP tools integration (#291, #303)
+
+### Changed
+- Enable Type-2 clone detection by default with Jaccard coefficient (#302)
+
+## [1.8.2] - 2026-01-22
+
+### Fixed
+- Remove MaxComplexity filtering from service layer (#298)
+- Check command now respects .pyscn.toml settings (#296)
+- Consolidate default settings to single source of truth (#294)
+
+## [1.8.1] - 2026-01-20
+
+### Fixed
+- Fix marketplace plugin source path for GitHub registration (#288, #289)
+
+## [1.8.0] - 2026-01-20
+
+### Added
+- Claude Code plugin marketplace support (#281)
+
+### Fixed
+- Improve duplication scoring with K-Core groups (#286)
+
+### Changed
+- Bump the go-dependencies group with 4 updates (#275)
+
+## [1.7.1] - 2026-01-15
+
+### Fixed
+- Fix reachability analysis exponential time complexity with memoization (#283)
+
+## [1.7.0] - 2026-01-14
+
+### Added
+- Mock data detection with `--select mockdata` flag (#278)
+
+## [1.6.0] - 2026-01-06
+
+### Added
+- Pyscn Bot (GitHub App) for automated PR reviews and weekly code audits (#276)
+
+### Changed
+- Consolidate default CBO thresholds to single source of truth (#274)
+- Consolidate default CloneTypes to single source of truth (#273)
+
+### Improved
+- Service layer test coverage (36.3% → 53.7%) (#269, #270)
+
+## [1.5.5] - 2025-12-15
+
+### Fixed
+- Improve clone detection similarity calculation to reduce false positives (#266)
+
+### Changed
+- Adjust duplication threshold from 0-20% to 0-10% (#267)
+
+## [1.5.4] - 2025-12-15
+
+### Improved
+- Change duplication rate calculation from line-based to function-based for consistent measurements (#264)
+
+## [1.5.3] - 2025-12-14
+
+### Fixed
+- Disable Type2 clone detection by default and fix clone grouping (#262)
+
+## [1.5.2] - 2025-12-13
+
+### Fixed
+- Skip docstrings from clone detection to reduce false positives (#258)
+
+## [1.5.1] - 2025-12-12
+
+### Fixed
+- Enable architecture strict mode by default (#255)
+
+### Improved
+- Consolidate default configuration values in `domain/defaults.go` (#254)
+
+### Removed
+- macOS Intel (x86_64) build support (#259)
+
+## [1.5.0] - 2025-12-08
+
+### Added
+- Data Flow Analysis (DFA) for Type-4 clone detection with `--enable-dfa` flag (#250)
+- Multi-dimensional clone type classification (#248)
+
+### Fixed
+- Ensure deterministic architecture analysis results (#252)
+- Count skipped files as analyzed (#243)
+- Replace hardcoded thresholds with constants in CentroidGrouping (#247)
+
+## [1.4.2] - 2025-11-30
+
+### Fixed
+- Route break/continue/raise through finally blocks correctly in CFG (#210)
+
+### Improved
+- Add comprehensive tests for apted_tree.go (#238)
+- Add jscan link to README (#234)
+- Bump Go dependencies (#232)
+- Remove unused labels from dependabot.yml (#240)
+
+## [1.4.1] - 2025-11-27
+
+### Fixed
+- Fix binary auto-detection for `pyscn_mcp` package in wheel build script (#224)
+
+### Improved
+- Remove Viper-based config loader and unify on TOML-only (#231)
+
+## [1.4.0] - 2025-11-25
+
+### Added
+- Circular dependency detection in `check` command with `--select deps`, `--allow-circular-deps`, and `--max-cycles` flags (#213)
+- Universal TOML configuration support for all pyscn sections in `.pyscn.toml` and `pyproject.toml` (#229)
+
+### Fixed
+- Complexity thresholds from `.pyscn.toml` were being ignored (#226)
+
+## [1.3.0] - 2025-11-06
+
+### Fixed
+- Fix finally clause parsing in try-except-finally statements (#209)
+- Fix score normalization for dependencies and architecture categories (#221)
+
+### Added
+- Circular dependency details in HTML reports (#176)
+- Scoring reference documentation (#211)
+- MCP use case examples in README (#222)
+
+### Enhanced
+- Stricter analyze scoring with continuous penalties and weighted dead code (#212)
+
+### Improved
+- Add test coverage for version package (#218)
+- Add test coverage for system-analysis helper utilities (#216)
+- Remove unused clone detection code (#214)
+
+## [1.2.2] - 2025-10-19
+
+### Enhanced
+- Compact MCP responses for MCP tools via the new `output_mode` parameter, including summary/detailed formats and correct totals when `max_results` is used (#203)
+
+### Improved
+- Drop unused `python/pyproject-mcp.toml` now that the MCP wheel uses the primary config (#204)
+- Remove redundant guidance from the Claude MCP setup snippet (#205)
+
+## [1.2.1] - 2025-10-18
+
+### Added
+- Standalone pyscn-mcp PyPI package for MCP-only usage (#194)
+
+## [1.2.0] - 2025-10-18
+
+### Added
+- MCP (Model Context Protocol) server integration for AI coding assistants (#184)
+
+### Improved
+- Package pyscn-mcp binary in wheels for uv workflows (#189)
+- Add MCP integration documentation section (#190)
+- Refactor file resolution logic into shared helper (#183)
+- Add Python 3.13 support (#174)
+- Improve build system and MCP documentation (#191)
+- Update issue templates for user feedback (#192)
+
+## [1.1.1] - 2025-10-12
+
+### Fixed
+- **Critical:** Fix `pyscn analyze` failing with "no Python files found" error (#178)
+
+### Improved
+- Improve README with dev.to article link and streamline CI/CD section (#172)
+
+## [1.1.0] - 2025-10-11
+
+### Added
+- `file:line:col` output format to `check` command for better editor integration (#168)
+- `--select` flag to `check` command for running specific analyses (#159)
+
+### Enhanced
+- Embed default config as TOML and load architecture rules from config (#163)
+
+### Fixed
+- Prevent browser from opening HTML reports when connected via SSH (#154)
+- Fix Makefile ASCII escape codes on cross-platform (#153)
+
+### Improved
+- Add Dependabot configuration for Go dependency updates (#165)
+- Improve issue template readability (#169)
+
+## [1.0.3] - 2025-10-10
+
+### Fixed
+- Improve progress estimation for clone detection with LSH (#161)
+- Support for `**` globstar patterns in include/exclude patterns (#152)
+
+### Note
+- Pattern matching now uses `doublestar` library for proper `**` support
+- If you use custom patterns, update `*.py` to `**/*.py` for recursive matching
+
+## [1.0.2] - 2025-10-10
+
+### Enhanced
+- Add nesting depth metric to complexity analysis (#150)
+
+### Fixed
+- **Critical:** Fix `pyscn check .` and `pyscn analyze .` failing with "no Python files found" (#147)
+- Ignore circular dependencies for imports inside TYPE_CHECKING (#151)
+
+### Improved
+- Add comprehensive test coverage for error categorizer (#142)
+- Improve README structure and installation section (#148)
+
+## [1.0.1] - 2025-10-07
+
+### Fixed
+- Fixed `pyscn init` missing `[output]` and `[analysis]` sections in generated config (#131)
+- Fixed HTML reports to sort by complexity instead of name by default (#130)
+
+## [1.0.0] - 2025-10-05
+
+### 🎉 First Stable Release
+
+High-performance Python code quality analyzer built with Go.
+Designed for the AI-assisted development era.
+
+### Key Features
+
+- **Blazing Fast** - 100,000+ lines/sec with Go + tree-sitter
+- **Advanced Clone Detection** - APTED algorithm with LSH acceleration
+- **Dead Code Analysis** - CFG-based unreachable code detection
+- **Architecture Metrics** - CBO coupling and cyclomatic complexity
+- **Multiple Formats** - HTML, JSON, YAML, CSV reports
+- **CI/CD Ready** - `pyscn check` for quality gates
+
+### Installation
+
+```bash
+pipx install pyscn        # Recommended
+uvx pyscn analyze .       # Run without install
+```
+
+### Quick Start
+
+```bash
+pyscn analyze .           # Full analysis with HTML report
+pyscn check .            # Quick CI check
+pyscn init              # Generate config file
+```
+
+---
+
+## Previous Releases
+
+Beta versions (0.1.0-beta.1 through 0.8.0-beta.1) were development releases.
+For details, see git commit history.

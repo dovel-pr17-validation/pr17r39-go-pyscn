@@ -1,0 +1,693 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ludo-technologies/pyscn/domain"
+)
+
+func TestLoadComplexityFromPyscnToml(t *testing.T) {
+	// Create temporary directory
+	tempDir := t.TempDir()
+
+	// Create .pyscn.toml with complexity settings
+	configContent := `[complexity]
+	enabled = false
+	report_unchanged = false
+	low_threshold = 5
+	medium_threshold = 7
+	max_complexity = 9
+	min_complexity = 3
+	`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	// Load config
+	loader := NewTomlConfigLoader()
+	config, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Verify complexity settings were loaded
+	if domain.BoolValue(config.ComplexityEnabled, true) {
+		t.Errorf("Expected enabled false, got %v", config.ComplexityEnabled)
+	}
+	if domain.BoolValue(config.ComplexityReportUnchanged, true) {
+		t.Errorf("Expected report_unchanged false, got %v", config.ComplexityReportUnchanged)
+	}
+	if config.ComplexityLowThreshold != 5 {
+		t.Errorf("Expected low_threshold 5, got %d", config.ComplexityLowThreshold)
+	}
+	if config.ComplexityMediumThreshold != 7 {
+		t.Errorf("Expected medium_threshold 7, got %d", config.ComplexityMediumThreshold)
+	}
+	if config.ComplexityMaxComplexity != 9 {
+		t.Errorf("Expected max_complexity 9, got %d", config.ComplexityMaxComplexity)
+	}
+	if config.ComplexityMinComplexity != 3 {
+		t.Errorf("Expected min_complexity 3, got %d", config.ComplexityMinComplexity)
+	}
+}
+
+func TestTomlConfigLoaderResolvesProjectRootFromConfig(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, ".pyscn.toml"), []byte("project_root = \"src\"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := NewTomlConfigLoader().LoadConfig(configDir)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	want, err := filepath.Abs(filepath.Join(configDir, "src"))
+	if err != nil {
+		t.Fatalf("failed to resolve expected root: %v", err)
+	}
+	if cfg.ProjectRoot != want {
+		t.Fatalf("expected project root %q, got %q", want, cfg.ProjectRoot)
+	}
+}
+
+func TestPyprojectConfigDefaultsProjectRootToConfigDirectory(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "pyproject.toml")
+	if err := os.WriteFile(configPath, []byte("[tool.pyscn]\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadPyprojectConfig(configDir)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	want, err := filepath.Abs(configDir)
+	if err != nil {
+		t.Fatalf("failed to resolve expected root: %v", err)
+	}
+	if cfg.ProjectRoot != want {
+		t.Fatalf("expected project root %q, got %q", want, cfg.ProjectRoot)
+	}
+}
+
+func TestLoadComplexityFromPyscnTomlPartial(t *testing.T) {
+	// Create temporary directory
+	tempDir := t.TempDir()
+
+	// Create .pyscn.toml with only some complexity settings
+	configContent := `[complexity]
+low_threshold = 4
+medium_threshold = 6
+`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	// Load config
+	loader := NewTomlConfigLoader()
+	config, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Verify specified settings were loaded
+	if config.ComplexityLowThreshold != 4 {
+		t.Errorf("Expected low_threshold 4, got %d", config.ComplexityLowThreshold)
+	}
+	if config.ComplexityMediumThreshold != 6 {
+		t.Errorf("Expected medium_threshold 6, got %d", config.ComplexityMediumThreshold)
+	}
+
+	// Verify unspecified settings use defaults
+	if config.ComplexityMaxComplexity != DefaultMaxComplexityLimit {
+		t.Errorf("Expected default max_complexity %d, got %d", DefaultMaxComplexityLimit, config.ComplexityMaxComplexity)
+	}
+	if config.ComplexityMinComplexity != DefaultMinComplexityFilter {
+		t.Errorf("Expected default min_complexity %d, got %d", DefaultMinComplexityFilter, config.ComplexityMinComplexity)
+	}
+}
+
+func TestLoadFunctionSLOCThresholdsFromPyscnToml(t *testing.T) {
+	tempDir := t.TempDir()
+
+	configContent := `[complexity]
+function_sloc_warn_threshold = 30
+function_sloc_critical_threshold = 80
+`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	loader := NewTomlConfigLoader()
+	pyscnCfg, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if pyscnCfg.FunctionSLOCWarnThreshold != 30 {
+		t.Errorf("Expected function_sloc_warn_threshold 30, got %d", pyscnCfg.FunctionSLOCWarnThreshold)
+	}
+	if pyscnCfg.FunctionSLOCCriticalThreshold != 80 {
+		t.Errorf("Expected function_sloc_critical_threshold 80, got %d", pyscnCfg.FunctionSLOCCriticalThreshold)
+	}
+
+	cfg := PyscnConfigToConfig(pyscnCfg)
+	if cfg.Complexity.FunctionSLOCWarnThreshold != 30 {
+		t.Errorf("Expected merged warn threshold 30, got %d", cfg.Complexity.FunctionSLOCWarnThreshold)
+	}
+	if cfg.Complexity.FunctionSLOCCriticalThreshold != 80 {
+		t.Errorf("Expected merged critical threshold 80, got %d", cfg.Complexity.FunctionSLOCCriticalThreshold)
+	}
+}
+
+func TestFunctionSLOCThresholdsDefaultWhenUnset(t *testing.T) {
+	tempDir := t.TempDir()
+
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte("[complexity]\nlow_threshold = 4\n"), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	loader := NewTomlConfigLoader()
+	pyscnCfg, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if pyscnCfg.FunctionSLOCWarnThreshold != DefaultFunctionSLOCWarnThreshold {
+		t.Errorf("Expected default warn threshold %d, got %d", DefaultFunctionSLOCWarnThreshold, pyscnCfg.FunctionSLOCWarnThreshold)
+	}
+	if pyscnCfg.FunctionSLOCCriticalThreshold != DefaultFunctionSLOCCriticalThreshold {
+		t.Errorf("Expected default critical threshold %d, got %d", DefaultFunctionSLOCCriticalThreshold, pyscnCfg.FunctionSLOCCriticalThreshold)
+	}
+}
+
+func TestFunctionSLOCThresholdsFollowTheTierThatWasSet(t *testing.T) {
+	tests := []struct {
+		name             string
+		section          string
+		expectedWarn     int
+		expectedCritical int
+	}{
+		{
+			name:             "warn only pulls critical up with it",
+			section:          "function_sloc_warn_threshold = 150\n",
+			expectedWarn:     150,
+			expectedCritical: 300,
+		},
+		{
+			name:             "critical only pulls warn down with it",
+			section:          "function_sloc_critical_threshold = 30\n",
+			expectedWarn:     15,
+			expectedCritical: 30,
+		},
+		{
+			name:             "both set are kept verbatim",
+			section:          "function_sloc_warn_threshold = 20\nfunction_sloc_critical_threshold = 200\n",
+			expectedWarn:     20,
+			expectedCritical: 200,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			configPath := filepath.Join(tempDir, ".pyscn.toml")
+			if err := os.WriteFile(configPath, []byte("[complexity]\n"+tt.section), 0644); err != nil {
+				t.Fatalf("Failed to write config file: %v", err)
+			}
+
+			pyscnCfg, err := NewTomlConfigLoader().LoadConfig(tempDir)
+			if err != nil {
+				t.Fatalf("Failed to load config: %v", err)
+			}
+
+			cfg := PyscnConfigToConfig(pyscnCfg)
+			if cfg.Complexity.FunctionSLOCWarnThreshold != tt.expectedWarn {
+				t.Errorf("Expected warn threshold %d, got %d", tt.expectedWarn, cfg.Complexity.FunctionSLOCWarnThreshold)
+			}
+			if cfg.Complexity.FunctionSLOCCriticalThreshold != tt.expectedCritical {
+				t.Errorf("Expected critical threshold %d, got %d", tt.expectedCritical, cfg.Complexity.FunctionSLOCCriticalThreshold)
+			}
+			// Raising or lowering a single tier must never produce a config
+			// the user then has to repair.
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Expected the derived config to validate, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestInvertedFunctionSLOCThresholdsAreRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `[complexity]
+function_sloc_warn_threshold = 100
+function_sloc_critical_threshold = 40
+`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	pyscnCfg, err := NewTomlConfigLoader().LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	err = PyscnConfigToConfig(pyscnCfg).Validate()
+	if err == nil {
+		t.Fatal("Expected an explicitly inverted threshold pair to be rejected")
+	}
+	if !strings.Contains(err.Error(), "function_sloc_critical_threshold (40)") {
+		t.Errorf("Expected the error to name both tiers, got: %v", err)
+	}
+}
+
+func TestMergeComplexitySection(t *testing.T) {
+	// Create a default config
+	config := DefaultPyscnConfig()
+
+	// Create complexity settings
+	complexity := ComplexityTomlConfig{
+		Enabled:         domain.BoolPtr(false),
+		ReportUnchanged: domain.BoolPtr(false),
+		LowThreshold:    intPtr(3),
+		MediumThreshold: intPtr(5),
+		MaxComplexity:   intPtr(10),
+		MinComplexity:   intPtr(2),
+	}
+
+	// Merge complexity settings
+	mergeComplexitySection(config, &complexity)
+
+	// Verify settings were merged
+	if domain.BoolValue(config.ComplexityEnabled, true) {
+		t.Errorf("Expected enabled false, got %v", config.ComplexityEnabled)
+	}
+	if domain.BoolValue(config.ComplexityReportUnchanged, true) {
+		t.Errorf("Expected report_unchanged false, got %v", config.ComplexityReportUnchanged)
+	}
+	if config.ComplexityLowThreshold != 3 {
+		t.Errorf("Expected low_threshold 3, got %d", config.ComplexityLowThreshold)
+	}
+	if config.ComplexityMediumThreshold != 5 {
+		t.Errorf("Expected medium_threshold 5, got %d", config.ComplexityMediumThreshold)
+	}
+	if config.ComplexityMaxComplexity != 10 {
+		t.Errorf("Expected max_complexity 10, got %d", config.ComplexityMaxComplexity)
+	}
+	if config.ComplexityMinComplexity != 2 {
+		t.Errorf("Expected min_complexity 2, got %d", config.ComplexityMinComplexity)
+	}
+}
+
+func TestMergeComplexitySectionNilValues(t *testing.T) {
+	// Create a default config
+	config := DefaultPyscnConfig()
+	originalLow := config.ComplexityLowThreshold
+
+	// Create complexity settings with nil values
+	complexity := ComplexityTomlConfig{
+		Enabled:         nil,
+		ReportUnchanged: nil,
+		LowThreshold:    nil,
+		MediumThreshold: nil,
+		MaxComplexity:   nil,
+		MinComplexity:   nil,
+	}
+
+	// Merge complexity settings
+	mergeComplexitySection(config, &complexity)
+
+	// Verify defaults were not changed
+	if config.ComplexityLowThreshold != originalLow {
+		t.Errorf("Expected defaults to remain, got %d", config.ComplexityLowThreshold)
+	}
+}
+
+// Helper function to create int pointer
+func intPtr(val int) *int {
+	return &val
+}
+
+func TestLoadDeadCodeFromPyscnToml(t *testing.T) {
+	// Create temporary directory
+	tempDir := t.TempDir()
+
+	// Create .pyscn.toml with dead_code settings
+	configContent := `[dead_code]
+min_severity = "info"
+show_context = true
+context_lines = 5
+sort_by = "line"
+detect_after_return = false
+detect_after_break = false
+`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	// Load config
+	loader := NewTomlConfigLoader()
+	config, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Debug: print values
+	t.Logf("Loaded PyscnConfig:")
+	t.Logf("  DeadCodeMinSeverity: %s", config.DeadCodeMinSeverity)
+	t.Logf("  DeadCodeShowContext: %v", config.DeadCodeShowContext)
+	t.Logf("  DeadCodeContextLines: %d", config.DeadCodeContextLines)
+	t.Logf("  DeadCodeSortBy: %s", config.DeadCodeSortBy)
+
+	// Verify dead_code settings were loaded
+	if config.DeadCodeMinSeverity != "info" {
+		t.Errorf("Expected min_severity 'info', got %s", config.DeadCodeMinSeverity)
+	}
+	if !domain.BoolValue(config.DeadCodeShowContext, false) {
+		t.Errorf("Expected show_context true, got %v", config.DeadCodeShowContext)
+	}
+	if config.DeadCodeContextLines != 5 {
+		t.Errorf("Expected context_lines 5, got %d", config.DeadCodeContextLines)
+	}
+	if config.DeadCodeSortBy != "line" {
+		t.Errorf("Expected sort_by 'line', got %s", config.DeadCodeSortBy)
+	}
+	if domain.BoolValue(config.DeadCodeDetectAfterReturn, true) {
+		t.Errorf("Expected detect_after_return false, got %v", config.DeadCodeDetectAfterReturn)
+	}
+	if domain.BoolValue(config.DeadCodeDetectAfterBreak, true) {
+		t.Errorf("Expected detect_after_break false, got %v", config.DeadCodeDetectAfterBreak)
+	}
+}
+
+func TestLoadDIFromPyscnToml(t *testing.T) {
+	tempDir := t.TempDir()
+
+	configContent := `[di]
+enabled = true
+min_severity = "error"
+constructor_param_threshold = 9
+`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	loader := NewTomlConfigLoader()
+	config, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if !domain.BoolValue(config.DIEnabled, false) {
+		t.Errorf("Expected di.enabled true, got %v", config.DIEnabled)
+	}
+	if config.DIMinSeverity != "error" {
+		t.Errorf("Expected di.min_severity error, got %s", config.DIMinSeverity)
+	}
+	if config.DIConstructorParamThreshold != 9 {
+		t.Errorf("Expected di.constructor_param_threshold 9, got %d", config.DIConstructorParamThreshold)
+	}
+}
+
+func TestLoadConfig_DirectPyprojectPathIgnoresSiblingPyscn(t *testing.T) {
+	tempDir := t.TempDir()
+
+	pyscnContent := `[analysis]
+include_patterns = ["from-pyscn"]
+`
+	pyprojectContent := `[tool.pyscn.analysis]
+include_patterns = ["from-pyproject"]
+`
+
+	if err := os.WriteFile(filepath.Join(tempDir, ".pyscn.toml"), []byte(pyscnContent), 0644); err != nil {
+		t.Fatalf("Failed to write .pyscn.toml: %v", err)
+	}
+	pyprojectPath := filepath.Join(tempDir, "pyproject.toml")
+	if err := os.WriteFile(pyprojectPath, []byte(pyprojectContent), 0644); err != nil {
+		t.Fatalf("Failed to write pyproject.toml: %v", err)
+	}
+
+	loader := NewTomlConfigLoader()
+	cfg, err := loader.LoadConfig(pyprojectPath)
+	if err != nil {
+		t.Fatalf("Failed to load explicit pyproject.toml: %v", err)
+	}
+
+	if len(cfg.AnalysisIncludePatterns) != 1 || cfg.AnalysisIncludePatterns[0] != "from-pyproject" {
+		t.Fatalf("Expected include pattern from explicit pyproject.toml, got %v", cfg.AnalysisIncludePatterns)
+	}
+}
+
+func TestFindConfigFileFromPath_DetectsQuotedPyscnSection(t *testing.T) {
+	tempDir := t.TempDir()
+	pyprojectPath := filepath.Join(tempDir, "pyproject.toml")
+	content := `[tool."pyscn".analysis]
+include_patterns = ["quoted"]
+`
+	if err := os.WriteFile(pyprojectPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write pyproject.toml: %v", err)
+	}
+
+	loader := NewTomlConfigLoader()
+	found := loader.FindConfigFileFromPath(tempDir)
+	if found != pyprojectPath {
+		t.Fatalf("Expected %s, got %s", pyprojectPath, found)
+	}
+}
+
+// writeNestedRepo creates <root>/outer/.pyscn.toml plus a nested checkout at
+// <root>/outer/inner marked as its own repository, and returns the inner path.
+func writeNestedRepo(t *testing.T, gitEntryIsDir bool) (root string, ancestorConfig string, inner string) {
+	t.Helper()
+
+	root = t.TempDir()
+	outer := filepath.Join(root, "outer")
+	inner = filepath.Join(outer, "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatalf("Failed to create nested directories: %v", err)
+	}
+
+	ancestorConfig = filepath.Join(outer, ".pyscn.toml")
+	if err := os.WriteFile(ancestorConfig, []byte("[architecture]\nstrict_mode = true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to write ancestor .pyscn.toml: %v", err)
+	}
+
+	gitEntry := filepath.Join(inner, ".git")
+	if gitEntryIsDir {
+		if err := os.Mkdir(gitEntry, 0o755); err != nil {
+			t.Fatalf("Failed to create .git directory: %v", err)
+		}
+	} else if err := os.WriteFile(gitEntry, []byte("gitdir: /elsewhere/.git/worktrees/inner\n"), 0o644); err != nil {
+		t.Fatalf("Failed to write .git file: %v", err)
+	}
+
+	return root, ancestorConfig, inner
+}
+
+func TestFindConfigFileFromPath_StopsAtNestedRepositoryRoot(t *testing.T) {
+	_, _, inner := writeNestedRepo(t, true)
+
+	found := NewTomlConfigLoader().FindConfigFileFromPath(inner)
+	if found != "" {
+		t.Fatalf("Expected no config for nested checkout, got %s", found)
+	}
+}
+
+func TestFindConfigFileFromPath_StopsAtWorktreeGitFile(t *testing.T) {
+	_, _, inner := writeNestedRepo(t, false)
+
+	found := NewTomlConfigLoader().FindConfigFileFromPath(inner)
+	if found != "" {
+		t.Fatalf("Expected no config for nested worktree, got %s", found)
+	}
+}
+
+func TestFindConfigFileFromPath_UsesNestedRepositoryOwnConfig(t *testing.T) {
+	_, _, inner := writeNestedRepo(t, true)
+
+	ownConfig := filepath.Join(inner, ".pyscn.toml")
+	if err := os.WriteFile(ownConfig, []byte("[architecture]\nstrict_mode = false\n"), 0o644); err != nil {
+		t.Fatalf("Failed to write nested .pyscn.toml: %v", err)
+	}
+
+	found := NewTomlConfigLoader().FindConfigFileFromPath(inner)
+	if found != ownConfig {
+		t.Fatalf("Expected %s, got %s", ownConfig, found)
+	}
+}
+
+func TestFindConfigFileFromPath_StopsAtRepositoryRootForPyproject(t *testing.T) {
+	root := t.TempDir()
+	outer := filepath.Join(root, "outer")
+	inner := filepath.Join(outer, "inner")
+	if err := os.MkdirAll(filepath.Join(inner, ".git"), 0o755); err != nil {
+		t.Fatalf("Failed to create nested directories: %v", err)
+	}
+
+	ancestorConfig := filepath.Join(outer, "pyproject.toml")
+	if err := os.WriteFile(ancestorConfig, []byte("[tool.pyscn.analysis]\ninclude_patterns = [\"ancestor\"]\n"), 0o644); err != nil {
+		t.Fatalf("Failed to write ancestor pyproject.toml: %v", err)
+	}
+
+	found := NewTomlConfigLoader().FindConfigFileFromPath(inner)
+	if found != "" {
+		t.Fatalf("Expected no config for nested checkout, got %s", found)
+	}
+}
+
+func TestFindConfigFileFromPath_FindsConfigAtOwnRepositoryRoot(t *testing.T) {
+	repoRoot := t.TempDir()
+	packageDir := filepath.Join(repoRoot, "src", "package")
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatalf("Failed to create package directory: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatalf("Failed to create .git directory: %v", err)
+	}
+
+	repoConfig := filepath.Join(repoRoot, ".pyscn.toml")
+	if err := os.WriteFile(repoConfig, []byte("[architecture]\nstrict_mode = true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to write repository .pyscn.toml: %v", err)
+	}
+
+	found := NewTomlConfigLoader().FindConfigFileFromPath(packageDir)
+	if found != repoConfig {
+		t.Fatalf("Expected %s, got %s", repoConfig, found)
+	}
+}
+
+func TestTomlLoaderPreservesExplicitEmptyAnalysisIncludes(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	content := `[analysis]
+include_patterns = []
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write .pyscn.toml: %v", err)
+	}
+
+	cfg, err := NewTomlConfigLoader().LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if !cfg.HasExplicitAnalysisIncludePatterns() {
+		t.Fatal("Expected explicit analysis include patterns")
+	}
+	if len(cfg.AnalysisIncludePatterns) != 0 {
+		t.Fatalf("Expected empty include patterns, got %v", cfg.AnalysisIncludePatterns)
+	}
+}
+
+func TestPyprojectLoaderPreservesExplicitEmptyAnalysisIncludes(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "pyproject.toml")
+	content := `[tool.pyscn.analysis]
+include_patterns = []
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write pyproject.toml: %v", err)
+	}
+
+	cfg, err := NewTomlConfigLoader().LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if !cfg.HasExplicitAnalysisIncludePatterns() {
+		t.Fatal("Expected explicit analysis include patterns")
+	}
+	if len(cfg.AnalysisIncludePatterns) != 0 {
+		t.Fatalf("Expected empty include patterns, got %v", cfg.AnalysisIncludePatterns)
+	}
+}
+
+func TestResolveConfigPath_MissingTomlReturnsError(t *testing.T) {
+	loader := NewTomlConfigLoader()
+
+	_, err := loader.ResolveConfigPath("/nonexistent/.pyscn.toml", "")
+	if err == nil {
+		t.Fatal("Expected error for missing explicit TOML file")
+	}
+	if !strings.Contains(err.Error(), "config file not found") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestResolveConfigPath_MissingNonTomlPathReturnsError(t *testing.T) {
+	loader := NewTomlConfigLoader()
+
+	_, err := loader.ResolveConfigPath("/nonexistent/config-dir", "")
+	if err == nil {
+		t.Fatal("Expected error for missing explicit config path")
+	}
+	if !strings.Contains(err.Error(), "config file not found") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestLoadArchitectureStyleFromPyscnToml(t *testing.T) {
+	tempDir := t.TempDir()
+
+	configContent := `[architecture]
+style = "hexagonal"
+`
+	configPath := filepath.Join(tempDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	loader := NewTomlConfigLoader()
+	cfg, err := loader.LoadConfig(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if cfg.ArchitectureStyle != "hexagonal" {
+		t.Errorf("Expected architecture style 'hexagonal', got %q", cfg.ArchitectureStyle)
+	}
+}
+
+func TestTomlConfigLoaderExplicitFileWithoutProjectRootLeavesItEmpty(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte("[output]\nmin_complexity = 15\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := NewTomlConfigLoader().LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if cfg.ProjectRoot != "" {
+		t.Fatalf("expected empty project root for an explicit config file, got %q", cfg.ProjectRoot)
+	}
+}
+
+func TestTomlConfigLoaderExplicitPyprojectWithoutProjectRootLeavesItEmpty(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "pyproject.toml")
+	if err := os.WriteFile(configPath, []byte("[tool.pyscn.output]\nmin_complexity = 15\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := NewTomlConfigLoader().LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if cfg.ProjectRoot != "" {
+		t.Fatalf("expected empty project root for an explicit pyproject.toml, got %q", cfg.ProjectRoot)
+	}
+}

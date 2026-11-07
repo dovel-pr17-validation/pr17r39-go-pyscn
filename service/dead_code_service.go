@@ -1,0 +1,587 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/analyzer"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+	"github.com/ludo-technologies/pyscn/internal/version"
+)
+
+// DeadCodeServiceImpl implements the DeadCodeService interface
+type DeadCodeServiceImpl struct {
+	parser *parser.Parser
+}
+
+// NewDeadCodeService creates a new dead code service implementation
+func NewDeadCodeService() *DeadCodeServiceImpl {
+	return &DeadCodeServiceImpl{
+		parser: parser.New(),
+	}
+}
+
+// deadCodePopulation is the complete analyzed unit count. FileDeadCode only
+// carries the execution scopes that produced findings, so the population has to
+// be accumulated separately: it is what the summary reports as the analyzed
+// totals and what OverallDeadRatio divides by.
+type deadCodePopulation struct {
+	Files       int
+	Functions   int
+	ClassScopes int
+	Blocks      int
+}
+
+func (p *deadCodePopulation) addFile(file deadCodePopulation) {
+	p.Files++
+	p.Functions += file.Functions
+	p.ClassScopes += file.ClassScopes
+	p.Blocks += file.Blocks
+}
+
+// Analyze performs dead code analysis on multiple files
+func (s *DeadCodeServiceImpl) Analyze(ctx context.Context, req domain.DeadCodeRequest) (*domain.DeadCodeResponse, error) {
+	var allFiles []domain.FileDeadCode
+	var warnings []string
+	var issues []analysisIssue
+	moduleRollups := make(map[string]domain.ModuleDeadCodeMetrics)
+	population := deadCodePopulation{}
+
+	for _, filePath := range req.Paths {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dead code analysis cancelled: %w", ctx.Err())
+		default:
+		}
+
+		// Progress reporting removed - file parsing is fast
+
+		// Analyze single file
+		fileResult, filePopulation, moduleRollup, fileWarnings, fileIssues := s.analyzeFile(ctx, filePath, req)
+
+		if len(fileIssues) > 0 {
+			issues = append(issues, fileIssues...)
+			continue // Skip this file but continue with others
+		}
+		moduleRollups[filepath.Clean(filePath)] = moduleRollup
+
+		// Only include files that have dead code findings
+		if fileResult != nil && (len(fileResult.Functions) > 0 || len(fileResult.ClassScopes) > 0 || fileResult.TotalFindings > 0) {
+			allFiles = append(allFiles, *fileResult)
+		}
+
+		warnings = append(warnings, fileWarnings...)
+		population.addFile(filePopulation)
+	}
+
+	// Filter and sort results for presentation only; the summary reports the
+	// analyzed totals over every file, not just the ones holding findings.
+	filteredFiles := s.filterFiles(allFiles, req)
+	sortedFiles := s.sortFiles(filteredFiles, req.SortBy)
+
+	// Generate summary
+	summary := s.generateSummary(sortedFiles, population, req)
+
+	return &domain.DeadCodeResponse{
+		Files:         sortedFiles,
+		Summary:       summary,
+		ModuleRollups: moduleRollups,
+		Warnings:      warnings,
+		Errors:        analysisIssueMessages(issues),
+		Failures:      analyzerFailures(domain.AnalysisKindDeadCode, issues),
+		GeneratedAt:   time.Now().Format(time.RFC3339),
+		Version:       version.Version,
+		Config:        s.buildConfigForResponse(req),
+	}, nil
+}
+
+// AnalyzeSnapshot performs dead code analysis using already parsed project files.
+func (s *DeadCodeServiceImpl) AnalyzeSnapshot(ctx context.Context, snapshot *ProjectSnapshot, req domain.DeadCodeRequest) (*domain.DeadCodeResponse, error) {
+	if snapshot == nil {
+		return nil, fmt.Errorf("project snapshot cannot be nil")
+	}
+
+	var allFiles []domain.FileDeadCode
+	var warnings []string
+	var issues []analysisIssue
+	moduleRollups := make(map[string]domain.ModuleDeadCodeMetrics)
+	population := deadCodePopulation{}
+
+	for _, file := range snapshot.analysisProjectFiles() {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dead code analysis cancelled: %w", ctx.Err())
+		default:
+		}
+		fileResult, filePopulation, moduleRollup, fileWarnings, fileIssues := s.analyzeProjectFile(file, req)
+
+		if len(fileIssues) > 0 {
+			issues = append(issues, fileIssues...)
+			continue
+		}
+		moduleRollups[filepath.Clean(file.Path)] = moduleRollup
+
+		if fileResult != nil && (len(fileResult.Functions) > 0 || len(fileResult.ClassScopes) > 0 || fileResult.TotalFindings > 0) {
+			allFiles = append(allFiles, *fileResult)
+		}
+
+		warnings = append(warnings, fileWarnings...)
+		population.addFile(filePopulation)
+	}
+
+	filteredFiles := s.filterFiles(allFiles, req)
+	sortedFiles := s.sortFiles(filteredFiles, req.SortBy)
+	summary := s.generateSummary(sortedFiles, population, req)
+
+	return &domain.DeadCodeResponse{
+		Files:         sortedFiles,
+		Summary:       summary,
+		ModuleRollups: moduleRollups,
+		Warnings:      warnings,
+		Errors:        analysisIssueMessages(issues),
+		Failures:      analyzerFailures(domain.AnalysisKindDeadCode, issues),
+		GeneratedAt:   time.Now().Format(time.RFC3339),
+		Version:       version.Version,
+		Config:        s.buildConfigForResponse(req),
+	}, nil
+}
+
+// AnalyzeFile analyzes a single Python file for dead code
+func (s *DeadCodeServiceImpl) AnalyzeFile(ctx context.Context, filePath string, req domain.DeadCodeRequest) (*domain.FileDeadCode, error) {
+	fileResult, _, _, _, fileIssues := s.analyzeFile(ctx, filePath, req)
+
+	if len(fileIssues) > 0 {
+		return nil, domain.NewAnalysisError(fmt.Sprintf("failed to analyze file %s", filePath), fmt.Errorf("%v", analysisIssueMessages(fileIssues)))
+	}
+
+	return fileResult, nil
+}
+
+// AnalyzeFunction analyzes a single function for dead code
+func (s *DeadCodeServiceImpl) AnalyzeFunction(ctx context.Context, functionCFG interface{}, req domain.DeadCodeRequest) (*domain.FunctionDeadCode, error) {
+	cfg, ok := functionCFG.(*analyzer.CFG)
+	if !ok {
+		return nil, domain.NewInvalidInputError("invalid CFG type", nil)
+	}
+
+	result := analyzer.DetectInFunction(cfg)
+	if result == nil {
+		return nil, domain.NewAnalysisError("failed to analyze function", nil)
+	}
+
+	funcResult := s.convertToFunctionDeadCode(result, req)
+	return &funcResult, nil
+}
+
+// analyzeFile performs dead code analysis on a single file
+func (s *DeadCodeServiceImpl) analyzeFile(ctx context.Context, filePath string, req domain.DeadCodeRequest) (*domain.FileDeadCode, deadCodePopulation, domain.ModuleDeadCodeMetrics, []string, []analysisIssue) {
+	var warnings []string
+	var issues []analysisIssue
+
+	// Parse the file
+	content, err := s.readFile(filePath)
+	if err != nil {
+		issues = append(issues, analysisIssue{filePath: filePath, message: fmt.Sprintf("Failed to read file: %v", err), cause: err})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	result, err := s.parser.Parse(ctx, content)
+	if err != nil {
+		issues = append(issues, analysisIssue{filePath: filePath, message: fmt.Sprintf("Parse error: %v", err), cause: err})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	// Build CFGs for all functions
+	builder := analyzer.NewCFGBuilder()
+	cfgs, err := builder.BuildAll(result.AST)
+	if err != nil {
+		issues = append(issues, analysisIssue{filePath: filePath, message: fmt.Sprintf("CFG construction failed: %v", err), cause: err})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	if len(cfgs) == 0 {
+		warnings = append(warnings, fmt.Sprintf("[%s] No executable scopes found in file", filePath))
+		return &domain.FileDeadCode{
+			FilePath:          filePath,
+			Functions:         []domain.FunctionDeadCode{},
+			ClassScopes:       []domain.FunctionDeadCode{},
+			TotalFindings:     0,
+			TotalFunctions:    0,
+			AffectedFunctions: 0,
+			DeadCodeRatio:     0.0,
+		}, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	fileResult, population, moduleRollup, fileWarnings := s.analyzeCFGs(filePath, cfgs, req)
+	warnings = append(warnings, fileWarnings...)
+
+	return fileResult, population, moduleRollup, warnings, issues
+}
+
+func (s *DeadCodeServiceImpl) analyzeProjectFile(file *ProjectFile, req domain.DeadCodeRequest) (*domain.FileDeadCode, deadCodePopulation, domain.ModuleDeadCodeMetrics, []string, []analysisIssue) {
+	var warnings []string
+	var issues []analysisIssue
+
+	if file == nil {
+		issues = append(issues, analysisIssue{filePath: "unknown", message: "Invalid project file"})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+	if file.ReadErr != nil {
+		issues = append(issues, analysisIssue{filePath: file.Path, message: fmt.Sprintf("Failed to read file: %v", file.ReadErr), cause: file.ReadErr, diagnosticCode: domain.DiagnosticCodeRead})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+	if file.ParseErr != nil {
+		issues = append(issues, analysisIssue{filePath: file.Path, message: fmt.Sprintf("Parse error: %v", file.ParseErr), cause: file.ParseErr, diagnosticCode: domain.DiagnosticCodeParse})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	cfgs, err := file.CFGs()
+	if err != nil {
+		issues = append(issues, analysisIssue{filePath: file.Path, message: fmt.Sprintf("CFG construction failed: %v", err), cause: err})
+		return nil, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	if len(cfgs) == 0 {
+		warnings = append(warnings, fmt.Sprintf("[%s] No executable scopes found in file", file.Path))
+		return &domain.FileDeadCode{
+			FilePath:          file.Path,
+			Functions:         []domain.FunctionDeadCode{},
+			ClassScopes:       []domain.FunctionDeadCode{},
+			TotalFindings:     0,
+			TotalFunctions:    0,
+			AffectedFunctions: 0,
+			DeadCodeRatio:     0.0,
+		}, deadCodePopulation{}, domain.ModuleDeadCodeMetrics{}, warnings, issues
+	}
+
+	fileResult, population, moduleRollup, fileWarnings := s.analyzeCFGs(file.Path, cfgs, req)
+	warnings = append(warnings, fileWarnings...)
+	return fileResult, population, moduleRollup, warnings, issues
+}
+
+func (s *DeadCodeServiceImpl) analyzeCFGs(filePath string, cfgs analyzer.ControlFlowGraphs, req domain.DeadCodeRequest) (*domain.FileDeadCode, deadCodePopulation, domain.ModuleDeadCodeMetrics, []string) {
+	var warnings []string
+	functions := make([]domain.FunctionDeadCode, 0)
+	classScopes := make([]domain.FunctionDeadCode, 0)
+	unfilteredFunctions := make([]domain.FunctionDeadCode, 0)
+	unfilteredClassScopes := make([]domain.FunctionDeadCode, 0)
+	totalFindings := 0
+	unfilteredFindings := 0
+	affectedFunctions := 0
+	affectedClassScopes := 0
+
+	population := deadCodePopulation{}
+	functionCount := 0
+	classScopeCount := 0
+	for _, scopedCFG := range cfgs {
+		if scopedCFG.Scope.Kind != domain.AnalysisScopeFunction && scopedCFG.Scope.Kind != domain.AnalysisScopeClass {
+			continue
+		}
+		if scopedCFG.Scope.Kind == domain.AnalysisScopeClass {
+			classScopeCount++
+		} else {
+			functionCount++
+		}
+		scopeName := scopedCFG.Scope.Name
+
+		deadCodeResults := analyzer.DetectInScopeWithFilePath(scopedCFG, filePath)
+		if deadCodeResults == nil {
+			warnings = append(warnings, fmt.Sprintf("[%s:%s] Failed to analyze dead code for scope", filePath, scopeName))
+			continue
+		}
+
+		scopeResult := s.convertToFunctionDeadCode(deadCodeResults, req)
+		scopeResult.Name = scopeName
+		scopeResult.FilePath = filePath
+		population.Blocks += scopeResult.TotalBlocks
+		if scopeResult.ScopeKind == domain.AnalysisScopeClass {
+			unfilteredClassScopes = append(unfilteredClassScopes, scopeResult)
+		} else {
+			unfilteredFunctions = append(unfilteredFunctions, scopeResult)
+		}
+		unfilteredFindings += len(scopeResult.Findings)
+
+		// Apply severity filtering
+		filteredFindings := s.filterFindingsBySeverity(scopeResult.Findings, req.MinSeverity)
+		scopeResult.Findings = filteredFindings
+
+		// Only include scopes that have findings after filtering while preserving
+		// the public function/class collection boundary.
+		if len(scopeResult.Findings) > 0 {
+			totalFindings += len(scopeResult.Findings)
+			if scopeResult.ScopeKind == domain.AnalysisScopeClass {
+				classScopes = append(classScopes, scopeResult)
+				affectedClassScopes++
+			} else {
+				functions = append(functions, scopeResult)
+				affectedFunctions++
+			}
+		}
+	}
+
+	deadCodeRatio := 0.0
+	if len(cfgs) > 0 {
+		totalDeadBlocks := 0
+		totalBlocks := 0
+		fileScopes := domain.FileDeadCode{Functions: functions, ClassScopes: classScopes}.ExecutionScopes()
+		for _, scope := range fileScopes {
+			totalDeadBlocks += scope.DeadBlocks
+			totalBlocks += scope.TotalBlocks
+		}
+		if totalBlocks > 0 {
+			deadCodeRatio = float64(totalDeadBlocks) / float64(totalBlocks)
+		}
+	}
+
+	fileResult := &domain.FileDeadCode{
+		FilePath:            filePath,
+		Functions:           functions,
+		ClassScopes:         classScopes,
+		TotalFindings:       totalFindings,
+		TotalFunctions:      functionCount,
+		AffectedFunctions:   affectedFunctions,
+		TotalClassScopes:    classScopeCount,
+		AffectedClassScopes: affectedClassScopes,
+		DeadCodeRatio:       deadCodeRatio,
+	}
+	unfilteredFile := domain.FileDeadCode{
+		FilePath:      filePath,
+		Functions:     unfilteredFunctions,
+		ClassScopes:   unfilteredClassScopes,
+		TotalFindings: unfilteredFindings,
+	}
+	moduleRollup := domain.AggregateDeadCodeByModule([]domain.FileDeadCode{unfilteredFile})[filepath.Clean(filePath)]
+
+	population.Functions = functionCount
+	population.ClassScopes = classScopeCount
+
+	return fileResult, population, moduleRollup, warnings
+}
+
+// convertToFunctionDeadCode converts analyzer results to domain model
+func (s *DeadCodeServiceImpl) convertToFunctionDeadCode(result *analyzer.DeadCodeResult, req domain.DeadCodeRequest) domain.FunctionDeadCode {
+	findings := make([]domain.DeadCodeFinding, 0, len(result.Findings))
+
+	for _, analyzerFinding := range result.Findings {
+		if !shouldIncludeDeadCodeFinding(analyzerFinding.Reason, req) {
+			continue
+		}
+		finding := domain.DeadCodeFinding{
+			Location: domain.DeadCodeLocation{
+				FilePath:  analyzerFinding.FilePath,
+				StartLine: analyzerFinding.StartLine,
+				EndLine:   analyzerFinding.EndLine,
+			},
+			FunctionName: analyzerFinding.FunctionName,
+			ScopeKind:    analyzerFinding.ScopeKind,
+			Code:         analyzerFinding.Code,
+			Reason:       string(analyzerFinding.Reason),
+			Severity:     s.convertSeverity(analyzerFinding.Severity),
+			Description:  analyzerFinding.Description,
+			Context:      analyzerFinding.Context,
+			BlockID:      analyzerFinding.BlockID,
+		}
+		findings = append(findings, finding)
+	}
+
+	functionResult := domain.FunctionDeadCode{
+		Name:           result.FunctionName,
+		ScopeKind:      result.ScopeKind,
+		FilePath:       result.FilePath,
+		Findings:       findings,
+		TotalBlocks:    result.TotalBlocks,
+		DeadBlocks:     result.DeadBlocks,
+		ReachableRatio: result.ReachableRatio,
+	}
+
+	// Calculate severity counts
+	functionResult.CalculateSeverityCounts()
+
+	return functionResult
+}
+
+func shouldIncludeDeadCodeFinding(reason analyzer.DeadCodeReason, req domain.DeadCodeRequest) bool {
+	switch reason {
+	case analyzer.ReasonUnreachableAfterReturn:
+		return domain.BoolValue(req.DetectAfterReturn, true)
+	case analyzer.ReasonUnreachableAfterBreak:
+		return domain.BoolValue(req.DetectAfterBreak, true)
+	case analyzer.ReasonUnreachableAfterContinue:
+		return domain.BoolValue(req.DetectAfterContinue, true)
+	case analyzer.ReasonUnreachableAfterRaise:
+		return domain.BoolValue(req.DetectAfterRaise, true)
+	case analyzer.ReasonUnreachableBranch:
+		return domain.BoolValue(req.DetectUnreachableBranches, true)
+	default:
+		return true
+	}
+}
+
+// convertSeverity converts analyzer severity to domain severity
+func (s *DeadCodeServiceImpl) convertSeverity(analyzerSeverity analyzer.SeverityLevel) domain.DeadCodeSeverity {
+	switch analyzerSeverity {
+	case analyzer.SeverityLevelCritical:
+		return domain.DeadCodeSeverityCritical
+	case analyzer.SeverityLevelWarning:
+		return domain.DeadCodeSeverityWarning
+	case analyzer.SeverityLevelInfo:
+		return domain.DeadCodeSeverityInfo
+	default:
+		return domain.DeadCodeSeverityWarning
+	}
+}
+
+// filterFiles filters files based on request criteria
+func (s *DeadCodeServiceImpl) filterFiles(files []domain.FileDeadCode, req domain.DeadCodeRequest) []domain.FileDeadCode {
+	filtered := make([]domain.FileDeadCode, 0, len(files))
+
+	for _, file := range files {
+		// Filter both public scope collections without merging their counters.
+		filteredFunctions := make([]domain.FunctionDeadCode, 0, len(file.Functions))
+		for _, function := range file.Functions {
+			if function.HasFindingsAtSeverity(req.MinSeverity) {
+				filteredFunctions = append(filteredFunctions, function)
+			}
+		}
+		var filteredClassScopes []domain.FunctionDeadCode
+		for _, scope := range file.ClassScopes {
+			if scope.HasFindingsAtSeverity(req.MinSeverity) {
+				filteredClassScopes = append(filteredClassScopes, scope)
+			}
+		}
+
+		// Only include files that have execution scopes with findings after filtering.
+		if len(filteredFunctions) > 0 || len(filteredClassScopes) > 0 {
+			filteredFile := file
+			filteredFile.Functions = filteredFunctions
+			filteredFile.ClassScopes = filteredClassScopes
+			filteredFile.TotalFindings = s.countTotalFindings(filteredFunctions) + s.countTotalFindings(filteredClassScopes)
+			filteredFile.AffectedFunctions = len(filteredFunctions)
+			filteredFile.AffectedClassScopes = len(filteredClassScopes)
+			filtered = append(filtered, filteredFile)
+		}
+	}
+
+	return filtered
+}
+
+// filterFindingsBySeverity filters findings by minimum severity level
+func (s *DeadCodeServiceImpl) filterFindingsBySeverity(findings []domain.DeadCodeFinding, minSeverity domain.DeadCodeSeverity) []domain.DeadCodeFinding {
+	filtered := make([]domain.DeadCodeFinding, 0, len(findings))
+	for _, finding := range findings {
+		if finding.Severity.IsAtLeast(minSeverity) {
+			filtered = append(filtered, finding)
+		}
+	}
+	return filtered
+}
+
+// sortFiles sorts files based on the specified criteria
+func (s *DeadCodeServiceImpl) sortFiles(files []domain.FileDeadCode, sortBy domain.DeadCodeSortCriteria) []domain.FileDeadCode {
+	sort.Slice(files, func(i, j int) bool {
+		switch sortBy {
+		case domain.DeadCodeSortByFile:
+			return files[i].FilePath < files[j].FilePath
+		case domain.DeadCodeSortBySeverity:
+			// Sort by highest severity findings first
+			return s.getHighestSeverityLevel(files[i]) > s.getHighestSeverityLevel(files[j])
+		default:
+			return files[i].FilePath < files[j].FilePath
+		}
+	})
+	return files
+}
+
+// getHighestSeverityLevel gets the highest severity level in a file
+func (s *DeadCodeServiceImpl) getHighestSeverityLevel(file domain.FileDeadCode) int {
+	maxLevel := 0
+	for _, scope := range file.ExecutionScopes() {
+		for _, finding := range scope.Findings {
+			if level := finding.Severity.Level(); level > maxLevel {
+				maxLevel = level
+			}
+		}
+	}
+	return maxLevel
+}
+
+// generateSummary generates aggregate statistics. The analyzed totals come from
+// population, which covers every analyzed file; files only carries the files that
+// kept findings after filtering and therefore feeds the finding counters alone.
+// Mixing the two would make OverallDeadRatio a ratio over the dead code's own
+// scopes, which overstates dead-code density by orders of magnitude.
+func (s *DeadCodeServiceImpl) generateSummary(files []domain.FileDeadCode, population deadCodePopulation, req domain.DeadCodeRequest) domain.DeadCodeSummary {
+	summary := domain.DeadCodeSummary{
+		TotalFiles:       population.Files,
+		TotalFunctions:   population.Functions,
+		TotalClassScopes: population.ClassScopes,
+		TotalBlocks:      population.Blocks,
+
+		FilesWithDeadCode: len(files),
+		FindingsByReason:  make(map[string]int),
+		DeadBlocks:        0,
+	}
+
+	for _, file := range files {
+		summary.FunctionsWithDeadCode += file.AffectedFunctions
+		summary.ClassScopesWithDeadCode += file.AffectedClassScopes
+
+		for _, scope := range file.ExecutionScopes() {
+			summary.TotalFindings += len(scope.Findings)
+			summary.CriticalFindings += scope.CriticalCount
+			summary.WarningFindings += scope.WarningCount
+			summary.InfoFindings += scope.InfoCount
+			summary.DeadBlocks += scope.DeadBlocks
+
+			// Count findings by reason
+			for _, finding := range scope.Findings {
+				summary.FindingsByReason[finding.Reason]++
+			}
+		}
+	}
+
+	// Calculate overall dead code ratio
+	if summary.TotalBlocks > 0 {
+		summary.OverallDeadRatio = float64(summary.DeadBlocks) / float64(summary.TotalBlocks)
+	}
+
+	return summary
+}
+
+// countTotalFindings counts total findings in functions
+func (s *DeadCodeServiceImpl) countTotalFindings(functions []domain.FunctionDeadCode) int {
+	total := 0
+	for _, function := range functions {
+		total += len(function.Findings)
+	}
+	return total
+}
+
+// readFile reads a file and returns its content
+func (s *DeadCodeServiceImpl) readFile(filePath string) ([]byte, error) {
+	return os.ReadFile(filePath)
+}
+
+// buildConfigForResponse builds configuration for response metadata
+func (s *DeadCodeServiceImpl) buildConfigForResponse(req domain.DeadCodeRequest) interface{} {
+	return map[string]interface{}{
+		"min_severity":                req.MinSeverity,
+		"sort_by":                     req.SortBy,
+		"show_context":                domain.BoolValue(req.ShowContext, false),
+		"context_lines":               req.ContextLines,
+		"detect_after_return":         domain.BoolValue(req.DetectAfterReturn, true),
+		"detect_after_break":          domain.BoolValue(req.DetectAfterBreak, true),
+		"detect_after_continue":       domain.BoolValue(req.DetectAfterContinue, true),
+		"detect_after_raise":          domain.BoolValue(req.DetectAfterRaise, true),
+		"detect_unreachable_branches": domain.BoolValue(req.DetectUnreachableBranches, true),
+		"include_patterns":            req.IncludePatterns,
+		"exclude_patterns":            req.ExcludePatterns,
+		"ignore_patterns":             req.IgnorePatterns,
+	}
+}

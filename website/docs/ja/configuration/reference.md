@@ -1,0 +1,336 @@
+# 設定リファレンス
+
+`.pyscn.toml`（または `pyproject.toml` の `[tool.pyscn.*]`）で設定可能なすべてのキーです。`pyscn init` を実行するとコメント付きのスターターファイルが生成されます。
+
+---
+
+## `[output]`
+
+結果の出力方法を制御します。
+
+| キー              | 型    | デフォルト       | 説明 |
+| ---------------- | ------- | ------------- | --- |
+| `format`         | string  | `"text"`      | `text`, `json`, `yaml`, `csv`, `html` のいずれか。`--json` などの CLI フラグで上書きされます。 |
+| `directory`      | string  | `""`          | 出力ディレクトリ。空の場合は CWD 配下の `.pyscn/reports/`。 |
+| `show_details`   | bool    | `false`       | サマリーに検出結果ごとの詳細を含めます。 |
+| `sort_by`        | string  | `"complexity"`| `name`, `complexity`, `risk` のいずれか。 |
+| `min_complexity` | int     | `1`           | この複雑度未満の関数を除外します。設定時に `[complexity].min_complexity` を上書きします。 |
+
+---
+
+## `[complexity]`
+
+循環的複雑度の分析です。
+
+| キー                | 型 | デフォルト | 説明 |
+| ------------------ | ---- | ------- | --- |
+| `enabled`          | bool | `true`  | 分析器を実行します。 |
+| `low_threshold`    | int  | `9`     | 「低リスク」の上限（この値を含む）。 |
+| `medium_threshold` | int  | `19`    | 「中リスク」の上限。 |
+| `max_complexity`   | int  | `0`     | CI 失敗の閾値。`0` = 制限なし。 |
+| `min_complexity`   | int  | `1`     | この値未満の関数をレポートしません。 |
+| `report_unchanged` | bool | `true`  | 複雑度 = 1 の関数を含めます。 |
+
+閾値のガイダンスは [high-cyclomatic-complexity](../rules/high-cyclomatic-complexity.md) を参照してください。
+
+---
+
+## `[dead_code]`
+
+デッドコード検出です。
+
+| キー                              | 型   | デフォルト      | 説明 |
+| -------------------------------- | ------ | ------------ | --- |
+| `enabled`                        | bool   | `true`       | 分析器を実行します。 |
+| `min_severity`                   | string | `"warning"`  | `info`, `warning`, `critical` のいずれか。 |
+| `show_context`                   | bool   | `false`      | 周囲のソース行を含めます。 |
+| `context_lines`                  | int    | `3`          | コンテキスト行数（0〜20）。 |
+| `sort_by`                        | string | `"severity"` | `severity`, `line`, `file`, `function` のいずれか。 |
+| `detect_after_return`            | bool   | `true`       | `return` の後の文を検出します。 |
+| `detect_after_break`             | bool   | `true`       | `break` の後の文を検出します。 |
+| `detect_after_continue`          | bool   | `true`       | `continue` の後の文を検出します。 |
+| `detect_after_raise`             | bool   | `true`       | `raise` の後の文を検出します。 |
+| `detect_unreachable_branches`    | bool   | `true`       | 到達不能なブランチを検出します。 |
+| `ignore_patterns`                | string[] | `[]`       | 無視する行の正規表現パターン。 |
+
+---
+
+## `[clones]`
+
+クローン検出（最も設定項目が多い分析器）です。
+
+### フラグメント選択
+
+| キー              | 型 | デフォルト | 説明 |
+| ---------------- | ---- | ------- | --- |
+| `min_lines`      | int  | `8`     | フラグメントとみなす最小 SLOC（コメント・空行・docstring を除く）。 |
+| `min_nodes`      | int  | `20`    | 最小 AST ノード数。 |
+| `skip_docstrings`| bool | `true`  | ハッシュ時にドキュメント文字列をスキップします。 |
+
+### タイプ閾値（0.0〜1.0）
+
+| キー                    | デフォルト | クローンタイプ |
+| ---------------------- | ------- | --- |
+| `type1_threshold`      | `0.85`  | 同一（空白/コメントのみ異なる）。 |
+| `type2_threshold`      | `0.75`  | 識別子/リテラルの名前変更。 |
+| `type3_threshold`      | `0.70`  | 変更を伴う構造的類似。 |
+| `type4_threshold`      | `0.65`  | 意味的等価。 |
+| `similarity_threshold` | `0.65`  | すべてのクローンに対するグローバル最小値。 |
+
+### アルゴリズム
+
+| キー                 | 型   | デフォルト    | 説明 |
+| ------------------- | ------ | ---------- | --- |
+| `cost_model_type`   | string | `"python"` | `default`, `python`, `weighted` のいずれか。 |
+| `ignore_literals`   | bool   | `false`    | 異なるリテラルを等価として扱います。 |
+| `ignore_identifiers`| bool   | `false`    | 異なる変数名を等価として扱います。 |
+| `max_edit_distance` | float  | `50.0`     | 木編集距離の上限。 |
+| `enable_dfa`        | bool   | `true`     | Type-4 のデータフロー解析。 |
+| `enabled_clone_types` | string[] | all     | `type1`, `type2`, `type3`, `type4` のサブセット。 |
+
+### LSH 高速化
+
+| キー                        | 型           | デフォルト  | 説明 |
+| -------------------------- | -------------- | -------- | --- |
+| `lsh_enabled`              | `true\|false\|"auto"` | `"auto"` | LSH を有効にします（`auto` = フラグメント数または推定ペア数に基づく）。 |
+| `lsh_auto_threshold`       | int            | `500`    | 自動有効化のフラグメント数閾値。推定ペア数が 10,000 を超える場合も自動有効化されます。 |
+| `lsh_similarity_threshold` | float          | `0.50`   | クローンペアに必要な AST 特徴量 Jaccard の下限。LSH の有無にかかわらず適用。 |
+| `lsh_bands`                | int            | `42`     | LSH バンド数。 |
+| `lsh_rows`                 | int            | `3`      | バンドあたりの行数。 |
+| `lsh_hashes`               | int            | `128`    | ハッシュ関数の数。 |
+
+### グルーピング
+
+| キー                  | 型   | デフォルト       | 説明 |
+| -------------------- | ------ | ------------- | --- |
+| `grouping_mode`      | string | `"complete_linkage"` | `connected`、`star`、`complete_linkage`、`k_core`、`centroid` のいずれか。`connected` はクローンを推移的に連結するため、無関係な断片が 1 つのグループにまとまることがあります。 |
+| `grouping_threshold` | float  | `0.65`        | グルーピングの最小類似度。 |
+| `k_core_k`           | int    | `2`           | `k_core` モードの k パラメータ。 |
+
+### パフォーマンス
+
+| キー               | 型 | デフォルト | 説明 |
+| ----------------- | ---- | ------- | --- |
+| `max_memory_mb`   | int  | `100`   | メモリ上限（MB）。`0` = 制限なし。 |
+| `batch_size`      | int  | `100`   | バッチあたりのファイル数。 |
+| `enable_batching` | bool | `true`  | バッチ処理を行います。 |
+| `max_goroutines`  | int  | `4`     | 並行ワーカー数。 |
+| `timeout_seconds` | int  | `300`   | 分析ごとのタイムアウト。 |
+
+### 出力フィルタリング
+
+| キー             | 型  | デフォルト         | 説明 |
+| --------------- | ----- | --------------- | --- |
+| `min_similarity`| float | `0.0`           | この値未満のペアを除外します。 |
+| `max_similarity`| float | `1.0`           | この値を超えるペアを除外します。 |
+| `max_results`   | int   | `10000`         | レポートする最大ペア数。`0` = 制限なし。 |
+| `show_details`  | bool  | `false`         | 詳細出力。 |
+| `show_content`  | bool  | `false`         | レポートにソースを含めます。 |
+| `sort_by`       | string| `"similarity"`  | `similarity`, `size`, `location`, `type` のいずれか。 |
+| `group_clones`  | bool  | `true`          | 関連するクローンをグループ化します。 |
+
+これらのキーはレポートの見た目だけを変えます。重複スコアやヘルススコアには影響しません。
+
+---
+
+## `[cbo]`
+
+Coupling Between Objects（クラス結合度）です。
+
+| キー                | 型 | デフォルト | 説明 |
+| ------------------ | ---- | ------- | --- |
+| `enabled`          | bool | `true`  | 分析器を実行します。 |
+| `low_threshold`    | int  | `3`     | 「低リスク」の上限。 |
+| `medium_threshold` | int  | `7`     | 「中リスク」の上限。 |
+| `min_cbo`          | int  | `0`     | この CBO 未満のクラスを除外します。 |
+| `max_cbo`          | int  | `0`     | この CBO を超えるクラスを除外します。`0` = 制限なし。 |
+| `show_zeros`       | bool | `false` | CBO = 0 のクラスを含めます。 |
+| `include_builtins` | bool | `false` | `list`/`dict`/`str` を依存関係としてカウントします。 |
+| `include_imports`  | bool | `true`  | インポートされたモジュール参照をカウントします。 |
+
+---
+
+## `[lcom]`
+
+Lack of Cohesion of Methods（LCOM4）です。
+
+| キー                | 型 | デフォルト | 説明 |
+| ------------------ | ---- | ------- | --- |
+| `low_threshold`    | int  | `2`     | 「低リスク」の上限（良好な凝集度）。 |
+| `medium_threshold` | int  | `5`     | 「中リスク」の上限。 |
+
+---
+
+## `[analysis]`
+
+ファイル探索ルールです。
+
+| キー                | 型     | デフォルト       | 説明 |
+| ------------------ | -------- | ------------- | --- |
+| `recursive`        | bool     | `true`        | サブディレクトリに再帰的に探索します。 |
+| `follow_symlinks`  | bool     | `false`       | シンボリックリンクをたどります。 |
+| `include_patterns` | string[] | `["**/*.py"]` | 含める glob パターン。 |
+| `exclude_patterns` | string[] | 下記参照     | 除外する glob パターン。 |
+
+デフォルトの `exclude_patterns`:
+
+```toml
+[
+  "test_*.py", "*_test.py",
+  "**/__pycache__/*", "**/*.pyc",
+  "**/.pytest_cache/", ".tox/",
+  "venv/", "env/", ".venv/", ".env/",
+]
+```
+
+---
+
+## `[architecture]`
+
+レイヤーバリデーションです。すべてのキーはオプションです。レイヤーを定義しない場合、アーキテクチャ分析は許容モードで実行されます。
+
+| キー                        | 型  | デフォルト | 説明 |
+| -------------------------- | ----- | ------- | --- |
+| `enabled`                  | bool  | `true`  | レイヤーバリデーションを実行します。 |
+| `style`                    | string | `""`   | レイヤーとルールの組み込みプリセットを適用します: `layered`, `hexagonal`, `clean`, `mvc`。下で明示した `layers`/`rules` がプリセットより優先されます。`style`・`layers`・`rules` をいずれも指定しない場合は、プリセットではなくアーキテクチャの自動検出が行われます。 |
+| `validate_layers`          | bool  | `true`  | レイヤー間ルールをチェックします。 |
+| `validate_cohesion`        | bool  | `true`  | パッケージ凝集度をチェックします。 |
+| `validate_responsibility`  | bool  | `true`  | モジュールごとの責務数をチェックします。 |
+| `strict_mode`              | bool  | `true`  | 厳格なバリデーション。 |
+| `fail_on_violations`       | bool  | `false` | 違反時に非ゼロ終了します。 |
+| `min_cohesion`             | float | `0.5`   | 最小パッケージ凝集度。 |
+| `max_coupling`             | int   | `10`    | レイヤー間結合度の最大値。 |
+| `max_responsibilities`     | int   | `3`     | モジュールごとの責務の最大数。 |
+| `neutral_prefixes`         | string[] | `[]` | レイヤー判定の前に取り除くトップレベルのモジュールセグメント。すべてのモジュールが同じプロジェクト接頭辞（例: `app`, `src`）から始まる場合に便利です。 |
+
+### スタイルプリセット
+
+`style` を指定すると、レイヤー定義とルールを手書きする代わりに、出来合いのセットを適用できます。プリセットは出発点であり、追加した `[[architecture.layers]]` や `[[architecture.rules]]` がプリセットを上書きします（`from` レイヤー単位でユーザールールが優先）。`layered` は生成されるデフォルト設定のレイヤー／ルールを再現したものです。`style`・`layers`・`rules` をいずれも指定しない場合は、`layered` ではなくアーキテクチャの自動検出が行われます。
+
+| プリセット | 強制する内容 | 特徴的なルール |
+| --- | --- | --- |
+| `layered` | 従来の `presentation → application → domain → infrastructure`（生成されるデフォルト設定の基準）。 | `domain` から `infrastructure` への依存は許容（DIP は緩め）。 |
+| `hexagonal` | ポート＆アダプター / オニオン: `domain` は外側に一切依存しない。 | `domain → ports`/`adapters` は拒否。 |
+| `clean` | クリーンアーキテクチャ: `entities → use_cases → interface_adapters → frameworks` で依存は内側のみ。 | 外側への依存はすべて拒否。 |
+| `mvc` | MVC / MVT: `model` / `view` / `controller`。 | `view → model` への直接依存は**非推奨**（警告）であり拒否ではない。 |
+
+```toml
+[architecture]
+style = "hexagonal"
+```
+
+ルールは 3 つのリストを順に評価します: `deny`（エラー）、`warn`（許可されるが警告として報告。`mvc` の `view → model` で使用）、`allow`（空でない allow リストがある場合、列挙外はエラー）。警告はエラーよりもアーキテクチャ適合スコアの低下が小さくなります。
+
+### レイヤー定義
+
+```toml
+[[architecture.layers]]
+name = "presentation"
+packages = ["router", "routers", "handler", "handlers", "controller", "api"]
+
+[[architecture.layers]]
+name = "application"
+packages = ["service", "services", "usecase", "usecases"]
+
+[[architecture.layers]]
+name = "domain"
+packages = ["model", "models", "entity", "entities"]
+
+[[architecture.layers]]
+name = "infrastructure"
+packages = ["repository", "repositories", "db", "database"]
+```
+
+### レイヤールール
+
+```toml
+[[architecture.rules]]
+from = "presentation"
+allow = ["application", "domain"]
+deny = ["infrastructure"]
+
+[[architecture.rules]]
+from = "application"
+allow = ["domain"]
+```
+
+### Neutral prefixes（中立な接頭辞）
+
+プロジェクト内のすべてのモジュールが同じルートセグメント（`app.`, `src.` など）で始まる場合、その接頭辞がレイヤー名を覆い隠してしまいレイヤー判定に失敗することがあります。`neutral_prefixes` にそうしたセグメントを列挙すると、pyscn はモジュールをレイヤーに解決する前にそれらを取り除きます:
+
+```toml
+[architecture]
+neutral_prefixes = ["app", "src"]
+```
+
+この設定により、`app.routers.user_router` は `routers.user_router` として扱われ、`presentation` レイヤーに解決されます。
+
+---
+
+## `[dependencies]`
+
+モジュール依存関係分析です。`pyscn check` では **オプトイン**。`pyscn analyze` ではスキップしない限り常に実行されます。
+
+| キー                  | 型   | デフォルト | 説明 |
+| -------------------- | ------ | ------- | --- |
+| `enabled`            | bool   | `false` | 分析器を実行します（analyze は設定に関係なく常に実行します）。 |
+| `include_stdlib`     | bool   | `false` | 標準ライブラリのインポートを含めます。 |
+| `include_third_party`| bool   | `true`  | サードパーティのインポートを含めます。 |
+| `follow_relative`    | bool   | `true`  | 相対インポートをたどります。 |
+| `detect_cycles`      | bool   | `true`  | 循環インポートを検出します。 |
+| `calculate_metrics`  | bool   | `true`  | Ca/Ce/I/A/D を計算します。 |
+| `find_long_chains`   | bool   | `true`  | 最長の依存チェーンをレポートします。 |
+| `cycle_reporting`    | string | `"summary"` | `all`, `critical`, `summary` のいずれか。 |
+| `max_cycles_to_show` | int    | `10`    | レポートする循環の上限。 |
+| `sort_by`            | string | `"name"` | `name`, `coupling`, `instability`, `distance`, `risk` のいずれか。 |
+| `show_matrix`        | bool   | `false` | 依存関係マトリクスを含めます。 |
+| `generate_dot_graph` | bool   | `false` | Graphviz DOT 出力を生成します。 |
+
+---
+
+## `[mock_data]`
+
+モック/プレースホルダーデータ検出です。**オプトイン**。
+
+| キー              | 型     | デフォルト     | 説明 |
+| ---------------- | -------- | ----------- | --- |
+| `enabled`        | bool     | `false`     | 分析器を実行します。 |
+| `min_severity`   | string   | `"warning"` | `info`, `warning`, `error` のいずれか。 |
+| `ignore_tests`   | bool     | `true`      | テストファイルをスキップします。 |
+| `keywords`       | string[] | 組み込み    | モック指標として検出されるキーワード。 |
+| `domains`        | string[] | 組み込み    | 検出されるドメイン（`example.com`, `test.com` など）。 |
+| `ignore_patterns`| string[] | `[]`        | スキップするファイル/正規表現パターン。 |
+
+---
+
+## `[di]`
+
+Dependency Injection のアンチパターン検出です。**オプトイン**。
+
+| キー                            | 型   | デフォルト     | 説明 |
+| ------------------------------ | ------ | ----------- | --- |
+| `enabled`                      | bool   | `false`     | 分析器を実行します。 |
+| `min_severity`                 | string | `"warning"` | `info`, `warning`, `error` のいずれか。 |
+| `constructor_param_threshold`  | int    | `5`         | この数を超えるパラメータを持つ `__init__` を検出します。 |
+
+---
+
+## CLI フラグと設定キーの対応表
+
+設定キーに直接マッピングされないフラグ（`--select`, `--skip-*`, `--no-open`）は、読み込まれた設定の上に適用されます。
+
+| CLI フラグ                | 設定キー                        |
+| ----------------------- | --------------------------------- |
+| `--config <path>`       | —（探索を上書き）           |
+| `--json/--yaml/--csv/--html` | `[output] format`            |
+| `--min-complexity`      | `[complexity] min_complexity`     |
+| `--max-complexity`      | `[complexity] max_complexity`     |
+| `--min-severity`        | `[dead_code] min_severity`        |
+| `--clone-threshold`     | `[clones] similarity_threshold`   |
+| `--min-cbo`             | `[cbo] min_cbo`                   |
+| `--max-cycles`          | —（check コマンド専用）            |
+
+## 関連項目
+
+- [設定ファイル形式](format.md) — 探索と優先順位。
+- [設定例](examples.md) — すぐに使える設定。

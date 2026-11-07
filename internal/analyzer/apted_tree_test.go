@@ -1,0 +1,1124 @@
+package analyzer
+
+import (
+	"context"
+	"testing"
+
+	coreapted "github.com/ludo-technologies/polyscan/core/apted"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type TreeNode = coreapted.TreeNode
+
+var (
+	NewTreeNode                   = coreapted.NewTreeNode
+	PostOrderTraversal            = coreapted.PostOrderTraversal
+	ComputeLeftMostLeaves         = coreapted.ComputeLeftMostLeaves
+	ComputeKeyRoots               = coreapted.ComputeKeyRoots
+	PrepareTreeForAPTED           = coreapted.PrepareTreeForAPTED
+	GetNodeByPostOrderID          = coreapted.GetNodeByPostOrderID
+	GetSubtreeNodes               = coreapted.GetSubtreeNodes
+	GetSubtreeNodesWithDepthLimit = coreapted.GetSubtreeNodesWithDepthLimit
+)
+
+func TestNewTreeConverter(t *testing.T) {
+	converter := NewTreeConverter()
+	assert.NotNil(t, converter)
+}
+
+func TestConvertAST(t *testing.T) {
+	converter := NewTreeConverter()
+
+	tests := []struct {
+		name      string
+		astNode   *parser.Node
+		wantNil   bool
+		wantLabel string
+	}{
+		{
+			name:    "nil input returns nil",
+			astNode: nil,
+			wantNil: true,
+		},
+		{
+			name:      "simple node",
+			astNode:   &parser.Node{Type: parser.NodeName, Name: "x"},
+			wantNil:   false,
+			wantLabel: "Name(x)",
+		},
+		{
+			name:      "constant node",
+			astNode:   &parser.Node{Type: parser.NodeConstant, Value: 42},
+			wantNil:   false,
+			wantLabel: "Constant(42)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.ConvertAST(tt.astNode)
+
+			if tt.wantNil {
+				assert.Nil(t, result)
+			} else {
+				assert.NotNil(t, result)
+				assert.Equal(t, tt.wantLabel, result.Label)
+			}
+		})
+	}
+}
+
+func TestConvertASTIncludesExpressionFieldsInAPTEDDistance(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{
+			name: "assignment target",
+			left: `if cond:
+    left = value
+`,
+			right: `if cond:
+    right = value
+`,
+		},
+		{
+			name: "literal value",
+			left: `if cond:
+    value = 1
+`,
+			right: `if cond:
+    value = 2
+`,
+		},
+		{
+			name: "call callee",
+			left: `if cond:
+    value = left(arg)
+`,
+			right: `if cond:
+    value = right(arg)
+`,
+		},
+		{
+			name: "call positional argument",
+			left: `if cond:
+    value = build(left)
+`,
+			right: `if cond:
+    value = build(right)
+`,
+		},
+		{
+			name: "keyword value",
+			left: `if cond:
+    value = build(flag=left)
+`,
+			right: `if cond:
+    value = build(flag=right)
+`,
+		},
+		{
+			name: "subscript index",
+			left: `if cond:
+    value = items[i]
+`,
+			right: `if cond:
+    value = items[j]
+`,
+		},
+		{
+			name: "attribute name",
+			left: `if cond:
+    value = obj.left
+`,
+			right: `if cond:
+    value = obj.right
+`,
+		},
+		{
+			name: "keyword name",
+			left: `if cond:
+    value = build(x=1)
+`,
+			right: `if cond:
+    value = build(y=1)
+`,
+		},
+		{
+			name: "comparison operator",
+			left: `if left < right:
+    value = 1
+`,
+			right: `if left > right:
+    value = 1
+`,
+		},
+		{
+			name: "augmented assignment operator",
+			left: `if cond:
+    value += step
+`,
+			right: `if cond:
+    value -= step
+`,
+		},
+		{
+			name: "function parameter name default and annotation",
+			left: `def update(left: int = 1):
+    return left
+`,
+			right: `def update(right: str = 2):
+    return right
+`,
+		},
+		{
+			name: "function return annotation",
+			left: `def update() -> Left:
+    return value
+`,
+			right: `def update() -> Right:
+    return value
+`,
+		},
+		{
+			name: "decorator expression",
+			left: `@left.decorator
+def update():
+    pass
+`,
+			right: `@right.decorator
+def update():
+    pass
+`,
+		},
+		{
+			name: "class base",
+			left: `class Model(LeftBase):
+    pass
+`,
+			right: `class Model(RightBase):
+    pass
+`,
+		},
+		{
+			name: "return value",
+			left: `def update():
+    return left
+`,
+			right: `def update():
+    return right
+`,
+		},
+		{
+			name: "delete target",
+			left: `if cond:
+    del left
+`,
+			right: `if cond:
+    del right
+`,
+		},
+		{
+			name: "raise value",
+			left: `if cond:
+    raise LeftError
+`,
+			right: `if cond:
+    raise RightError
+`,
+		},
+		{
+			name: "assert test",
+			left: `if cond:
+    assert left, "same"
+`,
+			right: `if cond:
+    assert right, "same"
+`,
+		},
+		{
+			name: "for target and iterator",
+			left: `for left in values:
+    total = left
+`,
+			right: `for right in items:
+    total = right
+`,
+		},
+		{
+			name: "while test",
+			left: `while left:
+    break
+`,
+			right: `while right:
+    break
+`,
+		},
+		{
+			name: "with item alias",
+			left: `with open(path) as left:
+    value = left.read()
+`,
+			right: `with open(path) as right:
+    value = right.read()
+`,
+		},
+		{
+			name: "except handler alias",
+			left: `try:
+    risky()
+except Error as left:
+    handle(left)
+`,
+			right: `try:
+    risky()
+except Error as right:
+    handle(right)
+`,
+		},
+		{
+			name: "global names",
+			left: `def update():
+    global left
+    left = 1
+`,
+			right: `def update():
+    global right
+    right = 1
+`,
+		},
+		{
+			name: "nonlocal names",
+			left: `def outer():
+    value = 0
+    def update():
+        nonlocal value
+        value = 1
+`,
+			right: `def outer():
+    other = 0
+    def update():
+        nonlocal other
+        other = 1
+`,
+		},
+		{
+			name: "import names",
+			left: `if cond:
+    import left_module
+`,
+			right: `if cond:
+    import right_module
+`,
+		},
+		{
+			name: "import alias",
+			left: `if cond:
+    import package as left
+`,
+			right: `if cond:
+    import package as right
+`,
+		},
+		{
+			name: "from import module and names",
+			left: `if cond:
+    from left_package import thing
+`,
+			right: `if cond:
+    from right_package import other
+`,
+		},
+		{
+			name: "lambda args and body",
+			left: `if cond:
+    value = lambda left: left + 1
+`,
+			right: `if cond:
+    value = lambda right: right + 1
+`,
+		},
+		{
+			name: "conditional expression branches",
+			left: `if cond:
+    value = left if check else fallback
+`,
+			right: `if cond:
+    value = right if check else fallback
+`,
+		},
+		{
+			name: "collection element",
+			left: `if cond:
+    value = [left, shared]
+`,
+			right: `if cond:
+    value = [right, shared]
+`,
+		},
+		{
+			name: "dict key and value",
+			left: `if cond:
+    value = {"left": left}
+`,
+			right: `if cond:
+    value = {"right": right}
+`,
+		},
+		{
+			name: "comprehension target iterator and filter",
+			left: `if cond:
+    value = [left for left in values if left]
+`,
+			right: `if cond:
+    value = [right for right in items if right]
+`,
+		},
+		{
+			name: "formatted string interpolation",
+			left: `if cond:
+    value = f"{left}"
+`,
+			right: `if cond:
+    value = f"{right}"
+`,
+		},
+		{
+			name: "formatted string static format spec",
+			left: `if cond:
+    value = f"{item:>5}"
+`,
+			right: `if cond:
+    value = f"{item:<5}"
+`,
+		},
+		{
+			name: "formatted string conversion marker",
+			left: `if cond:
+    value = f"{item!r}"
+`,
+			right: `if cond:
+    value = f"{item!s}"
+`,
+		},
+		{
+			name: "formatted string debug marker",
+			left: `if cond:
+    value = f"{item}"
+`,
+			right: `if cond:
+    value = f"{item=}"
+`,
+		},
+	}
+
+	analyzer := newAPTEDAnalyzer(NewPythonCostModel())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftTree := parseFirstStatementTree(t, tt.left)
+			rightTree := parseFirstStatementTree(t, tt.right)
+			coreapted.PrepareTreeForAPTED(leftTree)
+			coreapted.PrepareTreeForAPTED(rightTree)
+
+			distance := analyzer.ComputeDistance(leftTree, rightTree)
+			assert.Greater(t, distance, 0.0, "expression-only differences must affect APTED distance")
+		})
+	}
+}
+
+func parseFirstStatementTree(t *testing.T, source string) *coreapted.TreeNode {
+	t.Helper()
+
+	result, err := parser.New().Parse(context.Background(), []byte(source))
+	require.NoError(t, err)
+	require.NotEmpty(t, result.AST.Body)
+
+	tree := NewTreeConverter().ConvertAST(result.AST.Body[0])
+	require.NotNil(t, tree)
+	return tree
+}
+
+func TestPostOrderTraversal(t *testing.T) {
+	//     root(2)
+	//    /      \
+	//  left(0)  right(1)
+	root := NewTreeNode(1, "root")
+	left := NewTreeNode(2, "left")
+	right := NewTreeNode(3, "right")
+
+	root.AddChild(left)
+	root.AddChild(right)
+
+	PostOrderTraversal(root)
+
+	assert.Equal(t, 0, left.PostOrderID)
+	assert.Equal(t, 1, right.PostOrderID)
+	assert.Equal(t, 2, root.PostOrderID)
+}
+
+func TestComputeLeftMostLeaves(t *testing.T) {
+	t.Run("nil tree", func(t *testing.T) {
+		ComputeLeftMostLeaves(nil) // Should not panic
+	})
+
+	t.Run("single node", func(t *testing.T) {
+		root := NewTreeNode(1, "root")
+		PostOrderTraversal(root)
+		ComputeLeftMostLeaves(root)
+
+		assert.Equal(t, 0, root.LeftMostLeaf)
+	})
+
+	t.Run("tree with children", func(t *testing.T) {
+		//       root
+		//       /    \
+		//   child1  child2
+		//     |
+		// grandchild
+		root := NewTreeNode(1, "root")
+		child1 := NewTreeNode(2, "child1")
+		child2 := NewTreeNode(3, "child2")
+		grandchild := NewTreeNode(4, "grandchild")
+
+		root.AddChild(child1)
+		root.AddChild(child2)
+		child1.AddChild(grandchild)
+
+		PostOrderTraversal(root)
+		ComputeLeftMostLeaves(root)
+
+		// grandchild(0) is left-most leaf of entire tree
+		assert.Equal(t, 0, grandchild.LeftMostLeaf, "grandchild's left-most leaf is itself")
+		assert.Equal(t, 0, child1.LeftMostLeaf, "child1's left-most leaf is grandchild")
+		assert.Equal(t, 2, child2.LeftMostLeaf, "child2's left-most leaf is itself")
+		assert.Equal(t, 0, root.LeftMostLeaf, "root's left-most leaf is grandchild")
+	})
+}
+
+func TestAddChild_NilChild(t *testing.T) {
+	parent := NewTreeNode(1, "parent")
+	parent.AddChild(nil)
+	assert.Empty(t, parent.Children)
+}
+
+func TestComputeKeyRoots(t *testing.T) {
+	t.Run("nil tree", func(t *testing.T) {
+		result := ComputeKeyRoots(nil)
+		assert.Empty(t, result)
+	})
+
+	t.Run("single node", func(t *testing.T) {
+		root := NewTreeNode(1, "root")
+		PostOrderTraversal(root)
+		ComputeLeftMostLeaves(root)
+
+		keyRoots := ComputeKeyRoots(root)
+		assert.Equal(t, []int{0}, keyRoots)
+		assert.True(t, root.KeyRoot)
+	})
+
+	t.Run("tree with children", func(t *testing.T) {
+		//       root(3)
+		//       /    \
+		//   child1(1) child2(2)
+		//     |
+		// grandchild(0)
+		root := NewTreeNode(1, "root")
+		child1 := NewTreeNode(2, "child1")
+		child2 := NewTreeNode(3, "child2")
+		grandchild := NewTreeNode(4, "grandchild")
+
+		root.AddChild(child1)
+		root.AddChild(child2)
+		child1.AddChild(grandchild)
+
+		PostOrderTraversal(root)
+		ComputeLeftMostLeaves(root)
+		keyRoots := ComputeKeyRoots(root)
+
+		// Key roots are nodes whose left-most leaf hasn't been visited
+		assert.Contains(t, keyRoots, 2, "child2 should be a key root")
+		assert.Contains(t, keyRoots, 3, "root should be a key root")
+		assert.Len(t, keyRoots, 2)
+	})
+}
+
+func TestPrepareTreeForAPTED(t *testing.T) {
+	t.Run("nil tree", func(t *testing.T) {
+		keyRoots := PrepareTreeForAPTED(nil)
+		assert.Empty(t, keyRoots)
+	})
+
+	t.Run("complete preparation", func(t *testing.T) {
+		//       root
+		//       /    \
+		//   child1  child2
+		//     |
+		// grandchild
+		root := NewTreeNode(1, "root")
+		child1 := NewTreeNode(2, "child1")
+		child2 := NewTreeNode(3, "child2")
+		grandchild := NewTreeNode(4, "grandchild")
+
+		root.AddChild(child1)
+		root.AddChild(child2)
+		child1.AddChild(grandchild)
+
+		keyRoots := PrepareTreeForAPTED(root)
+
+		// Verify PostOrderIDs were assigned
+		assert.Equal(t, 0, grandchild.PostOrderID)
+		assert.Equal(t, 1, child1.PostOrderID)
+		assert.Equal(t, 2, child2.PostOrderID)
+		assert.Equal(t, 3, root.PostOrderID)
+
+		// Verify LeftMostLeaves were computed
+		assert.Equal(t, 0, root.LeftMostLeaf)
+		assert.Equal(t, 0, child1.LeftMostLeaf)
+		assert.Equal(t, 2, child2.LeftMostLeaf)
+
+		// Verify KeyRoots were identified
+		assert.NotEmpty(t, keyRoots)
+		assert.True(t, root.KeyRoot)
+	})
+}
+
+func TestGetNodeByPostOrderID(t *testing.T) {
+	t.Run("nil tree", func(t *testing.T) {
+		result := GetNodeByPostOrderID(nil, 0)
+		assert.Nil(t, result)
+	})
+
+	t.Run("find nodes by ID", func(t *testing.T) {
+		root := NewTreeNode(1, "root")
+		child1 := NewTreeNode(2, "child1")
+		child2 := NewTreeNode(3, "child2")
+
+		root.AddChild(child1)
+		root.AddChild(child2)
+
+		PostOrderTraversal(root)
+
+		// Find each node by its PostOrderID
+		found0 := GetNodeByPostOrderID(root, 0)
+		assert.NotNil(t, found0)
+		assert.Equal(t, "child1", found0.Label)
+
+		found1 := GetNodeByPostOrderID(root, 1)
+		assert.NotNil(t, found1)
+		assert.Equal(t, "child2", found1.Label)
+
+		found2 := GetNodeByPostOrderID(root, 2)
+		assert.NotNil(t, found2)
+		assert.Equal(t, "root", found2.Label)
+	})
+
+	t.Run("non-existent ID", func(t *testing.T) {
+		root := NewTreeNode(1, "root")
+		PostOrderTraversal(root)
+
+		result := GetNodeByPostOrderID(root, 999)
+		assert.Nil(t, result)
+	})
+}
+
+func TestGetSubtreeNodes(t *testing.T) {
+	t.Run("nil tree", func(t *testing.T) {
+		result := GetSubtreeNodes(nil)
+		assert.Empty(t, result)
+	})
+
+	t.Run("single node", func(t *testing.T) {
+		root := NewTreeNode(1, "root")
+		nodes := GetSubtreeNodes(root)
+
+		assert.Len(t, nodes, 1)
+		assert.Equal(t, root, nodes[0])
+	})
+
+	t.Run("tree with children", func(t *testing.T) {
+		//       root
+		//       /    \
+		//   child1  child2
+		//     |
+		// grandchild
+		root := NewTreeNode(1, "root")
+		child1 := NewTreeNode(2, "child1")
+		child2 := NewTreeNode(3, "child2")
+		grandchild := NewTreeNode(4, "grandchild")
+
+		root.AddChild(child1)
+		root.AddChild(child2)
+		child1.AddChild(grandchild)
+
+		nodes := GetSubtreeNodes(root)
+
+		assert.Len(t, nodes, 4)
+		// Verify all nodes are included
+		labels := make([]string, len(nodes))
+		for i, node := range nodes {
+			labels[i] = node.Label
+		}
+		assert.Contains(t, labels, "root")
+		assert.Contains(t, labels, "child1")
+		assert.Contains(t, labels, "child2")
+		assert.Contains(t, labels, "grandchild")
+	})
+
+	t.Run("subtree from child node", func(t *testing.T) {
+		root := NewTreeNode(1, "root")
+		child1 := NewTreeNode(2, "child1")
+		child2 := NewTreeNode(3, "child2")
+		grandchild := NewTreeNode(4, "grandchild")
+
+		root.AddChild(child1)
+		root.AddChild(child2)
+		child1.AddChild(grandchild)
+
+		// Get subtree starting from child1
+		nodes := GetSubtreeNodes(child1)
+
+		assert.Len(t, nodes, 2) // child1 and grandchild
+		labels := make([]string, len(nodes))
+		for i, node := range nodes {
+			labels[i] = node.Label
+		}
+		assert.Contains(t, labels, "child1")
+		assert.Contains(t, labels, "grandchild")
+		assert.NotContains(t, labels, "root")
+		assert.NotContains(t, labels, "child2")
+	})
+}
+
+func TestNewTreeConverterWithConfig(t *testing.T) {
+	t.Run("default converter does not skip docstrings", func(t *testing.T) {
+		converter := NewTreeConverter()
+		assert.NotNil(t, converter)
+		assert.False(t, converter.skipDocstrings)
+	})
+
+	t.Run("converter with skip docstrings enabled", func(t *testing.T) {
+		converter := NewTreeConverterWithConfig(true)
+		assert.NotNil(t, converter)
+		assert.True(t, converter.skipDocstrings)
+	})
+
+	t.Run("converter with skip docstrings disabled", func(t *testing.T) {
+		converter := NewTreeConverterWithConfig(false)
+		assert.NotNil(t, converter)
+		assert.False(t, converter.skipDocstrings)
+	})
+}
+
+func TestTreeConverter_SkipDocstrings(t *testing.T) {
+	t.Run("skips docstring when configured", func(t *testing.T) {
+		// Create a function with a docstring
+		// def test_function():
+		//     """This is a docstring"""
+		//     return 1
+		docstringNode := &parser.Node{
+			Type:     parser.NodeConstant,
+			Value:    "This is a docstring",
+			Children: []*parser.Node{},
+		}
+		exprNode := &parser.Node{
+			Type:     parser.NodeExpr,
+			Children: []*parser.Node{docstringNode},
+		}
+		returnNode := &parser.Node{
+			Type:     parser.NodeReturn,
+			Children: []*parser.Node{},
+		}
+		funcNode := &parser.Node{
+			Type: parser.NodeFunctionDef,
+			Name: "test_function",
+			Body: []*parser.Node{exprNode, returnNode},
+		}
+
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(funcNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(funcNode)
+
+		// Tree with skip should have fewer children (docstring excluded)
+		assert.Less(t, treeWithSkip.Size(), treeWithoutSkip.Size())
+	})
+
+	t.Run("does not skip non-docstring expressions", func(t *testing.T) {
+		// Create a function with a non-docstring expression first
+		// def test_function():
+		//     print("hello")  # This is a Call, not a Constant
+		//     return 1
+		callNode := &parser.Node{
+			Type:     parser.NodeCall,
+			Name:     "print",
+			Children: []*parser.Node{},
+		}
+		exprNode := &parser.Node{
+			Type:     parser.NodeExpr,
+			Children: []*parser.Node{callNode},
+		}
+		returnNode := &parser.Node{
+			Type:     parser.NodeReturn,
+			Children: []*parser.Node{},
+		}
+		funcNode := &parser.Node{
+			Type: parser.NodeFunctionDef,
+			Name: "test_function",
+			Body: []*parser.Node{exprNode, returnNode},
+		}
+
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(funcNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(funcNode)
+
+		// Should be same size since the first expression is not a docstring
+		assert.Equal(t, treeWithSkip.Size(), treeWithoutSkip.Size())
+	})
+
+	t.Run("does not skip docstring at non-first position", func(t *testing.T) {
+		// Create a function with docstring at position 1 (not 0)
+		// def test_function():
+		//     x = 1
+		//     """Not a docstring - appears after first statement"""
+		assignNode := &parser.Node{
+			Type:     parser.NodeAssign,
+			Children: []*parser.Node{},
+		}
+		docstringNode := &parser.Node{
+			Type:     parser.NodeConstant,
+			Value:    "Not a docstring",
+			Children: []*parser.Node{},
+		}
+		exprNode := &parser.Node{
+			Type:     parser.NodeExpr,
+			Children: []*parser.Node{docstringNode},
+		}
+		funcNode := &parser.Node{
+			Type: parser.NodeFunctionDef,
+			Name: "test_function",
+			Body: []*parser.Node{assignNode, exprNode},
+		}
+
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(funcNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(funcNode)
+
+		// Should be same size since the string is not at position 0
+		assert.Equal(t, treeWithSkip.Size(), treeWithoutSkip.Size())
+	})
+
+	t.Run("handles integer constant at first position", func(t *testing.T) {
+		// Create a function with integer constant at first position
+		// def test_function():
+		//     42  # Not a docstring - it's an integer
+		//     return 1
+		intNode := &parser.Node{
+			Type:     parser.NodeConstant,
+			Value:    int64(42), // integer, not string
+			Children: []*parser.Node{},
+		}
+		exprNode := &parser.Node{
+			Type:     parser.NodeExpr,
+			Children: []*parser.Node{intNode},
+		}
+		returnNode := &parser.Node{
+			Type:     parser.NodeReturn,
+			Children: []*parser.Node{},
+		}
+		funcNode := &parser.Node{
+			Type: parser.NodeFunctionDef,
+			Name: "test_function",
+			Body: []*parser.Node{exprNode, returnNode},
+		}
+
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(funcNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(funcNode)
+
+		// Should be same size since the constant is not a string
+		assert.Equal(t, treeWithSkip.Size(), treeWithoutSkip.Size())
+	})
+}
+
+// TestSkipDocstringInIf verifies if string literals at the start of an If block are skipped.
+// Python semantics say these are NOT docstrings, but the current implementation might skip them.
+func TestSkipDocstringInIf(t *testing.T) {
+	// if True:
+	//     "Not a docstring"
+	//     pass
+	docstringNode := &parser.Node{
+		Type:     parser.NodeConstant,
+		Value:    "Not a docstring",
+		Children: []*parser.Node{},
+	}
+	exprNode := &parser.Node{
+		Type:     parser.NodeExpr,
+		Children: []*parser.Node{docstringNode},
+	}
+	passNode := &parser.Node{
+		Type:     parser.NodePass,
+		Children: []*parser.Node{},
+	}
+	ifNode := &parser.Node{
+		Type: parser.NodeIf,
+		Body: []*parser.Node{exprNode, passNode},
+	}
+
+	converterWithSkip := NewTreeConverterWithConfig(true)
+	treeWithSkip := converterWithSkip.ConvertAST(ifNode)
+
+	converterWithoutSkip := NewTreeConverterWithConfig(false)
+	treeWithoutSkip := converterWithoutSkip.ConvertAST(ifNode)
+
+	// Since "If" node type does not support docstrings, the string literal should NOT be skipped
+	// regardless of the config setting.
+	assert.Equal(t, treeWithoutSkip.Size(), treeWithSkip.Size(), "String literal in If block should not be skipped")
+}
+
+// TestTryFinallyConversion verifies if Finalbody (finally block) is converted.
+func TestTryFinallyConversion(t *testing.T) {
+	// try:
+	//     pass
+	// finally:
+	//     x = 1
+	passNode := &parser.Node{
+		Type: parser.NodePass,
+	}
+
+	assignNode := &parser.Node{
+		Type: parser.NodeAssign,
+		Name: "x",
+	}
+
+	tryNode := &parser.Node{
+		Type:      parser.NodeTry,
+		Body:      []*parser.Node{passNode},
+		Finalbody: []*parser.Node{assignNode},
+	}
+
+	converter := NewTreeConverter()
+	tree := converter.ConvertAST(tryNode)
+
+	// We search for the assignment node in the converted tree
+	found := false
+	nodes := GetSubtreeNodes(tree)
+	for _, node := range nodes {
+		if node.OriginalNode == assignNode {
+			found = true
+			break
+		}
+	}
+
+	assert.True(t, found, "Code in 'finally' block was NOT found in the converted tree")
+}
+
+// TestTryExceptConversion verifies if Handlers (except blocks) are converted.
+func TestTryExceptConversion(t *testing.T) {
+	// try:
+	//     pass
+	// except:
+	//     pass
+
+	exceptHandler := &parser.Node{
+		Type: parser.NodeExceptHandler,
+		Body: []*parser.Node{
+			{Type: parser.NodePass},
+		},
+	}
+
+	tryNode := &parser.Node{
+		Type:     parser.NodeTry,
+		Body:     []*parser.Node{{Type: parser.NodePass}},
+		Handlers: []*parser.Node{exceptHandler},
+	}
+
+	converter := NewTreeConverter()
+	tree := converter.ConvertAST(tryNode)
+
+	// Search for ExceptHandler
+	found := false
+	nodes := GetSubtreeNodes(tree)
+	for _, node := range nodes {
+		if node.OriginalNode == exceptHandler {
+			found = true
+			break
+		}
+	}
+
+	assert.True(t, found, "ExceptHandler was NOT found in the converted tree")
+}
+
+// TestSkipDocstrings_Integration tests docstring skipping with actual parser output
+func TestSkipDocstrings_Integration(t *testing.T) {
+	t.Run("skips function docstring with real parser", func(t *testing.T) {
+		code := `def test_function():
+    """This is a docstring"""
+    return 1
+`
+		p := parser.New()
+		result, err := p.Parse(context.Background(), []byte(code))
+		assert.NoError(t, err)
+
+		// Find the function definition
+		var funcNode *parser.Node
+		for _, node := range result.AST.Body {
+			if node.Type == parser.NodeFunctionDef {
+				funcNode = node
+				break
+			}
+		}
+		assert.NotNil(t, funcNode)
+		assert.Equal(t, "test_function", funcNode.Name)
+
+		// Verify parser output structure - docstring should be NodeConstant directly in Body
+		assert.GreaterOrEqual(t, len(funcNode.Body), 2)
+		assert.Equal(t, parser.NodeConstant, funcNode.Body[0].Type, "First body element should be NodeConstant (docstring)")
+
+		// Convert with and without docstring skipping
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(funcNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(funcNode)
+
+		// Tree with skip should have fewer nodes (docstring excluded)
+		assert.Less(t, treeWithSkip.Size(), treeWithoutSkip.Size(),
+			"Tree with docstring skipping should be smaller")
+	})
+
+	t.Run("skips class docstring with real parser", func(t *testing.T) {
+		code := `class MyClass:
+    """Class docstring"""
+    def method(self):
+        pass
+`
+		p := parser.New()
+		result, err := p.Parse(context.Background(), []byte(code))
+		assert.NoError(t, err)
+
+		// Find the class definition
+		var classNode *parser.Node
+		for _, node := range result.AST.Body {
+			if node.Type == parser.NodeClassDef {
+				classNode = node
+				break
+			}
+		}
+		assert.NotNil(t, classNode)
+
+		// Convert with and without docstring skipping
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(classNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(classNode)
+
+		// Tree with skip should have fewer nodes
+		assert.Less(t, treeWithSkip.Size(), treeWithoutSkip.Size(),
+			"Tree with docstring skipping should be smaller")
+	})
+
+	t.Run("does not skip non-first string constant with real parser", func(t *testing.T) {
+		code := `def test_function():
+    x = 1
+    """Not a docstring - after first statement"""
+    return x
+`
+		p := parser.New()
+		result, err := p.Parse(context.Background(), []byte(code))
+		assert.NoError(t, err)
+
+		var funcNode *parser.Node
+		for _, node := range result.AST.Body {
+			if node.Type == parser.NodeFunctionDef {
+				funcNode = node
+				break
+			}
+		}
+		assert.NotNil(t, funcNode)
+
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		treeWithSkip := converterWithSkip.ConvertAST(funcNode)
+
+		converterWithoutSkip := NewTreeConverterWithConfig(false)
+		treeWithoutSkip := converterWithoutSkip.ConvertAST(funcNode)
+
+		// Should be same size - string at position 1 is not a docstring
+		assert.Equal(t, treeWithSkip.Size(), treeWithoutSkip.Size(),
+			"Non-first string constant should not be skipped")
+	})
+
+	t.Run("similar functions with different docstrings should have same tree when skipping", func(t *testing.T) {
+		code1 := `def calculate():
+    """Calculate the sum of two numbers."""
+    return 1 + 2
+`
+		code2 := `def calculate():
+    """This function performs multiplication."""
+    return 1 + 2
+`
+		p := parser.New()
+
+		result1, err := p.Parse(context.Background(), []byte(code1))
+		assert.NoError(t, err)
+		result2, err := p.Parse(context.Background(), []byte(code2))
+		assert.NoError(t, err)
+
+		var func1, func2 *parser.Node
+		for _, node := range result1.AST.Body {
+			if node.Type == parser.NodeFunctionDef {
+				func1 = node
+				break
+			}
+		}
+		for _, node := range result2.AST.Body {
+			if node.Type == parser.NodeFunctionDef {
+				func2 = node
+				break
+			}
+		}
+
+		// With docstring skipping, tree sizes should be equal
+		converterWithSkip := NewTreeConverterWithConfig(true)
+		tree1 := converterWithSkip.ConvertAST(func1)
+
+		converterWithSkip2 := NewTreeConverterWithConfig(true)
+		tree2 := converterWithSkip2.ConvertAST(func2)
+
+		assert.Equal(t, tree1.Size(), tree2.Size(),
+			"Functions with different docstrings should have same tree size when skipping docstrings")
+	})
+}
+
+// TestComputeDistanceAfterTreeMutation verifies that mutating a tree after it
+// has been compared (and its APTED preparation cached) invalidates the cache,
+// so later distance computations see the new structure.
+func TestComputeDistanceAfterTreeMutation(t *testing.T) {
+	analyzer := newAPTEDAnalyzer(coreapted.NewDefaultCostModel())
+
+	tree1 := NewTreeNode(0, "A")
+	tree1.AddChild(NewTreeNode(1, "B"))
+	tree2 := NewTreeNode(0, "A")
+	tree2.AddChild(NewTreeNode(1, "B"))
+
+	assert.Equal(t, 0.0, analyzer.ComputeDistance(tree1, tree2),
+		"Identical trees should have zero distance")
+
+	// Mutate tree1 after the comparison above cached its key roots
+	tree1.AddChild(NewTreeNode(2, "C"))
+
+	assert.Equal(t, 1.0, analyzer.ComputeDistance(tree1, tree2),
+		"Distance after mutation should reflect the inserted node")
+}

@@ -1,0 +1,444 @@
+package service
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNewConfigurationLoader(t *testing.T) {
+	loader := NewConfigurationLoader()
+	assert.NotNil(t, loader)
+}
+
+func TestConfigurationLoader_LoadDefaultConfig(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	req := loader.LoadDefaultConfig("")
+	require.NotNil(t, req)
+
+	// Verify default values are set
+	assert.Equal(t, domain.DefaultComplexityMinFilter, req.MinComplexity)
+	assert.Equal(t, domain.DefaultComplexityLowThreshold, req.LowThreshold)
+	assert.Equal(t, domain.DefaultComplexityMediumThreshold, req.MediumThreshold)
+	require.NotNil(t, req.Enabled)
+	require.NotNil(t, req.ReportUnchanged)
+	require.NotNil(t, req.ShowDetails)
+	require.NotNil(t, req.Recursive)
+	assert.True(t, *req.Enabled)
+	assert.True(t, *req.ReportUnchanged)
+	assert.False(t, *req.ShowDetails)
+	assert.True(t, *req.Recursive)
+}
+
+// The complexity request is built by its own conversion, not by
+// config.PyscnConfigToConfig, so the long-function tiers have to be carried
+// across here too or a configured threshold never reaches the analysis.
+func TestConfigurationLoader_LoadConfig_FunctionSLOCThresholds(t *testing.T) {
+	tests := []struct {
+		name             string
+		section          string
+		expectedWarn     int
+		expectedCritical int
+	}{
+		{
+			name:             "both tiers configured",
+			section:          "function_sloc_warn_threshold = 30\nfunction_sloc_critical_threshold = 80\n",
+			expectedWarn:     30,
+			expectedCritical: 80,
+		},
+		{
+			name:             "warn only carries critical with it",
+			section:          "function_sloc_warn_threshold = 150\n",
+			expectedWarn:     150,
+			expectedCritical: 300,
+		},
+		{
+			name:             "unset falls back to defaults",
+			section:          "low_threshold = 4\n",
+			expectedWarn:     domain.DefaultFunctionSLOCWarnThreshold,
+			expectedCritical: domain.DefaultFunctionSLOCCriticalThreshold,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), ".pyscn.toml")
+			require.NoError(t, os.WriteFile(configPath, []byte("[complexity]\n"+tt.section), 0o644))
+
+			req, err := NewConfigurationLoader().LoadConfig(configPath)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.expectedWarn, req.FunctionSLOCWarnThreshold)
+			assert.Equal(t, tt.expectedCritical, req.FunctionSLOCCriticalThreshold)
+		})
+	}
+}
+
+func TestConfigurationLoader_MergeConfig(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		Paths:           []string{"base/path"},
+		MinComplexity:   1,
+		MaxComplexity:   0,
+		LowThreshold:    10,
+		MediumThreshold: 20,
+		ShowDetails:     domain.BoolPtr(false),
+		Recursive:       domain.BoolPtr(true),
+	}
+
+	override := &domain.ComplexityRequest{
+		Paths:         []string{"override/path"},
+		MinComplexity: 5,
+		MaxComplexity: 15,
+		NoOpen:        true,
+		ShowDetails:   domain.BoolPtr(true),
+	}
+
+	merged := loader.MergeConfig(base, override)
+
+	assert.Equal(t, []string{"override/path"}, merged.Paths)
+	assert.Equal(t, 5, merged.MinComplexity)
+	assert.Equal(t, 15, merged.MaxComplexity)
+	assert.True(t, merged.NoOpen)
+	assert.True(t, domain.BoolValue(merged.ShowDetails, false))
+	// Base values should be preserved when not overridden
+	assert.Equal(t, 10, merged.LowThreshold)
+	assert.Equal(t, 20, merged.MediumThreshold)
+}
+
+func TestConfigurationLoader_MergeConfig_OutputFormat(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		OutputFormat: domain.OutputFormatText,
+	}
+
+	override := &domain.ComplexityRequest{
+		OutputFormat: domain.OutputFormatJSON,
+	}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, domain.OutputFormatJSON, merged.OutputFormat)
+}
+
+func TestConfigurationLoader_MergeConfig_OutputWriter(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{}
+	var buf bytes.Buffer
+	override := &domain.ComplexityRequest{
+		OutputWriter: &buf,
+	}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, &buf, merged.OutputWriter)
+}
+
+func TestConfigurationLoader_MergeConfig_Thresholds(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		LowThreshold:    10,
+		MediumThreshold: 20,
+	}
+
+	override := &domain.ComplexityRequest{
+		LowThreshold:    15,
+		MediumThreshold: 25,
+	}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, 15, merged.LowThreshold)
+	assert.Equal(t, 25, merged.MediumThreshold)
+}
+
+// TestConfigurationLoader_MergeConfig_ThresholdOverrideMatchesDefault is a
+// regression test for issue #553: an explicit override that happens to equal
+// the domain default must still win over the base value.
+func TestConfigurationLoader_MergeConfig_ThresholdOverrideMatchesDefault(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		LowThreshold:                 10,
+		MediumThreshold:              20,
+		CognitiveComplexityThreshold: 30,
+		NestingDepthThreshold:        11,
+	}
+
+	override := &domain.ComplexityRequest{
+		LowThreshold:                 domain.DefaultComplexityLowThreshold,       // 9
+		MediumThreshold:              domain.DefaultComplexityMediumThreshold,    // 19
+		CognitiveComplexityThreshold: domain.DefaultCognitiveComplexityThreshold, // 25
+		NestingDepthThreshold:        domain.DefaultNestingDepthThreshold,        // 7
+	}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, domain.DefaultComplexityLowThreshold, merged.LowThreshold,
+		"explicit override matching default should win over base")
+	assert.Equal(t, domain.DefaultComplexityMediumThreshold, merged.MediumThreshold,
+		"explicit override matching default should win over base")
+	assert.Equal(t, domain.DefaultCognitiveComplexityThreshold, merged.CognitiveComplexityThreshold,
+		"explicit override matching default should win over base")
+	assert.Equal(t, domain.DefaultNestingDepthThreshold, merged.NestingDepthThreshold,
+		"explicit override matching default should win over base")
+}
+
+// TestConfigurationLoader_MergeConfig_ThresholdZeroPreservesBase verifies that
+// a zero (unset) override leaves the base value intact.
+func TestConfigurationLoader_MergeConfig_ThresholdZeroPreservesBase(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		LowThreshold:                 10,
+		MediumThreshold:              20,
+		CognitiveComplexityThreshold: 30,
+		NestingDepthThreshold:        11,
+	}
+
+	override := &domain.ComplexityRequest{}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, 10, merged.LowThreshold)
+	assert.Equal(t, 20, merged.MediumThreshold)
+	assert.Equal(t, 30, merged.CognitiveComplexityThreshold)
+	assert.Equal(t, 11, merged.NestingDepthThreshold)
+}
+
+// TestConfigurationLoader_MergeConfig_MinComplexityOverrideMatchesDefault is a
+// regression test: an explicit MinComplexity override equal to the default (1)
+// must still win over the base value. The old guard (!= 1) dropped it.
+func TestConfigurationLoader_MergeConfig_MinComplexityOverrideMatchesDefault(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{MinComplexity: 5}
+	override := &domain.ComplexityRequest{MinComplexity: domain.DefaultComplexityMinFilter}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, domain.DefaultComplexityMinFilter, merged.MinComplexity,
+		"explicit MinComplexity override matching default should win over base")
+}
+
+// TestConfigurationLoader_MergeConfig_SortByOverrideMatchesDefault is a
+// regression test: an explicit SortBy override equal to the default
+// (complexity) must still win over the base value. The old guard
+// (!= "complexity") dropped it.
+func TestConfigurationLoader_MergeConfig_SortByOverrideMatchesDefault(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{SortBy: domain.SortByName}
+	override := &domain.ComplexityRequest{SortBy: domain.SortByComplexity}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, domain.SortByComplexity, merged.SortBy,
+		"explicit SortBy override matching default should win over base")
+}
+
+// TestConfigurationLoader_MergeConfig_ZeroOverridePreservesBase verifies that
+// unset (zero-value) override fields leave the base values intact.
+func TestConfigurationLoader_MergeConfig_ZeroOverridePreservesBase(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		MinComplexity: 5,
+		SortBy:        domain.SortByName,
+		ShowDetails:   domain.BoolPtr(true),
+		Recursive:     domain.BoolPtr(false),
+	}
+	override := &domain.ComplexityRequest{}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, 5, merged.MinComplexity)
+	assert.Equal(t, domain.SortByName, merged.SortBy)
+	assert.True(t, domain.BoolValue(merged.ShowDetails, false))
+	assert.False(t, domain.BoolValue(merged.Recursive, true))
+}
+
+func TestConfigurationLoader_MergeConfig_ExplicitFalseBoolWins(t *testing.T) {
+	loader := NewConfigurationLoader()
+	base := &domain.ComplexityRequest{
+		ShowDetails: domain.BoolPtr(true),
+		Recursive:   domain.BoolPtr(true),
+	}
+	override := &domain.ComplexityRequest{
+		ShowDetails: domain.BoolPtr(false),
+		Recursive:   domain.BoolPtr(false),
+	}
+
+	merged := loader.MergeConfig(base, override)
+	assert.False(t, domain.BoolValue(merged.ShowDetails, true))
+	assert.False(t, domain.BoolValue(merged.Recursive, true))
+}
+
+func TestConfigurationLoader_MergeConfig_Patterns(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	base := &domain.ComplexityRequest{
+		IncludePatterns: []string{"*.py"},
+		ExcludePatterns: []string{"test_*.py"},
+	}
+
+	override := &domain.ComplexityRequest{
+		IncludePatterns: []string{"**/*.py"},
+		ExcludePatterns: []string{"*_test.py"},
+	}
+
+	merged := loader.MergeConfig(base, override)
+	assert.Equal(t, []string{"**/*.py"}, merged.IncludePatterns)
+	assert.Equal(t, []string{"*_test.py"}, merged.ExcludePatterns)
+}
+
+func TestConfigurationLoader_LoadConfig_ValidFile(t *testing.T) {
+	// Create a temporary config file
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, ".pyscn.toml")
+
+	configContent := `
+	[complexity]
+	enabled = false
+	report_unchanged = false
+	low_threshold = 10
+	medium_threshold = 15
+	`
+	err := os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
+
+	loader := NewConfigurationLoader()
+	req, err := loader.LoadConfig(configPath)
+	require.NoError(t, err)
+	require.NotNil(t, req)
+	require.NotNil(t, req.Enabled)
+	require.NotNil(t, req.ReportUnchanged)
+	assert.False(t, *req.Enabled)
+	assert.False(t, *req.ReportUnchanged)
+}
+
+func TestConfigurationLoader_LoadConfig_MinComplexityPrecedence(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, ".pyscn.toml")
+
+	configContent := `
+	[complexity]
+	min_complexity = 3
+
+	[output]
+	min_complexity = 1
+	`
+	err := os.WriteFile(configPath, []byte(configContent), 0644)
+	require.NoError(t, err)
+
+	loader := NewConfigurationLoader()
+	req, err := loader.LoadConfig(configPath)
+	require.NoError(t, err)
+	require.NotNil(t, req)
+	assert.Equal(t, 1, req.MinComplexity)
+}
+
+func TestConfigurationLoader_FindDefaultConfigFile(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	// In a directory without config file
+	result := loader.FindDefaultConfigFile("")
+	// Result depends on current working directory
+	// Just verify it returns a string (empty or path)
+	assert.IsType(t, "", result)
+}
+
+func TestConfigurationLoader_ValidateConfig(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	tests := []struct {
+		name      string
+		config    *domain.ComplexityRequest
+		expectErr bool
+	}{
+		{
+			name: "valid config",
+			config: &domain.ComplexityRequest{
+				MinComplexity:   1,
+				MaxComplexity:   20,
+				LowThreshold:    10,
+				MediumThreshold: 15,
+			},
+			expectErr: false,
+		},
+		{
+			name: "min greater than max",
+			config: &domain.ComplexityRequest{
+				MinComplexity: 20,
+				MaxComplexity: 10,
+			},
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := loader.ValidateConfig(tt.config)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestConfigurationLoader_GetDefaultThresholds(t *testing.T) {
+	loader := NewConfigurationLoader()
+
+	low, medium := loader.GetDefaultThresholds()
+
+	assert.Equal(t, domain.DefaultComplexityLowThreshold, low)
+	assert.Equal(t, domain.DefaultComplexityMediumThreshold, medium)
+}
+
+func TestConfigurationLoader_CreateConfigTemplate(t *testing.T) {
+	loader := NewConfigurationLoader()
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "template.toml")
+
+	err := loader.CreateConfigTemplate(configPath)
+	require.NoError(t, err)
+
+	// Verify file was created
+	_, err = os.Stat(configPath)
+	assert.NoError(t, err)
+}
+
+// leakedMaxComplexity is a value no built-in default uses, so seeing it in a
+// loaded request proves the ancestor config was applied.
+const leakedMaxComplexity = 3
+
+// TestConfigurationLoader_LoadDefaultConfigDiscoversFromTarget pins discovery to
+// the analyzed path. Running from a project that has its own config must not
+// apply that config to a repository nested inside it (issue #666).
+func TestConfigurationLoader_LoadDefaultConfigDiscoversFromTarget(t *testing.T) {
+	outerDir := t.TempDir()
+	innerDir := filepath.Join(outerDir, "inner")
+	require.NoError(t, os.MkdirAll(filepath.Join(innerDir, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outerDir, ".pyscn.toml"),
+		[]byte("[complexity]\nmax_complexity = 3\n"),
+		0o644,
+	))
+
+	t.Chdir(outerDir)
+	loader := NewConfigurationLoader()
+
+	nested := loader.LoadDefaultConfig(innerDir)
+	require.NotNil(t, nested)
+	assert.NotEqual(t, leakedMaxComplexity, nested.MaxComplexity,
+		"nested checkout must not inherit the outer project's config")
+
+	own := loader.LoadDefaultConfig(outerDir)
+	require.NotNil(t, own)
+	assert.Equal(t, leakedMaxComplexity, own.MaxComplexity,
+		"a project's own config must still be discovered")
+}

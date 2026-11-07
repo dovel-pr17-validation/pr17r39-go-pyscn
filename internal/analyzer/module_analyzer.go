@@ -1,0 +1,1375 @@
+package analyzer
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/bmatcuk/doublestar/v4"
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+)
+
+// ModuleAnalyzer analyzes module-level dependencies and builds dependency graphs
+type ModuleAnalyzer struct {
+	projectRoot     string
+	moduleRoots     []string
+	pythonPath      []string
+	excludePatterns []string
+	includePatterns []string
+
+	// Module resolution cache
+	resolvedModules map[string]string // module name -> file path
+
+	// Re-export resolution
+	reExportResolver *ReExportResolver // Resolves re-exports in __init__.py files
+
+	// Analysis options
+	includeStdLib     bool
+	includeThirdParty bool
+	followRelative    bool
+}
+
+var pythonModuleExtensions = [...]string{".py", ".pyi"}
+var pythonPackageInitFiles = [...]string{"__init__.py", "__init__.pyi"}
+
+// ModuleAnalysisOptions configures module analysis behavior
+type ModuleAnalysisOptions struct {
+	ProjectRoot       string   // Project root directory
+	PythonPath        []string // Additional Python path entries
+	ModuleRoots       []string // Explicit captured module roots; nil discovers from disk
+	ExcludePatterns   []string // Module patterns to exclude; nil uses defaults, empty disables excludes
+	IncludePatterns   []string // Module patterns to include; nil uses defaults, empty includes all files
+	IncludeStdLib     *bool    // Include standard library dependencies
+	IncludeThirdParty *bool    // Include third-party dependencies
+	FollowRelative    *bool    // Follow relative imports
+}
+
+// DefaultModuleAnalysisOptions returns default analysis options
+func DefaultModuleAnalysisOptions() *ModuleAnalysisOptions {
+	return &ModuleAnalysisOptions{
+		IncludePatterns:   domain.DefaultPythonModuleIncludePatterns(),
+		ExcludePatterns:   domain.DefaultAnalysisExcludePatterns(),
+		IncludeStdLib:     domain.BoolPtr(false),
+		IncludeThirdParty: domain.BoolPtr(true),
+		FollowRelative:    domain.BoolPtr(true),
+	}
+}
+
+// NewModuleAnalyzer creates a new module analyzer
+func NewModuleAnalyzer(options *ModuleAnalysisOptions) (*ModuleAnalyzer, error) {
+	defaults := DefaultModuleAnalysisOptions()
+	if options == nil {
+		options = defaults
+	}
+
+	// Determine project root
+	projectRoot := options.ProjectRoot
+	if projectRoot == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get working directory: %w", err)
+		}
+		projectRoot = cwd
+	}
+
+	// Make project root absolute
+	absRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve project root: %w", err)
+	}
+
+	resolvedRoots := options.ModuleRoots
+	if resolvedRoots == nil {
+		resolvedRoots = moduleRoots(absRoot, options.PythonPath)
+	} else {
+		resolvedRoots = normalizeModuleRoots(resolvedRoots)
+	}
+	analyzer := &ModuleAnalyzer{
+		projectRoot:       absRoot,
+		moduleRoots:       resolvedRoots,
+		resolvedModules:   make(map[string]string),
+		includeStdLib:     domain.BoolValue(options.IncludeStdLib, domain.BoolValue(defaults.IncludeStdLib, false)),
+		includeThirdParty: domain.BoolValue(options.IncludeThirdParty, domain.BoolValue(defaults.IncludeThirdParty, true)),
+		followRelative:    domain.BoolValue(options.FollowRelative, domain.BoolValue(defaults.FollowRelative, true)),
+	}
+	analyzer.pythonPath = append([]string(nil), analyzer.moduleRoots...)
+	analyzer.reExportResolver = NewReExportResolverWithRoots(absRoot, analyzer.moduleRoots)
+
+	if options.ExcludePatterns != nil {
+		analyzer.excludePatterns = append(analyzer.excludePatterns, options.ExcludePatterns...)
+	} else {
+		analyzer.excludePatterns = append(analyzer.excludePatterns, defaults.ExcludePatterns...)
+	}
+
+	if options.IncludePatterns != nil {
+		analyzer.includePatterns = append(analyzer.includePatterns, options.IncludePatterns...)
+	} else {
+		analyzer.includePatterns = append(analyzer.includePatterns, defaults.IncludePatterns...)
+	}
+
+	return analyzer, nil
+}
+
+func normalizeModuleRoots(paths []string) []string {
+	roots := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		duplicate := false
+		for _, existing := range roots {
+			if existing == absolute {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			roots = append(roots, absolute)
+		}
+	}
+	sort.SliceStable(roots, func(i, j int) bool { return len(roots[i]) > len(roots[j]) })
+	return roots
+}
+
+func moduleRoots(projectRoot string, pythonPath []string) []string {
+	roots := make([]string, 0, 2+len(pythonPath))
+	addRoot := func(path string) {
+		if path == "" {
+			return
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return
+		}
+		for _, existing := range roots {
+			if existing == abs {
+				return
+			}
+		}
+		roots = append(roots, abs)
+	}
+
+	if isSrcLayoutRoot(projectRoot) {
+		addRoot(filepath.Join(projectRoot, "src"))
+	}
+	addRoot(projectRoot)
+	for _, path := range pythonPath {
+		addRoot(path)
+	}
+
+	sort.SliceStable(roots, func(i, j int) bool {
+		return len(roots[i]) > len(roots[j])
+	})
+	return roots
+}
+
+func isDirectory(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func isSrcLayoutRoot(projectRoot string) bool {
+	srcRoot := filepath.Join(projectRoot, "src")
+	if !isDirectory(srcRoot) {
+		return false
+	}
+	for _, name := range pythonPackageInitFiles {
+		if _, err := os.Stat(filepath.Join(srcRoot, name)); err == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// AnalyzeProject analyzes all Python modules in the project and builds a dependency graph
+func (ma *ModuleAnalyzer) AnalyzeProject() (*DependencyGraph, error) {
+	// Collect all Python files in the project
+	files, err := ma.collectPythonFiles()
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect Python files: %w", err)
+	}
+	files = ma.canonicalModuleFiles(files)
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no Python files found in project")
+	}
+
+	// Create dependency graph
+	graph := NewDependencyGraph(ma.projectRoot)
+
+	// First pass: Add all modules to graph
+	for _, filePath := range files {
+		moduleName := ma.filePathToModuleName(filePath)
+		if moduleName != "" {
+			graph.AddModule(moduleName, filePath)
+		}
+	}
+
+	// Second pass: Analyze dependencies for each module
+	for _, filePath := range files {
+		if err := ma.analyzeModuleDependencies(graph, filePath); err != nil {
+			// Log warning but continue with other files
+			continue
+		}
+	}
+
+	return graph, nil
+}
+
+// AnalyzeFiles analyzes specific Python files and builds a dependency graph
+func (ma *ModuleAnalyzer) AnalyzeFiles(filePaths []string) (*DependencyGraph, error) {
+	graph := NewDependencyGraph(ma.projectRoot)
+
+	// Filter and validate files
+	var validFiles []string
+	for _, filePath := range filePaths {
+		if ma.isValidPythonFile(filePath) {
+			absPath, err := filepath.Abs(filePath)
+			if err == nil {
+				validFiles = append(validFiles, absPath)
+			}
+		}
+	}
+
+	if len(validFiles) == 0 {
+		return nil, fmt.Errorf("no valid Python files provided")
+	}
+	validFiles = ma.canonicalModuleFiles(validFiles)
+
+	// Add modules to graph
+	for _, filePath := range validFiles {
+		moduleName := ma.filePathToModuleName(filePath)
+		if moduleName != "" {
+			graph.AddModule(moduleName, filePath)
+		}
+	}
+
+	// Analyze dependencies
+	for _, filePath := range validFiles {
+		if err := ma.analyzeModuleDependencies(graph, filePath); err != nil {
+			continue
+		}
+	}
+
+	return graph, nil
+}
+
+// AnalyzeParsedModules builds a dependency graph from previously parsed source.
+func (ma *ModuleAnalyzer) AnalyzeParsedModules(ctx context.Context, parsedModules []ParsedModule) (*DependencyGraph, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	modulesByPath := make(map[string]ParsedModule, len(parsedModules))
+	paths := make([]string, 0, len(parsedModules))
+	for _, parsedModule := range parsedModules {
+		if parsedModule.path == "" || parsedModule.ast == nil {
+			return nil, fmt.Errorf("invalid parsed module")
+		}
+		if !ma.isValidPythonFile(parsedModule.path) {
+			return nil, fmt.Errorf("unsupported Python module path: %s", parsedModule.path)
+		}
+		absolutePath, err := filepath.Abs(parsedModule.path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve parsed module path %s: %w", parsedModule.path, err)
+		}
+		parsedModule.path = absolutePath
+		modulesByPath[absolutePath] = parsedModule
+		paths = append(paths, absolutePath)
+	}
+	paths = ma.canonicalModuleFiles(paths)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no parsed Python modules provided")
+	}
+
+	graph := NewDependencyGraph(ma.projectRoot)
+	parsedPackages := make(map[string]*parser.Node)
+	for _, path := range paths {
+		moduleName := ma.filePathToModuleName(path)
+		if moduleName != "" {
+			graph.AddModule(moduleName, path)
+			if isPythonPackageInit(path) {
+				parsedPackages[moduleName] = modulesByPath[path].ast
+			}
+		}
+	}
+	ma.reExportResolver.UseParsedPackages(parsedPackages)
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("module analysis cancelled: %w", err)
+		}
+		parsedModule := modulesByPath[path]
+		if err := ma.analyzeParsedModuleDependencies(graph, parsedModule, true); err != nil {
+			return nil, fmt.Errorf("analyze captured module %s: %w", path, err)
+		}
+	}
+
+	return graph, nil
+}
+
+// analyzeModuleDependencies analyzes imports in a single module and adds dependencies to graph
+func (ma *ModuleAnalyzer) analyzeModuleDependencies(graph *DependencyGraph, filePath string) error {
+	// Read file content
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read file %s: %w", filePath, err)
+	}
+
+	// Parse the Python file
+	p := parser.New()
+	ctx := context.Background()
+	result, err := p.Parse(ctx, content)
+	if err != nil {
+		return fmt.Errorf("failed to parse file %s: %w", filePath, err)
+	}
+
+	parsedModule, err := NewParsedModule(filePath, content, result.AST)
+	if err != nil {
+		return fmt.Errorf("invalid parsed module %s: %w", filePath, err)
+	}
+	return ma.analyzeParsedModuleDependencies(graph, parsedModule, false)
+}
+
+func (ma *ModuleAnalyzer) analyzeParsedModuleDependencies(graph *DependencyGraph, parsedModule ParsedModule, capturedOnly bool) error {
+	moduleName := ma.filePathToModuleName(parsedModule.path)
+	if moduleName == "" {
+		return fmt.Errorf("could not determine module name for %s", parsedModule.path)
+	}
+
+	// Get module node
+	module := graph.GetModule(moduleName)
+	if module == nil {
+		return fmt.Errorf("module not found in graph: %s", moduleName)
+	}
+
+	facts := ma.collectModuleFacts(parsedModule.ast)
+	module.FunctionCount = facts.functionCount
+	module.ClassCount = facts.classCount
+	module.AbstractClassCount = facts.abstractClassCount
+	module.PublicNames = facts.publicNames
+	module.LineCount = CountSourceLines(parsedModule.source)
+
+	// Process each import
+	for _, imp := range facts.imports {
+		// Skip TYPE_CHECKING imports entirely: they never execute at runtime,
+		// so they are not real dependencies for any analysis.
+		if imp.IsTypeChecking {
+			continue
+		}
+
+		// NOTE: lazy (function/method-body) imports are still recorded as edges
+		// because they are real runtime dependencies that matter for coupling
+		// metrics, dependency matrices, and architecture layer checks. They are
+		// flagged via ImportInfo.IsLazy and excluded only from load-time
+		// circular-dependency detection. See issue #460.
+
+		targetModule := ma.resolveImport(graph, imp, parsedModule.path, capturedOnly)
+		ma.recordImportResolution(graph, imp, parsedModule.path, targetModule)
+		if targetModule == "" {
+			continue
+		}
+
+		edgeType := ma.dependencyEdgeType(imp)
+		for _, resolvedModule := range ma.importDependencyTargets(graph, imp, targetModule) {
+			if ma.shouldIncludeDependency(resolvedModule) {
+				graph.AddDependency(moduleName, resolvedModule, edgeType, imp)
+			}
+		}
+	}
+
+	return nil
+}
+
+// recordImportResolution tracks internal imports separately from imports that
+// are intentionally outside the analyzed project (stdlib and third-party
+// dependencies). This keeps the diagnostic ratio useful when third-party
+// fallback is enabled.
+func (ma *ModuleAnalyzer) recordImportResolution(graph *DependencyGraph, imp *ImportInfo, fromFile, targetModule string) {
+	if graph == nil || imp == nil {
+		return
+	}
+	moduleName := ma.moduleNameFromImport(imp)
+	if moduleName == "" || (!imp.IsRelative && ma.isStandardLibrary(moduleName)) {
+		return
+	}
+
+	if ma.isLikelyInternalImport(graph, imp, fromFile, targetModule) {
+		if targetModule != "" && ma.importTargetsAnalyzedModule(graph, imp, targetModule) {
+			graph.ResolvedImports++
+			return
+		}
+		graph.UnresolvedImports++
+	}
+}
+
+func (ma *ModuleAnalyzer) importTargetsAnalyzedModule(graph *DependencyGraph, imp *ImportInfo, targetModule string) bool {
+	if graph == nil || targetModule == "" {
+		return false
+	}
+	for _, target := range ma.importDependencyTargets(graph, imp, targetModule) {
+		if graph.GetModule(target) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (ma *ModuleAnalyzer) isLikelyInternalImport(graph *DependencyGraph, imp *ImportInfo, fromFile, targetModule string) bool {
+	if imp.IsRelative {
+		return true
+	}
+	moduleName := ma.moduleNameFromImport(imp)
+	if moduleName == "" || ma.isStandardLibrary(moduleName) {
+		return false
+	}
+	if ma.importTargetsAnalyzedModule(graph, imp, targetModule) || ma.hasProjectImport(moduleName, fromFile) {
+		return true
+	}
+
+	// A missing module under a namespace already represented in the graph is
+	// likely an internal import. This catches the common wrong-root case where
+	// the resolver gives the captured files a different qualified name.
+	namespace := moduleName
+	if dot := strings.IndexByte(namespace, '.'); dot >= 0 {
+		namespace = namespace[:dot]
+	}
+	for name := range graph.Nodes {
+		if name == namespace || strings.HasPrefix(name, namespace+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasProjectImport reports whether moduleName exists as a file under any
+// directory between the importing file and the project root, or under a module
+// root. Ancestors above the importer's parent matter when the inferred root is
+// wrong: the import then resolves on disk but to a differently named module,
+// and must be reported as unresolved rather than dropped.
+func (ma *ModuleAnalyzer) hasProjectImport(moduleName, fromFile string) bool {
+	searchPaths := append(ancestorDirsWithin(fromFile, ma.projectRoot), ma.moduleRoots...)
+	for _, searchPath := range searchPaths {
+		modulePath := filepath.Join(searchPath, strings.ReplaceAll(moduleName, ".", string(filepath.Separator)))
+		if ma.resolveModuleFile(modulePath) != "" || ma.resolvePackageInit(modulePath) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ancestorDirsWithin lists the directories from the file's own directory up to
+// root inclusive, or up to the filesystem root when the file lies outside root.
+func ancestorDirsWithin(file, root string) []string {
+	var dirs []string
+	for dir := filepath.Dir(file); ; dir = filepath.Dir(dir) {
+		dirs = append(dirs, dir)
+		if dir == root || filepath.Dir(dir) == dir {
+			return dirs
+		}
+	}
+}
+
+func (ma *ModuleAnalyzer) dependencyEdgeType(imp *ImportInfo) DependencyEdgeType {
+	if imp.IsRelative {
+		return DependencyEdgeRelative
+	}
+	if len(imp.ImportedNames) > 0 {
+		return DependencyEdgeFromImport
+	}
+	return DependencyEdgeImport
+}
+
+func (ma *ModuleAnalyzer) importDependencyTargets(graph *DependencyGraph, imp *ImportInfo, targetModule string) []string {
+	if len(imp.ImportedNames) == 0 {
+		return []string{targetModule}
+	}
+
+	targets := make(map[string]bool, len(imp.ImportedNames))
+	for _, importedName := range imp.ImportedNames {
+		if importedName == "*" {
+			targets[targetModule] = true
+			continue
+		}
+
+		if !imp.IsRelative {
+			if resolvedModule, found := ma.reExportResolver.ResolveReExport(targetModule, importedName); found {
+				targets[resolvedModule] = true
+				continue
+			}
+		}
+
+		if concreteModule := importedNameModule(targetModule, importedName); graph.GetModule(concreteModule) != nil {
+			targets[concreteModule] = true
+			continue
+		}
+
+		targets[targetModule] = true
+	}
+
+	return sortedModuleNames(targets)
+}
+
+func importedNameModule(moduleName, importedName string) string {
+	if moduleName == "" || importedName == "" {
+		return ""
+	}
+	return moduleName + "." + importedName
+}
+
+func sortedModuleNames(moduleSet map[string]bool) []string {
+	modules := make([]string, 0, len(moduleSet))
+	for moduleName := range moduleSet {
+		if moduleName != "" {
+			modules = append(modules, moduleName)
+		}
+	}
+	sort.Strings(modules)
+	return modules
+}
+
+type moduleFacts struct {
+	imports            []*ImportInfo
+	functionCount      int
+	classCount         int
+	abstractClassCount int
+	publicNames        []string
+}
+
+func (ma *ModuleAnalyzer) collectModuleFacts(ast *parser.Node) moduleFacts {
+	var facts moduleFacts
+	if ast == nil {
+		return facts
+	}
+
+	ast.Walk(func(node *parser.Node) bool {
+		switch node.Type {
+		case parser.NodeImport, parser.NodeImportFrom:
+			facts.imports = append(facts.imports, ma.importsFromNode(node)...)
+		case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+			facts.functionCount++
+			if isPublicName(node.Name) {
+				facts.publicNames = append(facts.publicNames, node.Name)
+			}
+		case parser.NodeClassDef:
+			facts.classCount++
+			if ma.isAbstractClass(node) {
+				facts.abstractClassCount++
+			}
+			if isPublicName(node.Name) {
+				facts.publicNames = append(facts.publicNames, node.Name)
+			}
+		}
+		return true
+	})
+
+	return facts
+}
+
+func isPublicName(name string) bool {
+	return name != "" && !strings.HasPrefix(name, "_")
+}
+
+func (ma *ModuleAnalyzer) importsFromNode(node *parser.Node) []*ImportInfo {
+	isTypeChecking := ma.isInTypeCheckingBlock(node)
+	isLazy := ma.isInFunctionScope(node) || ma.isInMainGuard(node)
+
+	switch node.Type {
+	case parser.NodeImport:
+		var imports []*ImportInfo
+		if len(node.Children) > 0 {
+			for _, child := range node.Children {
+				if child.Type != parser.NodeAlias {
+					continue
+				}
+				imp := &ImportInfo{
+					Statement:      fmt.Sprintf("import %s", child.Name),
+					ImportedNames:  []string{child.Name},
+					IsRelative:     false,
+					Line:           node.Location.StartLine,
+					IsTypeChecking: isTypeChecking,
+					IsLazy:         isLazy,
+				}
+				if alias, ok := child.Value.(string); ok {
+					imp.Alias = alias
+				}
+				imports = append(imports, imp)
+			}
+			return imports
+		}
+
+		imports = make([]*ImportInfo, 0, len(node.Names))
+		for _, name := range node.Names {
+			imports = append(imports, &ImportInfo{
+				Statement:      fmt.Sprintf("import %s", name),
+				ImportedNames:  []string{name},
+				IsRelative:     false,
+				Line:           node.Location.StartLine,
+				IsTypeChecking: isTypeChecking,
+				IsLazy:         isLazy,
+			})
+		}
+		return imports
+
+	case parser.NodeImportFrom:
+		module := node.Module
+		level := node.Level
+
+		seenNames := make(map[string]bool, len(node.Names)+len(node.Children))
+		importedNames := make([]string, 0, len(node.Names)+len(node.Children))
+		addName := func(name string) {
+			if name == "" || seenNames[name] {
+				return
+			}
+			seenNames[name] = true
+			importedNames = append(importedNames, name)
+		}
+		for _, name := range node.Names {
+			addName(name)
+		}
+		for _, child := range node.Children {
+			if child.Type == parser.NodeAlias {
+				addName(child.Name)
+			}
+		}
+
+		imp := &ImportInfo{
+			Statement:      ma.buildImportStatement(node),
+			ImportedNames:  importedNames,
+			IsRelative:     level > 0,
+			Level:          level,
+			Line:           node.Location.StartLine,
+			IsTypeChecking: isTypeChecking,
+			IsLazy:         isLazy,
+		}
+
+		if imp.IsRelative {
+			imp.Statement = strings.TrimLeft(module, ".")
+		} else {
+			imp.Statement = module
+		}
+
+		return []*ImportInfo{imp}
+	default:
+		return nil
+	}
+}
+
+// resolveImport resolves an import to a module name
+func (ma *ModuleAnalyzer) resolveImport(graph *DependencyGraph, imp *ImportInfo, fromFile string, capturedOnly bool) string {
+	if imp.IsRelative {
+		return ma.resolveRelativeImport(imp, fromFile)
+	}
+	if resolved := ma.resolveAbsoluteImportFromGraph(graph, imp); resolved != "" {
+		return resolved
+	}
+	if capturedOnly {
+		moduleName := ma.moduleNameFromImport(imp)
+		if ma.isStandardLibrary(moduleName) {
+			if ma.includeStdLib {
+				return moduleName
+			}
+			return ""
+		}
+		if resolved := ma.resolveScopedAbsoluteImportFromGraph(graph, moduleName, fromFile); resolved != "" {
+			return resolved
+		}
+		if ma.includeThirdParty {
+			return moduleName
+		}
+		return ""
+	}
+	// For absolute imports, try to resolve within the project first
+	return ma.resolveAbsoluteImportWithProject(imp, fromFile)
+}
+
+func (ma *ModuleAnalyzer) resolveAbsoluteImportFromGraph(graph *DependencyGraph, imp *ImportInfo) string {
+	if graph == nil {
+		return ""
+	}
+	moduleName := ma.moduleNameFromImport(imp)
+	if moduleName == "" {
+		return ""
+	}
+
+	if graph.GetModule(moduleName) != nil {
+		return moduleName
+	}
+	for _, importedName := range imp.ImportedNames {
+		if importedName == "" || importedName == "*" {
+			continue
+		}
+		if graph.GetModule(importedNameModule(moduleName, importedName)) != nil {
+			return moduleName
+		}
+	}
+	return ""
+}
+
+// resolveScopedAbsoluteImportFromGraph supports script-style imports using the
+// same two directories searched by the filesystem-backed resolver: the
+// importing module's directory and its parent. All candidates come from the
+// captured graph, so resolution remains independent of later filesystem state.
+func (ma *ModuleAnalyzer) resolveScopedAbsoluteImportFromGraph(
+	graph *DependencyGraph,
+	moduleName string,
+	fromFile string,
+) string {
+	if graph == nil || moduleName == "" {
+		return ""
+	}
+
+	packageName := strings.Trim(ma.pathToModuleName(filepath.Dir(fromFile)), ".")
+	for depth := 0; depth < 2 && packageName != ""; depth++ {
+		candidate := packageName + "." + moduleName
+		if graph.GetModule(candidate) != nil {
+			return candidate
+		}
+
+		separator := strings.LastIndex(packageName, ".")
+		if separator == -1 {
+			break
+		}
+		packageName = packageName[:separator]
+	}
+
+	return ""
+}
+
+// resolveRelativeImport resolves relative imports like "from .module import name"
+func (ma *ModuleAnalyzer) resolveRelativeImport(imp *ImportInfo, fromFile string) string {
+	if !ma.followRelative {
+		return ""
+	}
+
+	// Get the directory of the current file
+	currentDir := filepath.Dir(fromFile)
+
+	// Navigate up the directory tree based on the level
+	targetDir := currentDir
+	for i := 1; i < imp.Level; i++ {
+		targetDir = filepath.Dir(targetDir)
+	}
+
+	// Build the target module path
+	if imp.Statement != "" {
+		targetPath := filepath.Join(targetDir, strings.ReplaceAll(imp.Statement, ".", string(filepath.Separator)))
+		return ma.pathToModuleName(targetPath)
+	}
+
+	return ma.pathToModuleName(targetDir)
+}
+
+// resolveAbsoluteImport resolves absolute imports
+func (ma *ModuleAnalyzer) resolveAbsoluteImport(imp *ImportInfo) string {
+	moduleName := ma.moduleNameFromImport(imp)
+	if moduleName == "" {
+		return ""
+	}
+
+	cacheKey := pythonPathImportCacheKey(moduleName)
+
+	// Check cache first
+	if resolved, exists := ma.resolvedModules[cacheKey]; exists {
+		return resolved
+	}
+
+	// Try to find the module in the Python path
+	for _, pathEntry := range ma.pythonPath {
+		modulePath := filepath.Join(pathEntry, strings.ReplaceAll(moduleName, ".", string(filepath.Separator)))
+
+		if initFile := ma.resolvePackageInit(modulePath); initFile != "" {
+			ma.resolvedModules[cacheKey] = moduleName
+			return moduleName
+		}
+
+		if moduleFile := ma.resolveModuleFile(modulePath); moduleFile != "" {
+			ma.resolvedModules[cacheKey] = moduleName
+			return moduleName
+		}
+	}
+
+	// Check if it's a standard library or third-party module
+	if ma.isStandardLibrary(moduleName) {
+		if ma.includeStdLib {
+			ma.resolvedModules[cacheKey] = moduleName
+			return moduleName
+		}
+		return ""
+	}
+
+	if ma.includeThirdParty {
+		ma.resolvedModules[cacheKey] = moduleName
+		return moduleName
+	}
+
+	return ""
+}
+
+// resolveAbsoluteImportWithProject resolves absolute imports, checking project modules first
+func (ma *ModuleAnalyzer) resolveAbsoluteImportWithProject(imp *ImportInfo, fromFile string) string {
+	moduleName := ma.moduleNameFromImport(imp)
+	if moduleName == "" {
+		return ""
+	}
+
+	cacheKey := projectImportCacheKey(moduleName, fromFile)
+
+	// Check cache first
+	if resolved, exists := ma.resolvedModules[cacheKey]; exists {
+		return resolved
+	}
+
+	// First, try to resolve within the current project directory
+	// Build possible module path relative to the file's directory
+	currentDir := filepath.Dir(fromFile)
+
+	// Try to find the module in the same directory or project root
+	searchPaths := append([]string{
+		currentDir,               // Current directory
+		filepath.Dir(currentDir), // Parent directory
+	}, ma.pythonPath...)
+
+	for _, searchPath := range searchPaths {
+		// Try to build module path from the import name
+		modulePath := filepath.Join(searchPath, strings.ReplaceAll(moduleName, ".", string(filepath.Separator)))
+
+		if moduleFile := ma.resolveModuleFile(modulePath); moduleFile != "" {
+			// Calculate the module name based on project structure
+			resolvedName := ma.filePathToModuleName(moduleFile)
+			if ma.importMatchesResolvedModule(moduleName, resolvedName) {
+				ma.resolvedModules[cacheKey] = resolvedName
+				return resolvedName
+			}
+		}
+
+		if initFile := ma.resolvePackageInit(modulePath); initFile != "" {
+			resolvedName := ma.filePathToModuleName(initFile)
+			if resolvedName != "" {
+				// For __init__ files, use the package name.
+				resolvedName = strings.TrimSuffix(resolvedName, ".__init__")
+				if ma.importMatchesResolvedModule(moduleName, resolvedName) {
+					ma.resolvedModules[cacheKey] = resolvedName
+					return resolvedName
+				}
+			}
+		}
+	}
+
+	// Fall back to the original resolveAbsoluteImport logic
+	return ma.resolveAbsoluteImport(imp)
+}
+
+// importMatchesResolvedModule verifies that an absolute import maps by
+// qualified module path, while still supporting script-style local imports for
+// non-stdlib modules. Bare stdlib imports must not bind to same-basename
+// project modules discovered under the current file's directory.
+func (ma *ModuleAnalyzer) importMatchesResolvedModule(importName, resolvedName string) bool {
+	if importName == "" || resolvedName == "" {
+		return false
+	}
+	if resolvedName == importName {
+		return true
+	}
+	if !strings.Contains(importName, ".") {
+		return !ma.isStandardLibrary(importName) && strings.HasSuffix(resolvedName, "."+importName)
+	}
+	return strings.HasSuffix(resolvedName, "."+importName)
+}
+
+func projectImportCacheKey(moduleName, fromFile string) string {
+	dir := filepath.Dir(fromFile)
+	if absDir, err := filepath.Abs(dir); err == nil {
+		dir = absDir
+	}
+	return "project\x00" + dir + "\x00" + moduleName
+}
+
+func pythonPathImportCacheKey(moduleName string) string {
+	return "pythonpath\x00" + moduleName
+}
+
+// moduleNameFromImport normalizes the module name from an import statement
+func (ma *ModuleAnalyzer) moduleNameFromImport(imp *ImportInfo) string {
+	if imp == nil {
+		return ""
+	}
+
+	moduleName := strings.TrimSpace(imp.Statement)
+
+	// Handle plain "import foo as bar" statements by stripping the prefix and alias
+	if strings.HasPrefix(moduleName, "import ") {
+		moduleName = strings.TrimSpace(strings.TrimPrefix(moduleName, "import "))
+		if idx := strings.Index(moduleName, " as "); idx != -1 {
+			moduleName = moduleName[:idx]
+		}
+	}
+
+	if moduleName == "" && len(imp.ImportedNames) > 0 {
+		moduleName = imp.ImportedNames[0]
+	}
+
+	return strings.TrimSpace(moduleName)
+}
+
+// Helper methods
+
+// collectPythonFiles collects all Python files in the project
+func (ma *ModuleAnalyzer) collectPythonFiles() ([]string, error) {
+	var files []string
+
+	err := filepath.Walk(ma.projectRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip problematic files
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Check if file is a Python module and matches include patterns
+		if !ma.isValidPythonFile(path) {
+			return nil
+		}
+		relPath, err := ProjectRelativePath(ma.projectRoot, path)
+		if err != nil {
+			return err
+		}
+		if ma.matchesIncludePatterns(relPath) && !ma.matchesExcludePatterns(relPath) {
+			files = append(files, path)
+		}
+
+		return nil
+	})
+
+	return files, err
+}
+
+func (ma *ModuleAnalyzer) canonicalModuleFiles(filePaths []string) []string {
+	selected := make(map[string]string, len(filePaths))
+	for _, filePath := range filePaths {
+		moduleName := ma.filePathToModuleName(filePath)
+		if moduleName == "" {
+			continue
+		}
+		current, exists := selected[moduleName]
+		if !exists || preferPythonModuleFile(filePath, current) {
+			selected[moduleName] = filePath
+		}
+	}
+
+	moduleNames := make([]string, 0, len(selected))
+	for moduleName := range selected {
+		moduleNames = append(moduleNames, moduleName)
+	}
+	sort.Strings(moduleNames)
+
+	files := make([]string, 0, len(moduleNames))
+	for _, moduleName := range moduleNames {
+		files = append(files, selected[moduleName])
+	}
+	return files
+}
+
+// filePathToModuleName converts a file path to a Python module name
+func (ma *ModuleAnalyzer) filePathToModuleName(filePath string) string {
+	// Make path relative to project root
+	root := ma.moduleRootForFile(filePath)
+	relPath, err := filepath.Rel(root, filePath)
+	if err != nil {
+		return ""
+	}
+
+	relPath = stripPythonModuleExtension(relPath)
+
+	// Handle __init__.py files
+	if strings.HasSuffix(relPath, "__init__") {
+		relPath = relPath[:len(relPath)-len("__init__")]
+		if strings.HasSuffix(relPath, string(filepath.Separator)) {
+			relPath = relPath[:len(relPath)-1]
+		}
+	}
+
+	// Convert path separators to dots
+	moduleName := strings.ReplaceAll(relPath, string(filepath.Separator), ".")
+
+	// Clean up leading/trailing dots
+	moduleName = strings.Trim(moduleName, ".")
+
+	return moduleName
+}
+
+// pathToModuleName converts a directory path to a module name
+func (ma *ModuleAnalyzer) pathToModuleName(path string) string {
+	root := ma.moduleRootForFile(path)
+	relPath, err := filepath.Rel(root, path)
+	if err != nil {
+		return ""
+	}
+	return strings.ReplaceAll(relPath, string(filepath.Separator), ".")
+}
+
+func (ma *ModuleAnalyzer) moduleRootForFile(path string) string {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return ma.projectRoot
+	}
+	for _, root := range ma.moduleRoots {
+		if pathWithinRoot(absPath, root) {
+			return root
+		}
+	}
+	return ma.projectRoot
+}
+
+func pathWithinRoot(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != "" && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
+}
+
+func (ma *ModuleAnalyzer) isAbstractClass(classNode *parser.Node) bool {
+	for _, base := range classNode.Bases {
+		if ma.isAbstractClassName(ma.nodeQualifiedName(base)) {
+			return true
+		}
+	}
+
+	for _, child := range classNode.Body {
+		if ma.isAbstractMethod(child) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (ma *ModuleAnalyzer) isAbstractMethod(node *parser.Node) bool {
+	if node == nil || (node.Type != parser.NodeFunctionDef && node.Type != parser.NodeAsyncFunctionDef) {
+		return false
+	}
+
+	for _, decorator := range node.Decorator {
+		if ma.nodeQualifiedName(decorator) == "abstractmethod" || strings.HasSuffix(ma.nodeQualifiedName(decorator), ".abstractmethod") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (ma *ModuleAnalyzer) isAbstractClassName(name string) bool {
+	switch name {
+	case "ABC", "abc.ABC", "ABCMeta", "abc.ABCMeta":
+		return true
+	default:
+		return false
+	}
+}
+
+func (ma *ModuleAnalyzer) nodeQualifiedName(node *parser.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	switch node.Type {
+	case parser.NodeDecorator:
+		if value, ok := node.Value.(*parser.Node); ok {
+			return ma.nodeQualifiedName(value)
+		}
+	case parser.NodeCall:
+		if value, ok := node.Value.(*parser.Node); ok {
+			return ma.nodeQualifiedName(value)
+		}
+	case parser.NodeKeyword:
+		if node.Name == "metaclass" {
+			if value, ok := node.Value.(*parser.Node); ok {
+				return ma.nodeQualifiedName(value)
+			}
+		}
+	case parser.NodeKeywordArgument:
+		if len(node.Children) >= 3 && ma.nodeQualifiedName(node.Children[0]) == "metaclass" {
+			return ma.nodeQualifiedName(node.Children[2])
+		}
+	case parser.NodeName:
+		return node.Name
+	case parser.NodeAttribute:
+		left := ""
+		if value, ok := node.Value.(*parser.Node); ok {
+			left = ma.nodeQualifiedName(value)
+		}
+		if left == "" && node.Left != nil {
+			left = ma.nodeQualifiedName(node.Left)
+		}
+		if left == "" {
+			return node.Name
+		}
+		return left + "." + node.Name
+	}
+
+	return ""
+}
+
+// shouldIncludeDependency checks if a dependency should be included
+func (ma *ModuleAnalyzer) shouldIncludeDependency(moduleName string) bool {
+	if moduleName == "" {
+		return false
+	}
+
+	// Check exclude patterns
+	for _, pattern := range ma.excludePatterns {
+		if matched, _ := doublestar.Match(pattern, moduleName); matched {
+			return false
+		}
+	}
+
+	return true
+}
+
+// buildImportStatement builds the original import statement string
+func (ma *ModuleAnalyzer) buildImportStatement(node *parser.Node) string {
+	if node.Type == parser.NodeImportFrom {
+		var names []string
+		for _, child := range node.Children {
+			if child.Type == parser.NodeAlias {
+				names = append(names, child.Name)
+			}
+		}
+		return fmt.Sprintf("from %s import %s", node.Module, strings.Join(names, ", "))
+	}
+	return ""
+}
+
+// isValidPythonFile checks if a file is a valid Python file
+func (ma *ModuleAnalyzer) isValidPythonFile(filePath string) bool {
+	return hasPythonModuleExtension(filePath)
+}
+
+// fileExists checks if a file exists
+func (ma *ModuleAnalyzer) fileExists(filePath string) bool {
+	_, err := os.Stat(filePath)
+	return !os.IsNotExist(err)
+}
+
+func (ma *ModuleAnalyzer) resolveModuleFile(modulePath string) string {
+	for _, ext := range pythonModuleExtensions {
+		filePath := modulePath + ext
+		if ma.fileExists(filePath) {
+			return filePath
+		}
+	}
+	return ""
+}
+
+func (ma *ModuleAnalyzer) resolvePackageInit(packagePath string) string {
+	for _, name := range pythonPackageInitFiles {
+		filePath := filepath.Join(packagePath, name)
+		if ma.fileExists(filePath) {
+			return filePath
+		}
+	}
+	return ""
+}
+
+func hasPythonModuleExtension(filePath string) bool {
+	for _, ext := range pythonModuleExtensions {
+		if strings.HasSuffix(filePath, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripPythonModuleExtension(filePath string) string {
+	for _, ext := range pythonModuleExtensions {
+		if strings.HasSuffix(filePath, ext) {
+			return strings.TrimSuffix(filePath, ext)
+		}
+	}
+	return filePath
+}
+
+func preferPythonModuleFile(candidate, current string) bool {
+	candidatePriority := pythonModuleFilePriority(candidate)
+	currentPriority := pythonModuleFilePriority(current)
+	if candidatePriority != currentPriority {
+		return candidatePriority < currentPriority
+	}
+	return candidate < current
+}
+
+func pythonModuleFilePriority(filePath string) int {
+	switch {
+	case strings.HasSuffix(filePath, ".py"):
+		return 0
+	case strings.HasSuffix(filePath, ".pyi"):
+		return 1
+	default:
+		return 2
+	}
+}
+
+func isPythonPackageInit(filePath string) bool {
+	base := filepath.Base(filePath)
+	for _, name := range pythonPackageInitFiles {
+		if base == name {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesIncludePatterns checks if a project-relative path matches any include pattern
+func (ma *ModuleAnalyzer) matchesIncludePatterns(relPath string) bool {
+	if len(ma.includePatterns) == 0 {
+		return true
+	}
+	for _, pattern := range ma.includePatterns {
+		if MatchPathPattern(pattern, relPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesExcludePatterns checks if a project-relative path matches any exclude pattern
+func (ma *ModuleAnalyzer) matchesExcludePatterns(relPath string) bool {
+	for _, pattern := range ma.excludePatterns {
+		if MatchPathPattern(pattern, relPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// isStandardLibrary checks if a module is part of the Python standard library
+func (ma *ModuleAnalyzer) isStandardLibrary(moduleName string) bool {
+	rootModule, _, _ := strings.Cut(moduleName, ".")
+	return standardLibraryModules[rootModule]
+}
+
+// isInTypeCheckingBlock checks if a node is inside a TYPE_CHECKING conditional block
+func (ma *ModuleAnalyzer) isInTypeCheckingBlock(node *parser.Node) bool {
+	child := node
+	current := node.Parent
+	for current != nil {
+		if current.Type == parser.NodeIf || current.Type == parser.NodeElifClause {
+			if ma.isTypeCheckingCondition(current.Test) && containsDirectNode(current.Body, child) {
+				return true
+			}
+		}
+		child = current
+		current = current.Parent
+	}
+	return false
+}
+
+// isInFunctionScope reports whether the node is nested inside a function or
+// method body. Such imports are "lazy": they run only when the function is
+// called, not at module load time, so they cannot create a load-time circular
+// dependency. A class body, by contrast, executes at definition (load) time,
+// so imports directly in a class body are not considered lazy.
+func (ma *ModuleAnalyzer) isInFunctionScope(node *parser.Node) bool {
+	for current := node.Parent; current != nil; current = current.Parent {
+		switch current.Type {
+		case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+			return true
+		}
+	}
+	return false
+}
+
+// isInMainGuard reports whether the node is inside an
+// `if __name__ == "__main__":` block. Such imports run only when the file is
+// executed as a script, never when it is imported, so like function-body
+// imports they cannot create a load-time circular dependency.
+func (ma *ModuleAnalyzer) isInMainGuard(node *parser.Node) bool {
+	child := node
+	for current := node.Parent; current != nil; current = current.Parent {
+		if current.Type == parser.NodeIf && isMainGuardCondition(current.Test) && containsDirectNode(current.Body, child) {
+			return true
+		}
+		child = current
+	}
+	return false
+}
+
+func isMainGuardCondition(expr *parser.Node) bool {
+	if expr == nil || expr.Type != parser.NodeCompare || expr.Op != "==" || expr.Left == nil || len(expr.Children) != 1 {
+		return false
+	}
+	left, right := expr.Left, expr.Children[0]
+	return (isDunderName(left) && isMainLiteral(right)) || (isMainLiteral(left) && isDunderName(right))
+}
+
+func isDunderName(node *parser.Node) bool {
+	return node.Type == parser.NodeName && node.Name == "__name__"
+}
+
+func isMainLiteral(node *parser.Node) bool {
+	return node.Type == parser.NodeConstant && node.Value == "__main__"
+}
+
+func containsDirectNode(nodes []*parser.Node, target *parser.Node) bool {
+	for _, node := range nodes {
+		if node == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (ma *ModuleAnalyzer) isTypeCheckingCondition(expr *parser.Node) bool {
+	if expr == nil {
+		return false
+	}
+
+	if expr.Type == parser.NodeName && expr.Name == "TYPE_CHECKING" {
+		return true
+	}
+
+	if expr.Type == parser.NodeAttribute && expr.Name == "TYPE_CHECKING" {
+		return true
+	}
+
+	if expr.Type == parser.NodeBoolOp {
+		return ma.isTypeCheckingBoolOp(expr)
+	}
+
+	return false
+}
+
+func (ma *ModuleAnalyzer) isTypeCheckingBoolOp(expr *parser.Node) bool {
+	children := expr.GetChildren()
+	if len(children) == 0 {
+		return false
+	}
+
+	switch expr.Op {
+	case "and":
+		for _, child := range children {
+			if ma.isTypeCheckingCondition(child) {
+				return true
+			}
+		}
+	case "or":
+		for _, child := range children {
+			if !ma.isTypeCheckingCondition(child) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return false
+}

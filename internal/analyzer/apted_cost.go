@@ -1,0 +1,331 @@
+package analyzer
+
+import (
+	"strings"
+
+	coreapted "github.com/ludo-technologies/polyscan/core/apted"
+)
+
+// PythonCostModel implements a Python-aware cost model with different costs for different node types
+type PythonCostModel struct {
+	// Base costs for different operations
+	BaseInsertCost float64
+	BaseDeleteCost float64
+	BaseRenameCost float64
+
+	// Whether to ignore differences in literal values
+	IgnoreLiterals bool
+
+	// Whether to ignore differences in identifier names
+	IgnoreIdentifiers bool
+
+	// Whether to reduce weight for boilerplate nodes (type annotations, decorators, Field() calls)
+	ReduceBoilerplateWeight bool
+
+	// Multiplier for boilerplate nodes (default: 0.1)
+	BoilerplateMultiplier float64
+}
+
+var _ coreapted.CostModel = (*PythonCostModel)(nil)
+
+func newAPTEDAnalyzer(costModel coreapted.CostModel) *coreapted.APTEDAnalyzer {
+	return coreapted.NewAPTEDAnalyzerWithNormalization(costModel, coreapted.NormalizeByMax)
+}
+
+// NewPythonCostModel creates a new Python-aware cost model with default settings
+func NewPythonCostModel() *PythonCostModel {
+	return &PythonCostModel{
+		BaseInsertCost:          1.0,
+		BaseDeleteCost:          1.0,
+		BaseRenameCost:          1.0,
+		IgnoreLiterals:          false,
+		IgnoreIdentifiers:       false,
+		ReduceBoilerplateWeight: true, // Enable by default to reduce false positives
+		BoilerplateMultiplier:   0.1,
+	}
+}
+
+// NewPythonCostModelWithConfig creates a Python cost model with custom configuration
+func NewPythonCostModelWithConfig(ignoreLiterals, ignoreIdentifiers bool) *PythonCostModel {
+	return &PythonCostModel{
+		BaseInsertCost:          1.0,
+		BaseDeleteCost:          1.0,
+		BaseRenameCost:          1.0,
+		IgnoreLiterals:          ignoreLiterals,
+		IgnoreIdentifiers:       ignoreIdentifiers,
+		ReduceBoilerplateWeight: true, // Enable by default to reduce false positives
+		BoilerplateMultiplier:   0.1,
+	}
+}
+
+// NewPythonCostModelWithBoilerplateConfig creates a Python cost model with full configuration
+func NewPythonCostModelWithBoilerplateConfig(ignoreLiterals, ignoreIdentifiers, reduceBoilerplate bool, boilerplateMultiplier float64) *PythonCostModel {
+	if boilerplateMultiplier <= 0 {
+		boilerplateMultiplier = 0.1
+	}
+	return &PythonCostModel{
+		BaseInsertCost:          1.0,
+		BaseDeleteCost:          1.0,
+		BaseRenameCost:          1.0,
+		IgnoreLiterals:          ignoreLiterals,
+		IgnoreIdentifiers:       ignoreIdentifiers,
+		ReduceBoilerplateWeight: reduceBoilerplate,
+		BoilerplateMultiplier:   boilerplateMultiplier,
+	}
+}
+
+// Insert returns the cost of inserting a node
+func (c *PythonCostModel) Insert(node *coreapted.TreeNode) float64 {
+	if node == nil {
+		return c.BaseInsertCost
+	}
+
+	// Different costs based on node type
+	multiplier := c.getNodeTypeMultiplier(node.Label)
+	return c.BaseInsertCost * multiplier
+}
+
+// Delete returns the cost of deleting a node
+func (c *PythonCostModel) Delete(node *coreapted.TreeNode) float64 {
+	if node == nil {
+		return c.BaseDeleteCost
+	}
+
+	// Different costs based on node type
+	multiplier := c.getNodeTypeMultiplier(node.Label)
+	return c.BaseDeleteCost * multiplier
+}
+
+// Rename returns the cost of renaming node1 to node2
+func (c *PythonCostModel) Rename(node1, node2 *coreapted.TreeNode) float64 {
+	if node1 == nil || node2 == nil {
+		return c.BaseRenameCost
+	}
+
+	// If labels are identical, no cost
+	if node1.Label == node2.Label {
+		return 0.0
+	}
+
+	// Apply ignore patterns
+	if c.shouldIgnoreDifference(node1.Label, node2.Label) {
+		return 0.0
+	}
+
+	// Check if both nodes are of similar types
+	similarity := c.calculateLabelSimilarity(node1.Label, node2.Label)
+
+	// Scale rename cost based on similarity
+	return c.BaseRenameCost * (1.0 - similarity)
+}
+
+// getNodeTypeMultiplier returns a cost multiplier based on the node type
+func (c *PythonCostModel) getNodeTypeMultiplier(label string) float64 {
+	// Boilerplate nodes (type annotations, decorators, Field() calls) get very low weight
+	// This reduces false positives for framework patterns like dataclasses and Pydantic
+	// Uses the shared IsBoilerplateLabel function to avoid duplication
+	if c.ReduceBoilerplateWeight && IsBoilerplateLabel(label) {
+		return c.BoilerplateMultiplier
+	}
+
+	// Structural nodes are more expensive to modify
+	if c.isStructuralNode(label) {
+		return 1.5
+	}
+
+	// Control flow nodes are expensive
+	if c.isControlFlowNode(label) {
+		return 1.3
+	}
+
+	// Expression nodes are less expensive
+	if c.isExpressionNode(label) {
+		return 0.8
+	}
+
+	// Literals and identifiers can be very cheap if configured to ignore
+	if c.isLiteralNode(label) && c.IgnoreLiterals {
+		return 0.1
+	}
+
+	if c.isIdentifierNode(label) && c.IgnoreIdentifiers {
+		return 0.2
+	}
+
+	return 1.0 // Default multiplier
+}
+
+// isStructuralNode checks if a node represents a structural element
+func (c *PythonCostModel) isStructuralNode(label string) bool {
+	structuralNodes := []string{
+		"FunctionDef", "AsyncFunctionDef", "ClassDef", "Module",
+		"Arguments", "Arg", "Decorator",
+	}
+
+	for _, nodeType := range structuralNodes {
+		if strings.HasPrefix(label, nodeType) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isControlFlowNode checks if a node represents a control flow element
+func (c *PythonCostModel) isControlFlowNode(label string) bool {
+	controlFlowNodes := []string{
+		"If", "For", "While", "Try", "With", "Match",
+		"AsyncFor", "AsyncWith", "ExceptHandler",
+		"Break", "Continue", "Return", "Raise",
+	}
+
+	for _, nodeType := range controlFlowNodes {
+		if strings.HasPrefix(label, nodeType) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isExpressionNode checks if a node represents an expression
+func (c *PythonCostModel) isExpressionNode(label string) bool {
+	expressionNodes := []string{
+		"BinOp", "UnaryOp", "BoolOp", "Compare", "Call",
+		"Attribute", "Subscript", "List", "Tuple", "Dict", "Set",
+		"Lambda", "IfExp", "ListComp", "SetComp", "DictComp", "GeneratorExp",
+	}
+
+	for _, nodeType := range expressionNodes {
+		if strings.HasPrefix(label, nodeType) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isLiteralNode checks if a node represents a literal value
+func (c *PythonCostModel) isLiteralNode(label string) bool {
+	return strings.HasPrefix(label, "Constant(")
+}
+
+// isIdentifierNode checks if a node represents an identifier
+func (c *PythonCostModel) isIdentifierNode(label string) bool {
+	return strings.HasPrefix(label, "Name(")
+}
+
+// shouldIgnoreDifference determines if the difference between two labels should be ignored
+func (c *PythonCostModel) shouldIgnoreDifference(label1, label2 string) bool {
+	// Ignore literal differences if configured
+	if c.IgnoreLiterals && c.isLiteralNode(label1) && c.isLiteralNode(label2) {
+		return true
+	}
+
+	// Ignore identifier differences if configured
+	if c.IgnoreIdentifiers && c.isIdentifierNode(label1) && c.isIdentifierNode(label2) {
+		return true
+	}
+
+	return false
+}
+
+// calculateLabelSimilarity calculates similarity between two node labels.
+// Returns a value in [0, 1] that reduces the rename cost.
+// Lower values = higher rename cost = stricter clone detection.
+func (c *PythonCostModel) calculateLabelSimilarity(label1, label2 string) float64 {
+	// Extract base node types (remove parenthetical content)
+	baseType1 := c.extractBaseNodeType(label1)
+	baseType2 := c.extractBaseNodeType(label2)
+
+	// If base types are identical, moderate similarity
+	// This ensures renaming Name(foo) -> Name(bar) still has meaningful cost (0.7)
+	if baseType1 == baseType2 {
+		// For top-level definitions, names matter significantly.
+		// Different names = no similarity = full rename cost.
+		if c.isTopLevelDefinition(baseType1) {
+			name1 := c.extractNameFromLabel(label1)
+			name2 := c.extractNameFromLabel(label2)
+			if name1 != name2 {
+				return 0.0
+			}
+		}
+		return 0.3
+	}
+
+	// Check for related node types (e.g., For/AsyncFor)
+	if c.areRelatedNodeTypes(baseType1, baseType2) {
+		return 0.2
+	}
+
+	// Check for same category (e.g., both control flow)
+	if c.areSameCategory(baseType1, baseType2) {
+		return 0.1
+	}
+
+	return 0.0 // No similarity - full rename cost
+}
+
+// extractBaseNodeType extracts the base node type from a label
+func (c *PythonCostModel) extractBaseNodeType(label string) string {
+	if idx := strings.Index(label, "("); idx != -1 {
+		return label[:idx]
+	}
+	return label
+}
+
+// isTopLevelDefinition checks if a node type represents a top-level definition
+// where the name is semantically significant for clone detection.
+// Note: AsyncFunctionDef is included for consistency with isStructuralNode,
+// though the tree converter normalizes async functions to FunctionDef labels.
+func (c *PythonCostModel) isTopLevelDefinition(baseType string) bool {
+	return baseType == "ClassDef" || baseType == "FunctionDef" || baseType == "AsyncFunctionDef"
+}
+
+// extractNameFromLabel extracts the name from a label like "ClassDef(MyClass)" -> "MyClass"
+func (c *PythonCostModel) extractNameFromLabel(label string) string {
+	start := strings.Index(label, "(")
+	end := strings.LastIndex(label, ")")
+	if start != -1 && end > start {
+		return label[start+1 : end]
+	}
+	return ""
+}
+
+// areRelatedNodeTypes checks if two node types are related
+func (c *PythonCostModel) areRelatedNodeTypes(type1, type2 string) bool {
+	relatedPairs := [][2]string{
+		{"FunctionDef", "AsyncFunctionDef"},
+		{"For", "AsyncFor"},
+		{"With", "AsyncWith"},
+		{"BinOp", "UnaryOp"},
+		{"List", "Tuple"},
+		{"ListComp", "GeneratorExp"},
+		{"If", "IfExp"},
+	}
+
+	for _, pair := range relatedPairs {
+		if (type1 == pair[0] && type2 == pair[1]) || (type1 == pair[1] && type2 == pair[0]) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// areSameCategory checks if two node types belong to the same category
+func (c *PythonCostModel) areSameCategory(type1, type2 string) bool {
+	if c.isStructuralNode(type1) && c.isStructuralNode(type2) {
+		return true
+	}
+
+	if c.isControlFlowNode(type1) && c.isControlFlowNode(type2) {
+		return true
+	}
+
+	if c.isExpressionNode(type1) && c.isExpressionNode(type2) {
+		return true
+	}
+
+	return false
+}

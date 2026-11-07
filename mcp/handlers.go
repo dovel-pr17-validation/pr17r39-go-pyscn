@@ -1,0 +1,1526 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/ludo-technologies/pyscn/app"
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/service"
+	"github.com/mark3labs/mcp-go/mcp"
+)
+
+// HandlerSet exposes MCP tool handlers with shared dependencies.
+type HandlerSet struct {
+	deps *Dependencies
+}
+
+type healthScorePayload struct {
+	HealthScore    int                         `json:"health_score"`
+	Grade          string                      `json:"grade"`
+	IsHealthy      bool                        `json:"is_healthy"`
+	Partial        bool                        `json:"partial"`
+	Diagnostics    []domain.AnalysisDiagnostic `json:"diagnostics"`
+	Failures       []domain.AnalysisFailure    `json:"failures"`
+	CategoryScores healthCategoryScores        `json:"category_scores"`
+	Summary        healthScoreSummary          `json:"summary"`
+}
+
+type healthCategoryScores struct {
+	Complexity   int  `json:"complexity_score"`
+	DeadCode     int  `json:"dead_code_score"`
+	Duplication  int  `json:"duplication_score"`
+	Coupling     int  `json:"coupling_score"`
+	Cohesion     int  `json:"cohesion_score"`
+	Dependency   int  `json:"dependency_score"`
+	Architecture int  `json:"architecture_score"`
+	Community    *int `json:"community_score,omitempty"`
+}
+
+type healthScoreSummary struct {
+	TotalFiles                    int     `json:"total_files"`
+	AnalyzedFiles                 int     `json:"analyzed_files"`
+	SkippedFiles                  int     `json:"skipped_files"`
+	AverageComplexity             float64 `json:"average_complexity"`
+	HighComplexityCount           int     `json:"high_complexity_count"`
+	TotalClassScopes              int     `json:"total_class_scopes"`
+	MaxClassComplexity            int     `json:"max_class_complexity"`
+	MaxClassCognitiveComplexity   int     `json:"max_class_cognitive_complexity"`
+	MaxClassNestingDepth          int     `json:"max_class_nesting_depth"`
+	HighComplexityClassScopeCount int     `json:"high_complexity_class_scope_count"`
+	DeadCodeCount                 int     `json:"dead_code_count"`
+	ClonePairs                    int     `json:"clone_pairs"`
+	HighCouplingClasses           int     `json:"high_coupling_classes"`
+	HighLCOMClasses               int     `json:"high_lcom_classes"`
+	CommunityRiskScore            *int    `json:"community_risk_score,omitempty"`
+}
+
+// NewHandlerSet constructs a handler set.
+func NewHandlerSet(deps *Dependencies) *HandlerSet {
+	if deps == nil {
+		deps = NewDependencies(nil, "")
+	}
+	return &HandlerSet{deps: deps}
+}
+
+// HandleAnalyzeCode handles the analyze_code tool
+func (h *HandlerSet) HandleAnalyzeCode(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Parse arguments with type assertion
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	// Validate path exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	// Parse analyses array
+	analyses := []string{}
+	if rawAnalyses, ok := args["analyses"].([]interface{}); ok {
+		for _, a := range rawAnalyses {
+			if str, ok := a.(string); ok {
+				analyses = append(analyses, str)
+			}
+		}
+	}
+
+	var recursiveOverride *bool
+	if rawRecursive, exists := args["recursive"]; exists {
+		recursive, ok := rawRecursive.(bool)
+		if !ok {
+			return mcp.NewToolResultError("recursive parameter must be a boolean"), nil
+		}
+		recursiveOverride = &recursive
+	}
+
+	// Create config for analyze use case
+	config := app.ApplyAnalyzeSelection(app.AnalyzeUseCaseConfig{
+		MinComplexity:   1,
+		MinSeverity:     domain.DeadCodeSeverityWarning,
+		CloneSimilarity: 0.8,
+		ConfigFile:      h.deps.ConfigPath(),
+	}, analyses)
+	if cfg := h.deps.Config(); cfg != nil {
+		if cfg.Output.MinComplexity > 0 {
+			config.MinComplexity = cfg.Output.MinComplexity
+		}
+		switch cfg.DeadCode.MinSeverity {
+		case "info":
+			config.MinSeverity = domain.DeadCodeSeverityInfo
+		case "critical", "error":
+			config.MinSeverity = domain.DeadCodeSeverityCritical
+		default:
+			config.MinSeverity = domain.DeadCodeSeverityWarning
+		}
+		if cfg.Clones != nil && cfg.Clones.Thresholds.SimilarityThreshold > 0 {
+			config.CloneSimilarity = cfg.Clones.Thresholds.SimilarityThreshold
+		}
+	}
+
+	// Build analyze use case using builder pattern
+	analyzeUC, err := h.deps.BuildAnalyzeUseCase()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create analyzer: %v", err)), nil
+	}
+
+	// Collect files
+	paths := []string{path}
+
+	// Execute analysis
+	result, err := analyzeUC.ExecuteWithOverrides(ctx, config, paths, app.AnalyzeRequestOverrides{
+		Recursive: recursiveOverride,
+	})
+	if err != nil && result == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("analysis failed: %v", err)), nil
+	}
+
+	// Parse output_mode parameter (default: "summary")
+	outputMode := "summary"
+	if om, ok := args["output_mode"].(string); ok {
+		outputMode = om
+	}
+
+	// Format output based on mode
+	diagnostics, failures, incomplete := analysisResultState(result, err)
+	var responseData interface{}
+	switch outputMode {
+	case "full":
+		responseData = result
+	default: // "summary" - return health score and high-level metrics
+		responseData = map[string]interface{}{
+			"health_score": result.Summary.HealthScore,
+			"grade":        result.Summary.Grade,
+			"is_healthy":   result.Summary.IsHealthy() && !incomplete,
+			"partial":      incomplete,
+			"diagnostics":  diagnostics,
+			"failures":     failures,
+			"summary": map[string]interface{}{
+				"total_files":                       result.Summary.TotalFiles,
+				"analyzed_files":                    result.Summary.AnalyzedFiles,
+				"skipped_files":                     result.Summary.SkippedFiles,
+				"total_functions":                   result.Summary.TotalFunctions,
+				"total_class_scopes":                result.Summary.TotalClassScopes,
+				"high_complexity_class_scope_count": result.Summary.HighComplexityClassScopeCount,
+				"functions_parsed":                  result.Summary.FunctionsParsed,
+				"complexity_score":                  result.Summary.ComplexityScore,
+				"dead_code_score":                   result.Summary.DeadCodeScore,
+				"duplication_score":                 result.Summary.DuplicationScore,
+				"coupling_score":                    result.Summary.CouplingScore,
+				"cohesion_score":                    result.Summary.CohesionScore,
+				"dependency_score":                  result.Summary.DependencyScore,
+				"high_complexity_count":             result.Summary.HighComplexityCount,
+				"dead_code_count":                   result.Summary.DeadCodeCount,
+				"clone_pairs":                       result.Summary.ClonePairs,
+				"high_coupling_classes":             result.Summary.HighCouplingClasses,
+				"high_lcom_classes":                 result.Summary.HighLCOMClasses,
+			},
+		}
+	}
+
+	// Surface community scores in summary mode only when communities ran.
+	if m, ok := responseData.(map[string]interface{}); ok && result.Summary.CommunityScored {
+		if sum, ok := m["summary"].(map[string]interface{}); ok {
+			sum["community_score"] = result.Summary.CommunityScore
+			sum["community_risk_score"] = result.Summary.CommunityRiskScore
+		}
+	}
+
+	// Convert result to JSON
+	jsonData, err := json.Marshal(responseData)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	toolResult := mcp.NewToolResultText(string(jsonData))
+	toolResult.IsError = incomplete
+	return toolResult, nil
+}
+
+// HandleCheckComplexity handles the check_complexity tool
+func (h *HandlerSet) HandleCheckComplexity(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	// Parse optional parameters
+	cfg := h.deps.Config()
+
+	minComplexity := 1
+	if cfg != nil && cfg.Output.MinComplexity > 0 {
+		minComplexity = cfg.Output.MinComplexity
+	}
+	if mc, ok := args["min_complexity"].(float64); ok {
+		minComplexity = int(mc)
+	}
+
+	maxComplexity := 0
+	if cfg != nil && cfg.Complexity.MaxComplexity > 0 {
+		maxComplexity = cfg.Complexity.MaxComplexity
+	}
+	if mc, ok := args["max_complexity"].(float64); ok {
+		maxComplexity = int(mc)
+	}
+
+	showDetails := true
+	if cfg != nil {
+		showDetails = cfg.Output.ShowDetails
+	}
+	if sd, ok := args["show_details"].(bool); ok {
+		showDetails = sd
+	}
+
+	lowThreshold := 9
+	mediumThreshold := 19
+	if cfg != nil {
+		if cfg.Complexity.LowThreshold > 0 {
+			lowThreshold = cfg.Complexity.LowThreshold
+		}
+		if cfg.Complexity.MediumThreshold > 0 {
+			mediumThreshold = cfg.Complexity.MediumThreshold
+		}
+	}
+
+	sortBy := domain.SortByComplexity
+	if cfg != nil {
+		switch cfg.Output.SortBy {
+		case "name":
+			sortBy = domain.SortByName
+		case "risk":
+			sortBy = domain.SortByRisk
+		}
+	}
+
+	includePatterns := []string{}
+	excludePatterns := []string{}
+	if cfg != nil {
+		if len(cfg.Analysis.IncludePatterns) > 0 {
+			includePatterns = cfg.Analysis.IncludePatterns
+		}
+		if len(cfg.Analysis.ExcludePatterns) > 0 {
+			excludePatterns = cfg.Analysis.ExcludePatterns
+		}
+	}
+
+	// Create complexity request
+	req := domain.ComplexityRequest{
+		Paths:           []string{path},
+		MinComplexity:   minComplexity,
+		MaxComplexity:   maxComplexity,
+		ShowDetails:     domain.BoolPtr(showDetails),
+		Recursive:       domain.BoolPtr(cfg == nil || cfg.Analysis.Recursive),
+		OutputFormat:    domain.OutputFormatJSON,
+		OutputWriter:    io.Discard,
+		LowThreshold:    lowThreshold,
+		MediumThreshold: mediumThreshold,
+		SortBy:          sortBy,
+		IncludePatterns: includePatterns,
+		ExcludePatterns: excludePatterns,
+		ConfigPath:      h.deps.ConfigPath(),
+	}
+
+	// Build use case with all required dependencies
+	complexityService := service.NewComplexityService()
+	fileReader := service.NewFileReader()
+	formatter := service.NewOutputFormatter()
+	configLoader := service.NewConfigurationLoader()
+
+	useCase := app.NewComplexityUseCase(
+		complexityService,
+		fileReader,
+		formatter,
+		configLoader,
+	)
+
+	// Execute analysis
+	result, err := useCase.AnalyzeAndReturn(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("complexity analysis failed: %v", err)), nil
+	}
+
+	// Parse output_mode parameter (default: "summary")
+	outputMode := "summary"
+	if om, ok := args["output_mode"].(string); ok {
+		outputMode = om
+	}
+
+	// Parse max_results parameter (default: unlimited for summary mode)
+	maxResults := 0
+	if mr, ok := args["max_results"].(float64); ok {
+		maxResults = int(mr)
+	}
+
+	// Format output based on mode
+	var responseData interface{}
+	switch outputMode {
+	case "full":
+		responseData = result
+	case "detailed":
+		responseData, err = formatComplexityDetailed(result, maxComplexity, maxResults)
+	default: // "summary"
+		responseData, err = formatComplexitySummary(result, maxComplexity, maxResults)
+	}
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid complexity result: %v", err)), nil
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(responseData)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(jsonData)), nil
+}
+
+// HandleDetectClones handles the detect_clones tool
+func (h *HandlerSet) HandleDetectClones(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	// Sparse request: only tool arguments are explicit overrides; zero
+	// values are filled from the config file (or defaults) during
+	// MergeConfig inside the use case.
+	req := &domain.CloneRequest{}
+	if st, ok := args["similarity_threshold"].(float64); ok {
+		req.SimilarityThreshold = st
+	}
+	if ml, ok := args["min_lines"].(float64); ok {
+		req.MinLines = int(ml)
+	}
+	if gc, ok := args["group_clones"].(bool); ok {
+		req.GroupClones = domain.BoolPtr(gc)
+	}
+
+	req.Paths = []string{path}
+	req.OutputFormat = domain.OutputFormatJSON
+	req.OutputWriter = io.Discard
+	req.ConfigPath = h.deps.ConfigPath()
+
+	// Build use case with all required dependencies
+	cloneService := service.NewCloneService()
+	fileReader := service.NewFileReader()
+	formatter := service.NewCloneOutputFormatter()
+	configLoader := service.NewCloneConfigurationLoader()
+
+	useCase := app.NewCloneUseCase(
+		cloneService,
+		fileReader,
+		formatter,
+		configLoader,
+	)
+
+	// Execute analysis
+	result, err := useCase.ExecuteAndReturn(ctx, *req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("clone detection failed: %v", err)), nil
+	}
+
+	// Parse output_mode parameter (default: "summary")
+	outputMode := "summary"
+	if om, ok := args["output_mode"].(string); ok {
+		outputMode = om
+	}
+
+	// Parse max_results parameter
+	maxResults := 0
+	if mr, ok := args["max_results"].(float64); ok {
+		maxResults = int(mr)
+	}
+
+	// Format output based on mode
+	var responseData interface{}
+	switch outputMode {
+	case "full":
+		responseData = result
+	case "detailed":
+		responseData = formatClonesDetailed(result, maxResults)
+	default: // "summary"
+		responseData = formatClonesSummary(result, maxResults)
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(responseData)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(jsonData)), nil
+}
+
+// HandleCheckCoupling handles the check_coupling tool
+func (h *HandlerSet) HandleCheckCoupling(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	cfg := h.deps.Config()
+	req := domain.DefaultCBORequest() // Already sets LowThreshold and MediumThreshold from domain defaults
+	req.Paths = []string{path}
+	req.OutputFormat = domain.OutputFormatJSON
+	req.OutputWriter = io.Discard
+	req.ConfigPath = h.deps.ConfigPath()
+	req.SortBy = domain.SortByCoupling
+
+	if cfg != nil {
+		req.Recursive = domain.BoolPtr(cfg.Analysis.Recursive)
+		if len(cfg.Analysis.IncludePatterns) > 0 {
+			req.IncludePatterns = cfg.Analysis.IncludePatterns
+		}
+		if len(cfg.Analysis.ExcludePatterns) > 0 {
+			req.ExcludePatterns = cfg.Analysis.ExcludePatterns
+		}
+	}
+
+	// Build use case with all required dependencies
+	cboService := service.NewCBOService()
+	fileReader := service.NewFileReader()
+	formatter := service.NewCBOFormatter()
+
+	useCase := app.NewCBOUseCase(
+		cboService,
+		fileReader,
+		formatter,
+		nil, // CBO config loader is optional
+	)
+
+	// Execute analysis
+	result, err := useCase.AnalyzeAndReturn(ctx, *req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("coupling analysis failed: %v", err)), nil
+	}
+
+	// Parse output_mode parameter (default: "summary")
+	outputMode := "summary"
+	if om, ok := args["output_mode"].(string); ok {
+		outputMode = om
+	}
+
+	// Parse max_results parameter
+	maxResults := 0
+	if mr, ok := args["max_results"].(float64); ok {
+		maxResults = int(mr)
+	}
+
+	// Parse min_cbo parameter (default threshold for filtering)
+	minCBO := 10
+	if mc, ok := args["min_cbo"].(float64); ok {
+		minCBO = int(mc)
+	}
+
+	// Format output based on mode
+	var responseData interface{}
+	switch outputMode {
+	case "full":
+		responseData = result
+	case "detailed":
+		responseData = formatCouplingDetailed(result, minCBO, maxResults)
+	default: // "summary"
+		responseData = formatCouplingSummary(result, minCBO, maxResults)
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(responseData)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(jsonData)), nil
+}
+
+// HandleCheckCohesion handles the check_cohesion tool
+func (h *HandlerSet) HandleCheckCohesion(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	cfg := h.deps.Config()
+	req := &domain.LCOMRequest{
+		Paths:           []string{path},
+		OutputFormat:    domain.OutputFormatJSON,
+		OutputWriter:    io.Discard,
+		ConfigPath:      h.deps.ConfigPath(),
+		SortBy:          domain.SortByCohesion,
+		LowThreshold:    0, // Zero: let config file values take precedence via merge
+		MediumThreshold: 0, // Zero: let config file values take precedence via merge
+	}
+
+	if cfg != nil {
+		req.Recursive = domain.BoolPtr(cfg.Analysis.Recursive)
+		if len(cfg.Analysis.IncludePatterns) > 0 {
+			req.IncludePatterns = cfg.Analysis.IncludePatterns
+		}
+		if len(cfg.Analysis.ExcludePatterns) > 0 {
+			req.ExcludePatterns = cfg.Analysis.ExcludePatterns
+		}
+	}
+
+	// Build use case with all required dependencies
+	lcomService := service.NewLCOMService()
+	fileReader := service.NewFileReader()
+	formatter := service.NewLCOMFormatter()
+
+	lcomConfigLoader := service.NewLCOMConfigurationLoader()
+	useCase := app.NewLCOMUseCase(
+		lcomService,
+		fileReader,
+		formatter,
+		lcomConfigLoader,
+	)
+
+	// Execute analysis
+	result, err := useCase.AnalyzeAndReturn(ctx, *req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("cohesion analysis failed: %v", err)), nil
+	}
+
+	// Parse output_mode parameter (default: "summary")
+	outputMode := "summary"
+	if om, ok := args["output_mode"].(string); ok {
+		outputMode = om
+	}
+
+	// Parse max_results parameter
+	maxResults := 0
+	if mr, ok := args["max_results"].(float64); ok {
+		maxResults = int(mr)
+	}
+
+	// Format output based on mode
+	var responseData interface{}
+	switch outputMode {
+	case "full":
+		responseData = result
+	case "detailed":
+		responseData = formatCohesionDetailed(result, maxResults)
+	default: // "summary"
+		responseData = formatCohesionSummary(result, maxResults)
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(responseData)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(jsonData)), nil
+}
+
+// HandleFindDeadCode handles the find_dead_code tool
+func (h *HandlerSet) HandleFindDeadCode(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	// Parse min_severity
+	cfg := h.deps.Config()
+	minSeverity := domain.DeadCodeSeverityWarning
+	if cfg != nil {
+		switch cfg.DeadCode.MinSeverity {
+		case "info":
+			minSeverity = domain.DeadCodeSeverityInfo
+		case "critical", "error":
+			minSeverity = domain.DeadCodeSeverityCritical
+		}
+	}
+	if ms, ok := args["min_severity"].(string); ok {
+		switch ms {
+		case "info":
+			minSeverity = domain.DeadCodeSeverityInfo
+		case "warning":
+			minSeverity = domain.DeadCodeSeverityWarning
+		case "critical", "error":
+			minSeverity = domain.DeadCodeSeverityCritical
+		}
+	}
+
+	// Create dead code request
+	req := domain.DeadCodeRequest{
+		Paths:        []string{path},
+		MinSeverity:  minSeverity,
+		Recursive:    domain.BoolPtr(true),
+		OutputFormat: domain.OutputFormatJSON,
+		OutputWriter: io.Discard,
+		SortBy:       domain.DeadCodeSortBySeverity,
+		ConfigPath:   h.deps.ConfigPath(),
+	}
+	if cfg != nil {
+		req.Recursive = domain.BoolPtr(cfg.Analysis.Recursive)
+		if len(cfg.Analysis.IncludePatterns) > 0 {
+			req.IncludePatterns = cfg.Analysis.IncludePatterns
+		}
+		if len(cfg.Analysis.ExcludePatterns) > 0 {
+			req.ExcludePatterns = cfg.Analysis.ExcludePatterns
+		}
+	}
+
+	// Build use case with all required dependencies
+	deadCodeService := service.NewDeadCodeService()
+	fileReader := service.NewFileReader()
+	formatter := service.NewDeadCodeFormatter()
+	configLoader := service.NewDeadCodeConfigurationLoader()
+
+	useCase := app.NewDeadCodeUseCase(
+		deadCodeService,
+		fileReader,
+		formatter,
+		configLoader,
+	)
+
+	// Execute analysis
+	result, err := useCase.AnalyzeAndReturn(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("dead code analysis failed: %v", err)), nil
+	}
+
+	// Parse output_mode parameter (default: "summary")
+	outputMode := "summary"
+	if om, ok := args["output_mode"].(string); ok {
+		outputMode = om
+	}
+
+	// Parse max_results parameter
+	maxResults := 0
+	if mr, ok := args["max_results"].(float64); ok {
+		maxResults = int(mr)
+	}
+
+	// Format output based on mode
+	var responseData interface{}
+	switch outputMode {
+	case "full":
+		responseData = result
+	case "detailed":
+		responseData = formatDeadCodeDetailed(result, maxResults)
+	default: // "summary"
+		responseData = formatDeadCodeSummary(result, maxResults)
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(responseData)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(jsonData)), nil
+}
+
+// HandleGetHealthScore handles the get_health_score tool
+func (h *HandlerSet) HandleGetHealthScore(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	// Run comprehensive analysis to get health score
+	analyzeUC, err := h.deps.BuildAnalyzeUseCase()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create analyzer: %v", err)), nil
+	}
+
+	config := app.AnalyzeUseCaseConfig{
+		SkipComplexity:  false,
+		SkipDeadCode:    false,
+		SkipClones:      false,
+		SkipCBO:         false,
+		SkipLCOM:        false,
+		MinSeverity:     domain.DeadCodeSeverityWarning,
+		MinComplexity:   1,
+		CloneSimilarity: 0.8,
+		ConfigFile:      h.deps.ConfigPath(),
+	}
+	if cfg := h.deps.Config(); cfg != nil {
+		if cfg.Output.MinComplexity > 0 {
+			config.MinComplexity = cfg.Output.MinComplexity
+		}
+		switch cfg.DeadCode.MinSeverity {
+		case "info":
+			config.MinSeverity = domain.DeadCodeSeverityInfo
+		case "critical", "error":
+			config.MinSeverity = domain.DeadCodeSeverityCritical
+		default:
+			config.MinSeverity = domain.DeadCodeSeverityWarning
+		}
+		if cfg.Clones != nil && cfg.Clones.Thresholds.SimilarityThreshold > 0 {
+			config.CloneSimilarity = cfg.Clones.Thresholds.SimilarityThreshold
+		}
+	}
+
+	result, err := analyzeUC.Execute(ctx, config, []string{path})
+	if err != nil && result == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("analysis failed: %v", err)), nil
+	}
+	healthScoreResult, incomplete := newHealthScorePayload(result, err)
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(healthScoreResult)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	toolResult := mcp.NewToolResultText(string(jsonData))
+	toolResult.IsError = incomplete
+	return toolResult, nil
+}
+
+func analysisResultState(result *domain.AnalyzeResponse, executionErr error) ([]domain.AnalysisDiagnostic, []domain.AnalysisFailure, bool) {
+	diagnostics := result.Diagnostics
+	if diagnostics == nil {
+		diagnostics = []domain.AnalysisDiagnostic{}
+	}
+	failures := result.Failures
+	if failures == nil {
+		failures = []domain.AnalysisFailure{}
+	}
+	incomplete := executionErr != nil || result.Summary.SkippedFiles > 0 || len(failures) > 0
+	return diagnostics, failures, incomplete
+}
+
+func newHealthScorePayload(result *domain.AnalyzeResponse, executionErr error) (healthScorePayload, bool) {
+	diagnostics, failures, incomplete := analysisResultState(result, executionErr)
+	payload := healthScorePayload{
+		HealthScore: result.Summary.HealthScore,
+		Grade:       result.Summary.Grade,
+		IsHealthy:   result.Summary.IsHealthy() && !incomplete,
+		Partial:     incomplete,
+		Diagnostics: diagnostics,
+		Failures:    failures,
+		CategoryScores: healthCategoryScores{
+			Complexity:   result.Summary.ComplexityScore,
+			DeadCode:     result.Summary.DeadCodeScore,
+			Duplication:  result.Summary.DuplicationScore,
+			Coupling:     result.Summary.CouplingScore,
+			Cohesion:     result.Summary.CohesionScore,
+			Dependency:   result.Summary.DependencyScore,
+			Architecture: result.Summary.ArchitectureScore,
+		},
+		Summary: healthScoreSummary{
+			TotalFiles:                    result.Summary.TotalFiles,
+			AnalyzedFiles:                 result.Summary.AnalyzedFiles,
+			SkippedFiles:                  result.Summary.SkippedFiles,
+			AverageComplexity:             result.Summary.AverageComplexity,
+			HighComplexityCount:           result.Summary.HighComplexityCount,
+			TotalClassScopes:              result.Summary.TotalClassScopes,
+			MaxClassComplexity:            result.Summary.MaxClassComplexity,
+			MaxClassCognitiveComplexity:   result.Summary.MaxClassCognitiveComplexity,
+			MaxClassNestingDepth:          result.Summary.MaxClassNestingDepth,
+			HighComplexityClassScopeCount: result.Summary.HighComplexityClassScopeCount,
+			DeadCodeCount:                 result.Summary.DeadCodeCount,
+			ClonePairs:                    result.Summary.ClonePairs,
+			HighCouplingClasses:           result.Summary.HighCouplingClasses,
+			HighLCOMClasses:               result.Summary.HighLCOMClasses,
+		},
+	}
+	if result.Summary.CommunityScored {
+		payload.CategoryScores.Community = &result.Summary.CommunityScore
+		payload.Summary.CommunityRiskScore = &result.Summary.CommunityRiskScore
+	}
+	return payload, incomplete
+}
+
+// Helper functions
+
+// formatComplexitySummary formats complexity results in compact summary mode
+func formatComplexitySummary(result *domain.ComplexityResponse, threshold int, maxResults int) (map[string]interface{}, error) {
+	issues := []string{}
+
+	// Default threshold to 10 if not specified
+	if threshold == 0 {
+		threshold = 10
+	}
+
+	analysis, err := analyzeComplexityGate(result, threshold, maxResults)
+	if err != nil {
+		return nil, err
+	}
+	for _, scope := range analysis.Issues {
+		issue := fmt.Sprintf("%s:%d:%d: %s is too complex (%d > %d)",
+			scope.FilePath, scope.StartLine, scope.StartColumn+1, scope.ScopeLabel(),
+			scope.Metrics.Complexity, threshold)
+		issues = append(issues, issue)
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"total_issues":             analysis.TotalIssues,
+			"total_functions":          result.Summary.TotalFunctions,
+			"total_class_scopes":       result.Summary.TotalClassScopes,
+			"functions_parsed":         result.Summary.FunctionsParsed,
+			"max_complexity":           result.Summary.MaxComplexity,
+			"max_scope_complexity":     analysis.MaxComplexity,
+			"average_complexity":       result.Summary.AverageComplexity,
+			"average_scope_complexity": analysis.AverageComplexity,
+			"threshold":                threshold,
+		},
+	}, nil
+}
+
+// formatComplexityDetailed formats complexity results with structured details
+func formatComplexityDetailed(result *domain.ComplexityResponse, threshold int, maxResults int) (map[string]interface{}, error) {
+	type Issue struct {
+		File       string                   `json:"file"`
+		Line       int                      `json:"line"`
+		Column     int                      `json:"column"`
+		Function   string                   `json:"function"`
+		ScopeKind  domain.AnalysisScopeKind `json:"scope_kind"`
+		Complexity int                      `json:"complexity"`
+		Threshold  int                      `json:"threshold"`
+		Message    string                   `json:"message"`
+	}
+
+	issues := []Issue{}
+
+	if threshold == 0 {
+		threshold = 10
+	}
+
+	analysis, err := analyzeComplexityGate(result, threshold, maxResults)
+	if err != nil {
+		return nil, err
+	}
+	for _, scope := range analysis.Issues {
+		issue := Issue{
+			File:       scope.FilePath,
+			Line:       scope.StartLine,
+			Column:     scope.StartColumn + 1,
+			Function:   scope.Name,
+			ScopeKind:  scope.ScopeKind,
+			Complexity: scope.Metrics.Complexity,
+			Threshold:  threshold,
+			Message:    fmt.Sprintf("is too complex (%d > %d)", scope.Metrics.Complexity, threshold),
+		}
+		issues = append(issues, issue)
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"total_issues":             analysis.TotalIssues,
+			"total_functions":          result.Summary.TotalFunctions,
+			"total_class_scopes":       result.Summary.TotalClassScopes,
+			"functions_parsed":         result.Summary.FunctionsParsed,
+			"max_complexity":           result.Summary.MaxComplexity,
+			"max_scope_complexity":     analysis.MaxComplexity,
+			"average_complexity":       result.Summary.AverageComplexity,
+			"average_scope_complexity": analysis.AverageComplexity,
+			"threshold":                threshold,
+		},
+	}, nil
+}
+
+type complexityGateAnalysis struct {
+	Issues            []domain.FunctionComplexity
+	TotalIssues       int
+	MaxComplexity     int
+	AverageComplexity float64
+}
+
+func analyzeComplexityGate(result *domain.ComplexityResponse, threshold int, maxResults int) (complexityGateAnalysis, error) {
+	analyzedScopes, err := result.AnalyzedScopes()
+	if err != nil {
+		return complexityGateAnalysis{}, err
+	}
+
+	analysis := complexityGateAnalysis{}
+	total := 0
+	for _, scope := range analyzedScopes {
+		total += scope.Metrics.Complexity
+		if scope.Metrics.Complexity > analysis.MaxComplexity {
+			analysis.MaxComplexity = scope.Metrics.Complexity
+		}
+	}
+	if len(analyzedScopes) > 0 {
+		analysis.AverageComplexity = float64(total) / float64(len(analyzedScopes))
+	}
+
+	// Gate findings use the same presentation-filtered population serialized by
+	// full mode. Aggregate scope statistics above intentionally remain complete.
+	for _, scope := range result.ReportedScopesByComplexity() {
+		if scope.Metrics.Complexity > threshold {
+			analysis.TotalIssues++
+			analysis.Issues = append(analysis.Issues, scope)
+		}
+	}
+
+	if maxResults > 0 && len(analysis.Issues) > maxResults {
+		analysis.Issues = analysis.Issues[:maxResults]
+	}
+	return analysis, nil
+}
+
+// formatDeadCodeSummary formats dead code results in compact summary mode
+func formatDeadCodeSummary(result *domain.DeadCodeResponse, maxResults int) map[string]interface{} {
+	issues := []string{}
+	totalIssues := 0
+	criticalCount := 0
+	warningCount := 0
+	infoCount := 0
+
+	for _, file := range result.Files {
+		for _, scope := range file.ExecutionScopes() {
+			for _, finding := range scope.Findings {
+				totalIssues++
+
+				switch finding.Severity {
+				case domain.DeadCodeSeverityCritical:
+					criticalCount++
+				case domain.DeadCodeSeverityWarning:
+					warningCount++
+				case domain.DeadCodeSeverityInfo:
+					infoCount++
+				}
+
+				if maxResults == 0 || len(issues) < maxResults {
+					// Format: "file:line:col: message (severity)"
+					issue := fmt.Sprintf("%s:%d:%d: %s (%s)",
+						finding.Location.FilePath,
+						finding.Location.StartLine,
+						finding.Location.StartColumn+1,
+						finding.Reason,
+						finding.Severity)
+					issues = append(issues, issue)
+				}
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"total_issues":    totalIssues,
+			"critical_issues": criticalCount,
+			"warning_issues":  warningCount,
+			"info_issues":     infoCount,
+			"files_analyzed":  len(result.Files),
+		},
+	}
+}
+
+// formatDeadCodeDetailed formats dead code results with structured details
+func formatDeadCodeDetailed(result *domain.DeadCodeResponse, maxResults int) map[string]interface{} {
+	type Issue struct {
+		File       string                   `json:"file"`
+		Line       int                      `json:"line"`
+		Column     int                      `json:"column"`
+		Function   string                   `json:"function"`
+		ScopeKind  domain.AnalysisScopeKind `json:"scope_kind"`
+		ScopeLabel string                   `json:"scope_label"`
+		Reason     string                   `json:"reason"`
+		Severity   string                   `json:"severity"`
+	}
+
+	issues := []Issue{}
+	totalIssues := 0
+	criticalCount := 0
+	warningCount := 0
+	infoCount := 0
+
+	for _, file := range result.Files {
+		for _, scope := range file.ExecutionScopes() {
+			for _, finding := range scope.Findings {
+				totalIssues++
+
+				switch finding.Severity {
+				case domain.DeadCodeSeverityCritical:
+					criticalCount++
+				case domain.DeadCodeSeverityWarning:
+					warningCount++
+				case domain.DeadCodeSeverityInfo:
+					infoCount++
+				}
+
+				if maxResults == 0 || len(issues) < maxResults {
+					issue := Issue{
+						File:       finding.Location.FilePath,
+						Line:       finding.Location.StartLine,
+						Column:     finding.Location.StartColumn + 1,
+						Function:   scope.Name,
+						ScopeKind:  scope.ScopeKind,
+						ScopeLabel: scope.ScopeLabel(),
+						Reason:     finding.Reason,
+						Severity:   string(finding.Severity),
+					}
+					issues = append(issues, issue)
+				}
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"total_issues":    totalIssues,
+			"critical_issues": criticalCount,
+			"warning_issues":  warningCount,
+			"info_issues":     infoCount,
+			"files_analyzed":  len(result.Files),
+		},
+	}
+}
+
+// formatClonesSummary formats clone detection results in compact summary mode
+func formatClonesSummary(result *domain.CloneResponse, maxResults int) map[string]interface{} {
+	issues := []string{}
+	filesWithClones := make(map[string]bool)
+
+	for _, pair := range result.ClonePairs {
+		filesWithClones[pair.Clone1.Location.FilePath] = true
+		filesWithClones[pair.Clone2.Location.FilePath] = true
+
+		if maxResults == 0 || len(issues) < maxResults {
+			// Format: "file1:line:col: clone of file2:line:col (similarity%)"
+			issue := fmt.Sprintf("%s:%d:%d: clone of %s:%d:%d (%.1f%%)",
+				pair.Clone1.Location.FilePath,
+				pair.Clone1.Location.StartLine,
+				pair.Clone1.Location.StartCol+1,
+				pair.Clone2.Location.FilePath,
+				pair.Clone2.Location.StartLine,
+				pair.Clone2.Location.StartCol+1,
+				pair.Similarity*100)
+			issues = append(issues, issue)
+		}
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"total_clone_pairs":  len(result.ClonePairs),
+			"total_clone_groups": len(result.CloneGroups),
+			"files_with_clones":  len(filesWithClones),
+		},
+	}
+}
+
+// formatClonesDetailed formats clone detection results with structured details
+func formatClonesDetailed(result *domain.CloneResponse, maxResults int) map[string]interface{} {
+	type Issue struct {
+		File1      string  `json:"file1"`
+		Line1      int     `json:"line1"`
+		Col1       int     `json:"col1"`
+		File2      string  `json:"file2"`
+		Line2      int     `json:"line2"`
+		Col2       int     `json:"col2"`
+		Similarity float64 `json:"similarity"`
+		Lines      int     `json:"lines"`
+	}
+
+	issues := []Issue{}
+	filesWithClones := make(map[string]bool)
+
+	for _, pair := range result.ClonePairs {
+		filesWithClones[pair.Clone1.Location.FilePath] = true
+		filesWithClones[pair.Clone2.Location.FilePath] = true
+
+		if maxResults == 0 || len(issues) < maxResults {
+			issue := Issue{
+				File1:      pair.Clone1.Location.FilePath,
+				Line1:      pair.Clone1.Location.StartLine,
+				Col1:       pair.Clone1.Location.StartCol + 1,
+				File2:      pair.Clone2.Location.FilePath,
+				Line2:      pair.Clone2.Location.StartLine,
+				Col2:       pair.Clone2.Location.StartCol + 1,
+				Similarity: pair.Similarity,
+				Lines:      pair.Clone1.Location.EndLine - pair.Clone1.Location.StartLine + 1,
+			}
+			issues = append(issues, issue)
+		}
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"total_clone_pairs":  len(result.ClonePairs),
+			"total_clone_groups": len(result.CloneGroups),
+			"files_with_clones":  len(filesWithClones),
+		},
+	}
+}
+
+// formatCouplingSummary formats coupling results in compact summary mode
+func formatCouplingSummary(result *domain.CBOResponse, threshold int, maxResults int) map[string]interface{} {
+	issues := []string{}
+	highCouplingCount := 0
+	totalCBO := 0
+	maxCBO := 0
+
+	for _, class := range result.Classes {
+		cbo := class.Metrics.CouplingCount
+		if cbo > maxCBO {
+			maxCBO = cbo
+		}
+		totalCBO += cbo
+
+		if cbo > threshold {
+			highCouplingCount++
+
+			// Only add to issues array if within max_results limit
+			if maxResults == 0 || len(issues) < maxResults {
+				// Format: "file:line: ClassName has high coupling (CBO=X)"
+				issue := fmt.Sprintf("%s:%d: %s has high coupling (CBO=%d)",
+					class.FilePath, class.StartLine, class.Name, cbo)
+				issues = append(issues, issue)
+			}
+		}
+	}
+
+	avgCBO := 0.0
+	if len(result.Classes) > 0 {
+		avgCBO = float64(totalCBO) / float64(len(result.Classes))
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"high_coupling_classes": highCouplingCount,
+			"total_classes":         len(result.Classes),
+			"max_cbo":               maxCBO,
+			"average_cbo":           avgCBO,
+			"threshold":             threshold,
+		},
+	}
+}
+
+// formatCouplingDetailed formats coupling results with structured details
+func formatCouplingDetailed(result *domain.CBOResponse, threshold int, maxResults int) map[string]interface{} {
+	type Issue struct {
+		File      string `json:"file"`
+		Line      int    `json:"line"`
+		ClassName string `json:"class_name"`
+		CBO       int    `json:"cbo"`
+		Message   string `json:"message"`
+	}
+
+	issues := []Issue{}
+	highCouplingCount := 0
+	totalCBO := 0
+	maxCBO := 0
+
+	for _, class := range result.Classes {
+		cbo := class.Metrics.CouplingCount
+		if cbo > maxCBO {
+			maxCBO = cbo
+		}
+		totalCBO += cbo
+
+		if cbo > threshold {
+			highCouplingCount++
+
+			// Only add to issues array if within max_results limit
+			if maxResults == 0 || len(issues) < maxResults {
+				issue := Issue{
+					File:      class.FilePath,
+					Line:      class.StartLine,
+					ClassName: class.Name,
+					CBO:       cbo,
+					Message:   fmt.Sprintf("has high coupling (CBO=%d)", cbo),
+				}
+				issues = append(issues, issue)
+			}
+		}
+	}
+
+	avgCBO := 0.0
+	if len(result.Classes) > 0 {
+		avgCBO = float64(totalCBO) / float64(len(result.Classes))
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"high_coupling_classes": highCouplingCount,
+			"total_classes":         len(result.Classes),
+			"max_cbo":               maxCBO,
+			"average_cbo":           avgCBO,
+			"threshold":             threshold,
+		},
+	}
+}
+
+// HandleDetectDIAntipatterns handles the detect_di_antipatterns tool
+func (h *HandlerSet) HandleDetectDIAntipatterns(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments format"), nil
+	}
+
+	path, ok := args["path"].(string)
+	if !ok {
+		return mcp.NewToolResultError("path parameter is required and must be a string"), nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return mcp.NewToolResultError(fmt.Sprintf("path does not exist: %s", path)), nil
+	}
+
+	// Parse optional parameters
+	constructorParamThreshold := 0
+	if cpt, ok := args["constructor_param_threshold"].(float64); ok {
+		constructorParamThreshold = int(cpt)
+	}
+
+	var minSeverity domain.DIAntipatternSeverity
+	if ms, ok := args["min_severity"].(string); ok {
+		switch ms {
+		case "info":
+			minSeverity = domain.DIAntipatternSeverityInfo
+		case "warning":
+			minSeverity = domain.DIAntipatternSeverityWarning
+		case "error":
+			minSeverity = domain.DIAntipatternSeverityError
+		}
+	}
+
+	cfg := h.deps.Config()
+	recursive := true
+	includePatterns := []string{}
+	excludePatterns := []string{}
+	if cfg != nil {
+		recursive = cfg.Analysis.Recursive
+		if len(cfg.Analysis.IncludePatterns) > 0 {
+			includePatterns = cfg.Analysis.IncludePatterns
+		}
+		if len(cfg.Analysis.ExcludePatterns) > 0 {
+			excludePatterns = cfg.Analysis.ExcludePatterns
+		}
+	}
+
+	// Create DI anti-pattern request
+	req := domain.DIAntipatternRequest{
+		Paths:           []string{path},
+		OutputFormat:    domain.OutputFormatJSON,
+		OutputWriter:    io.Discard,
+		Recursive:       domain.BoolPtr(recursive),
+		IncludePatterns: includePatterns,
+		ExcludePatterns: excludePatterns,
+		SortBy:          domain.SortBySeverity,
+		ConfigPath:      h.deps.ConfigPath(),
+	}
+	if constructorParamThreshold > 0 {
+		req.ConstructorParamThreshold = constructorParamThreshold
+	}
+	if minSeverity != "" {
+		req.MinSeverity = minSeverity
+	}
+
+	// Build use case with all required dependencies
+	diService := service.NewDIAntipatternService()
+	fileReader := service.NewFileReader()
+	formatter := service.NewDIAntipatternFormatter()
+	configLoader := service.NewDIAntipatternConfigurationLoader()
+
+	useCase := app.NewDIAntipatternUseCase(
+		diService,
+		fileReader,
+		formatter,
+		configLoader,
+	)
+
+	// Execute analysis
+	result, err := useCase.AnalyzeAndReturn(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("DI anti-pattern analysis failed: %v", err)), nil
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(jsonData)), nil
+}
+
+// formatCohesionSummary formats cohesion results in compact summary mode
+func formatCohesionSummary(result *domain.LCOMResponse, maxResults int) map[string]interface{} {
+	issues := []string{}
+	highLCOMCount := 0
+	totalLCOM := 0
+	maxLCOM := 0
+
+	for _, class := range result.Classes {
+		lcom := class.Metrics.LCOM4
+		if lcom > maxLCOM {
+			maxLCOM = lcom
+		}
+		totalLCOM += lcom
+
+		if class.RiskLevel == domain.RiskLevelHigh {
+			highLCOMCount++
+
+			if maxResults == 0 || len(issues) < maxResults {
+				issue := fmt.Sprintf("%s:%d: %s has low cohesion (LCOM4=%d)",
+					class.FilePath, class.StartLine, class.Name, lcom)
+				issues = append(issues, issue)
+			}
+		}
+	}
+
+	avgLCOM := 0.0
+	if len(result.Classes) > 0 {
+		avgLCOM = float64(totalLCOM) / float64(len(result.Classes))
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"high_lcom_classes": highLCOMCount,
+			"total_classes":     len(result.Classes),
+			"max_lcom":          maxLCOM,
+			"average_lcom":      avgLCOM,
+		},
+	}
+}
+
+// formatCohesionDetailed formats cohesion results with structured details
+func formatCohesionDetailed(result *domain.LCOMResponse, maxResults int) map[string]interface{} {
+	type Issue struct {
+		File      string `json:"file"`
+		Line      int    `json:"line"`
+		ClassName string `json:"class_name"`
+		LCOM4     int    `json:"lcom4"`
+		RiskLevel string `json:"risk_level"`
+		Message   string `json:"message"`
+	}
+
+	issues := []Issue{}
+	highLCOMCount := 0
+	totalLCOM := 0
+	maxLCOM := 0
+
+	for _, class := range result.Classes {
+		lcom := class.Metrics.LCOM4
+		if lcom > maxLCOM {
+			maxLCOM = lcom
+		}
+		totalLCOM += lcom
+
+		if class.RiskLevel == domain.RiskLevelHigh || class.RiskLevel == domain.RiskLevelMedium {
+			if class.RiskLevel == domain.RiskLevelHigh {
+				highLCOMCount++
+			}
+
+			if maxResults == 0 || len(issues) < maxResults {
+				issue := Issue{
+					File:      class.FilePath,
+					Line:      class.StartLine,
+					ClassName: class.Name,
+					LCOM4:     lcom,
+					RiskLevel: string(class.RiskLevel),
+					Message:   fmt.Sprintf("has low cohesion (LCOM4=%d)", lcom),
+				}
+				issues = append(issues, issue)
+			}
+		}
+	}
+
+	avgLCOM := 0.0
+	if len(result.Classes) > 0 {
+		avgLCOM = float64(totalLCOM) / float64(len(result.Classes))
+	}
+
+	return map[string]interface{}{
+		"issues": issues,
+		"summary": map[string]interface{}{
+			"high_lcom_classes": highLCOMCount,
+			"total_classes":     len(result.Classes),
+			"max_lcom":          maxLCOM,
+			"average_lcom":      avgLCOM,
+		},
+	}
+}
+
+func buildAnalyzeUseCase(fileReader domain.FileReader) (*app.AnalyzeUseCase, error) {
+	// Create config loaders
+	complexityConfigLoader := service.NewConfigurationLoader()
+	deadCodeConfigLoader := service.NewDeadCodeConfigurationLoader()
+	cloneConfigLoader := service.NewCloneConfigurationLoader()
+	systemConfigLoader := service.NewSystemAnalysisConfigurationLoader()
+
+	// Build complexity use case
+	complexityService := service.NewComplexityService()
+	complexityFormatter := service.NewOutputFormatter()
+	complexityUC := app.NewSnapshotComplexityUseCase(complexityService, fileReader, complexityFormatter, complexityConfigLoader)
+
+	// Build dead code use case
+	deadCodeService := service.NewDeadCodeService()
+	deadCodeFormatter := service.NewDeadCodeFormatter()
+	deadCodeUC := app.NewSnapshotDeadCodeUseCase(deadCodeService, fileReader, deadCodeFormatter, deadCodeConfigLoader)
+
+	// Build clone use case
+	cloneService := service.NewCloneService()
+	cloneFormatter := service.NewCloneOutputFormatter()
+	cloneUC := app.NewSnapshotCloneUseCase(cloneService, fileReader, cloneFormatter, cloneConfigLoader)
+
+	// Build CBO use case
+	cboService := service.NewCBOService()
+	cboFormatter := service.NewCBOFormatter()
+	cboUC := app.NewSnapshotCBOUseCase(cboService, fileReader, cboFormatter, service.NewCBOConfigurationLoader())
+
+	// Build LCOM use case
+	lcomService := service.NewLCOMService()
+	lcomFormatter := service.NewLCOMFormatter()
+	lcomConfigLoader := service.NewLCOMConfigurationLoader()
+	lcomUC := app.NewSnapshotLCOMUseCase(lcomService, fileReader, lcomFormatter, lcomConfigLoader)
+
+	// Build system analysis use case
+	systemService := service.NewSystemAnalysisService()
+	systemFormatter := service.NewSystemAnalysisFormatter()
+	systemUC := app.NewGraphSystemAnalysisUseCase(systemService, fileReader, systemFormatter, systemConfigLoader)
+
+	// Build community analysis use case
+	communityService := service.NewCommunityAnalysisService()
+	communityFormatter := service.NewCommunityFormatter()
+	communityUC, err := app.NewCommunityUseCaseBuilder().
+		WithGraphService(communityService).
+		WithFileReader(fileReader).
+		WithFormatter(communityFormatter).
+		Build()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build analyze use case
+	return app.NewAnalyzeUseCaseBuilder().
+		WithComplexityUseCase(complexityUC).
+		WithDeadCodeUseCase(deadCodeUC).
+		WithCloneUseCase(cloneUC).
+		WithCBOUseCase(cboUC).
+		WithLCOMUseCase(lcomUC).
+		WithSystemUseCase(systemUC).
+		WithCommunityUseCase(communityUC).
+		WithFileReader(fileReader).
+		WithProgressManager(service.NewProgressManager()).
+		WithParallelExecutor(service.NewParallelExecutor()).
+		WithErrorCategorizer(service.NewErrorCategorizer()).
+		Build()
+}

@@ -1,0 +1,270 @@
+package service
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/ludo-technologies/pyscn/domain"
+)
+
+func TestAnalyzeConfigurationLoader_LoadAnalyzeExecutionConfig(t *testing.T) {
+	loader := NewAnalyzeConfigurationLoader()
+
+	t.Run("uses analyze defaults when no config file is found", func(t *testing.T) {
+		cfg, err := loader.LoadAnalyzeExecutionConfig("", t.TempDir())
+		if err != nil {
+			t.Fatalf("LoadAnalyzeExecutionConfig returned error: %v", err)
+		}
+
+		if cfg.ConfigPath != "" {
+			t.Errorf("expected empty config path, got %q", cfg.ConfigPath)
+		}
+		if len(cfg.IncludePatterns) != 1 || cfg.IncludePatterns[0] != "**/*.py" {
+			t.Errorf("expected default include patterns to include runtime Python files, got %v", cfg.IncludePatterns)
+		}
+		if !cfg.ComplexityEnabled {
+			t.Error("expected complexity enabled by default")
+		}
+		if !cfg.ComplexityReportUnchanged {
+			t.Error("expected report_unchanged enabled by default")
+		}
+		if cfg.ShowDetails {
+			t.Error("expected show_details disabled by default")
+		}
+		if !cfg.DeadCodeEnabled {
+			t.Error("expected dead code enabled by default")
+		}
+		if !cfg.SystemEnabled {
+			t.Error("expected system analysis enabled by default")
+		}
+		if !cfg.SystemAnalyzeDependencies {
+			t.Error("expected dependency analysis enabled by default")
+		}
+		if !cfg.SystemAnalyzeArchitecture {
+			t.Error("expected architecture analysis enabled by default")
+		}
+		if cfg.CommunitiesEnabled {
+			t.Error("expected communities config default to be false")
+		}
+		if cfg.CommunitiesEnabledExplicit {
+			t.Error("expected communities config default to be implicit")
+		}
+		defaultCloneReq := domain.DefaultCloneRequest()
+		if cfg.CloneLSHEnabled != defaultCloneReq.LSHEnabled {
+			t.Errorf("expected default LSH enabled %q, got %q", defaultCloneReq.LSHEnabled, cfg.CloneLSHEnabled)
+		}
+		if cfg.CloneLSHAutoThreshold != defaultCloneReq.LSHAutoThreshold {
+			t.Errorf("expected default LSH threshold %d, got %d", defaultCloneReq.LSHAutoThreshold, cfg.CloneLSHAutoThreshold)
+		}
+	})
+
+	t.Run("resolves config from target path and loads analyze settings", func(t *testing.T) {
+		projectDir := t.TempDir()
+		targetDir := filepath.Join(projectDir, "pkg")
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			t.Fatalf("failed to create target dir: %v", err)
+		}
+
+		configPath := filepath.Join(projectDir, ".pyscn.toml")
+		configContent := `[analysis]
+include_patterns = ["pkg/**/*.py"]
+exclude_patterns = ["tests/**/*.py"]
+recursive = false
+
+[complexity]
+enabled = false
+report_unchanged = false
+low_threshold = 3
+medium_threshold = 7
+max_complexity = 11
+
+[dead_code]
+enabled = false
+
+[system_analysis]
+enabled = true
+enable_dependencies = false
+enable_architecture = true
+
+[dependencies]
+enabled = true
+include_stdlib = true
+include_third_party = false
+follow_relative = false
+
+[output]
+min_complexity = 9
+show_details = true
+
+[clones]
+lsh_enabled = "true"
+lsh_auto_threshold = 123
+`
+		if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config file: %v", err)
+		}
+
+		cfg, err := loader.LoadAnalyzeExecutionConfig("", targetDir)
+		if err != nil {
+			t.Fatalf("LoadAnalyzeExecutionConfig returned error: %v", err)
+		}
+
+		if cfg.ConfigPath != configPath {
+			t.Errorf("expected config path %q, got %q", configPath, cfg.ConfigPath)
+		}
+		// No explicit project_root: the use case discovers the root from the
+		// analyzed paths, which lands on the config directory.
+		if cfg.ProjectRoot != "" {
+			t.Errorf("expected project root left for discovery, got %q", cfg.ProjectRoot)
+		}
+		if cfg.Recursive {
+			t.Error("expected recursive false")
+		}
+		if len(cfg.IncludePatterns) != 1 || cfg.IncludePatterns[0] != "pkg/**/*.py" {
+			t.Errorf("expected custom include patterns, got %v", cfg.IncludePatterns)
+		}
+		moduleSelection := cfg.PythonFileSelection().ForModules()
+		if len(moduleSelection.IncludePatterns) != 2 || moduleSelection.IncludePatterns[0] != "pkg/**/*.py" || moduleSelection.IncludePatterns[1] != "pkg/**/*.pyi" {
+			t.Errorf("expected module patterns to preserve configured scope, got %v", moduleSelection.IncludePatterns)
+		}
+		if len(cfg.ExcludePatterns) != 1 || cfg.ExcludePatterns[0] != "tests/**/*.py" {
+			t.Errorf("expected custom exclude patterns, got %v", cfg.ExcludePatterns)
+		}
+		if cfg.ComplexityEnabled {
+			t.Error("expected complexity disabled")
+		}
+		if cfg.ComplexityReportUnchanged {
+			t.Error("expected report_unchanged false")
+		}
+		if cfg.ComplexityLowThreshold != 3 {
+			t.Errorf("expected low threshold 3, got %d", cfg.ComplexityLowThreshold)
+		}
+		if cfg.ComplexityMediumThreshold != 7 {
+			t.Errorf("expected medium threshold 7, got %d", cfg.ComplexityMediumThreshold)
+		}
+		if cfg.ComplexityMaxComplexity != 11 {
+			t.Errorf("expected max complexity 11, got %d", cfg.ComplexityMaxComplexity)
+		}
+		if cfg.ComplexityMinComplexity != 9 {
+			t.Errorf("expected min complexity 9, got %d", cfg.ComplexityMinComplexity)
+		}
+		if !cfg.ShowDetails {
+			t.Error("expected show_details true")
+		}
+		if cfg.DeadCodeEnabled {
+			t.Error("expected dead code disabled")
+		}
+		if !cfg.SystemEnabled {
+			t.Error("expected system analysis enabled")
+		}
+		if !cfg.SystemAnalyzeDependencies {
+			t.Error("expected dependencies enabled through dependencies section")
+		}
+		if !cfg.SystemAnalyzeArchitecture {
+			t.Error("expected architecture enabled through system analysis section")
+		}
+		if !cfg.ModuleGraph.IncludeStdLib {
+			t.Error("expected standard library dependencies enabled")
+		}
+		if cfg.ModuleGraph.IncludeThirdParty {
+			t.Error("expected third-party dependencies disabled")
+		}
+		if cfg.ModuleGraph.FollowRelative {
+			t.Error("expected relative imports disabled")
+		}
+		if cfg.CloneLSHEnabled != "true" {
+			t.Errorf("expected LSH enabled true, got %q", cfg.CloneLSHEnabled)
+		}
+		if cfg.CloneLSHAutoThreshold != 123 {
+			t.Errorf("expected LSH threshold 123, got %d", cfg.CloneLSHAutoThreshold)
+		}
+	})
+
+	t.Run("loads communities enabled setting from config", func(t *testing.T) {
+		projectDir := t.TempDir()
+		configPath := filepath.Join(projectDir, ".pyscn.toml")
+		configContent := `[communities]
+enabled = true
+`
+		if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config file: %v", err)
+		}
+
+		cfg, err := loader.LoadAnalyzeExecutionConfig("", projectDir)
+		if err != nil {
+			t.Fatalf("LoadAnalyzeExecutionConfig returned error: %v", err)
+		}
+		if !cfg.CommunitiesEnabled {
+			t.Error("expected communities enabled from config")
+		}
+		if !cfg.CommunitiesEnabledExplicit {
+			t.Error("expected communities enabled setting to be explicit")
+		}
+	})
+
+	t.Run("loads communities disabled setting from config", func(t *testing.T) {
+		projectDir := t.TempDir()
+		configPath := filepath.Join(projectDir, ".pyscn.toml")
+		configContent := `[communities]
+enabled = false
+`
+		if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config file: %v", err)
+		}
+
+		cfg, err := loader.LoadAnalyzeExecutionConfig("", projectDir)
+		if err != nil {
+			t.Fatalf("LoadAnalyzeExecutionConfig returned error: %v", err)
+		}
+		if cfg.CommunitiesEnabled {
+			t.Error("expected communities disabled from config")
+		}
+		if !cfg.CommunitiesEnabledExplicit {
+			t.Error("expected communities disabled setting to be explicit")
+		}
+	})
+
+	t.Run("keeps comprehensive system defaults when config omits system sections", func(t *testing.T) {
+		projectDir := t.TempDir()
+		configPath := filepath.Join(projectDir, ".pyscn.toml")
+		configContent := `[complexity]
+enabled = false
+`
+		if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+			t.Fatalf("failed to write config file: %v", err)
+		}
+
+		cfg, err := loader.LoadAnalyzeExecutionConfig("", projectDir)
+		if err != nil {
+			t.Fatalf("LoadAnalyzeExecutionConfig returned error: %v", err)
+		}
+
+		if !cfg.SystemEnabled {
+			t.Error("expected system analysis to remain enabled")
+		}
+		if !cfg.SystemAnalyzeDependencies {
+			t.Error("expected dependency analysis to remain enabled")
+		}
+		if !cfg.SystemAnalyzeArchitecture {
+			t.Error("expected architecture analysis to remain enabled")
+		}
+	})
+}
+
+func TestAnalyzeConfigurationLoader_ExplicitConfigOutsideTargetLeavesProjectRootForDiscovery(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, ".pyscn.toml")
+	if err := os.WriteFile(configPath, []byte("[output]\nmin_complexity = 15\n"), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	targetDir := t.TempDir()
+
+	cfg, err := NewAnalyzeConfigurationLoader().LoadAnalyzeExecutionConfig(configPath, targetDir)
+	if err != nil {
+		t.Fatalf("LoadAnalyzeExecutionConfig returned error: %v", err)
+	}
+	if cfg.ProjectRoot != "" {
+		t.Fatalf("config directory %q must not become the project root of %q", configDir, targetDir)
+	}
+}

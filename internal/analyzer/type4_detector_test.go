@@ -1,0 +1,173 @@
+package analyzer
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sort"
+	"testing"
+
+	"github.com/ludo-technologies/pyscn/internal/parser"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// These genuine equivalents lack shared call evidence and are conservatively
+// rejected by Type-4 scoring; keep them explicit rather than relabeling as FPs.
+var callAsymmetricType4Pairs = [][2]string{
+	{"sum_iterative.py::sum_numbers", "sum_recursive.py::sum_numbers"},
+	{"sum_iterative.py::sum_range", "sum_recursive.py::sum_range"},
+	{"filter_transform_a.py::count_matching", "filter_transform_b.py::count_matching"},
+}
+
+// These genuine equivalents share too few AST features to pass the feature
+// Jaccard floor that keeps exhaustive and LSH detection consistent (#832).
+var belowFeatureFloorType4Pairs = [][2]string{
+	{"find_max_a.py::find_maximum", "find_max_b.py::find_maximum"},
+	{"find_max_a.py::find_min_max", "find_max_b.py::find_min_max"},
+}
+
+func TestType4CloneDetection(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.EnableDFAAnalysis = true
+	config.MinLines = 4 // fixture functions are 4 lines once their docstring is excluded
+	config.MinNodes = 10
+	config.Type4Threshold = 0.70
+
+	detector := NewCloneDetector(config)
+	allFragments, functionFragments := loadType4FunctionFragments(t, detector)
+
+	result := detector.DetectClones(allFragments)
+	pairs, groups := result.Pairs, result.Groups
+	require.NotEmpty(t, pairs)
+	require.NotEmpty(t, groups)
+
+	pairByID := make(map[string]*ClonePair, len(pairs))
+	for _, pair := range pairs {
+		pairByID[type4PairID(type4FragmentID(pair.Fragment1), type4FragmentID(pair.Fragment2))] = pair
+	}
+
+	expectedPairs := [][2]string{
+		{"filter_transform_a.py::filter_and_double", "filter_transform_b.py::filter_and_double"},
+		{"filter_transform_a.py::process_data", "filter_transform_b.py::process_data"},
+	}
+	for _, expected := range expectedPairs {
+		pair := pairByID[type4PairID(expected[0], expected[1])]
+		require.NotNil(t, pair, "missing Type-4 pair %s <-> %s", expected[0], expected[1])
+		assert.Equal(t, Type4Clone, pair.CloneType)
+		assert.GreaterOrEqual(t, pair.Similarity, config.Type4Threshold)
+	}
+
+	for _, equivalent := range callAsymmetricType4Pairs {
+		if pair := pairByID[type4PairID(equivalent[0], equivalent[1])]; pair != nil {
+			assert.NotEqual(t, Type4Clone, pair.CloneType)
+		}
+	}
+
+	for _, equivalent := range belowFeatureFloorType4Pairs {
+		assert.Nil(t, pairByID[type4PairID(equivalent[0], equivalent[1])], "pair below the feature floor reported: %s <-> %s", equivalent[0], equivalent[1])
+	}
+
+	negativePairs := [][2]string{
+		{"sum_iterative.py::sum_numbers", "find_max_b.py::find_maximum"},
+		{"sum_iterative.py::sum_range", "find_max_b.py::find_min_max"},
+		{"find_max_a.py::find_maximum", "find_max_b.py::find_min_max"},
+	}
+	for _, negative := range negativePairs {
+		assert.Nil(t, pairByID[type4PairID(negative[0], negative[1])], "unexpected Type-4 pair %s <-> %s", negative[0], negative[1])
+	}
+
+	for _, expected := range expectedPairs {
+		first := functionFragments[expected[0]]
+		second := functionFragments[expected[1]]
+		require.NotNil(t, first, "missing fixture function %s", expected[0])
+		require.NotNil(t, second, "missing fixture function %s", expected[1])
+
+		pair := detector.compareFragments(first, second)
+		require.NotNil(t, pair, "direct comparison missed %s <-> %s", expected[0], expected[1])
+		assert.Equal(t, Type4Clone, pair.CloneType)
+	}
+
+	// Issue #482: same control-flow template, disjoint literal vocabulary.
+	// The pair may legitimately surface as a syntactic (Type-2/3) clone, but
+	// must never be classified as a semantic Type-4 clone.
+	if pair := pairByID[type4PairID("field_converter_a.py::delimited_list2param", "field_converter_b.py::uploadfield2properties")]; pair != nil {
+		assert.NotEqual(t, Type4Clone, pair.CloneType,
+			"field converters with disjoint spec keys must not be Type-4 clones")
+	}
+}
+
+// Issue #832: LSH is an acceleration and must not change which clones are
+// found. The fixture holds Type-2 and Type-4 pairs on both sides of the
+// feature Jaccard floor.
+func TestCloneDetection_LSHMatchesExhaustive(t *testing.T) {
+	detect := func(useLSH bool) map[string]CloneType {
+		config := DefaultCloneDetectorConfig()
+		config.EnableDFAAnalysis = true
+		config.MinLines = 4
+		config.MinNodes = 10
+		config.Type4Threshold = 0.70
+		config.UseLSH = useLSH
+
+		detector := NewCloneDetector(config)
+		fragments, _ := loadType4FunctionFragments(t, detector)
+		result := detector.DetectClonesWithLSH(context.Background(), fragments)
+
+		pairs := make(map[string]CloneType, len(result.Pairs))
+		for _, pair := range result.Pairs {
+			pairs[type4PairID(pair.Fragment1.Location.String(), pair.Fragment2.Location.String())] = pair.CloneType
+		}
+		return pairs
+	}
+
+	exhaustive := detect(false)
+	require.NotEmpty(t, exhaustive)
+	assert.Equal(t, exhaustive, detect(true))
+}
+
+func loadType4FunctionFragments(t *testing.T, detector *CloneDetector) ([]*CodeFragment, map[string]*CodeFragment) {
+	t.Helper()
+
+	testDir := "../../testdata/python/clones/type4"
+	files, err := filepath.Glob(filepath.Join(testDir, "*.py"))
+	require.NoError(t, err)
+	sort.Strings(files)
+
+	p := parser.New()
+	ctx := context.Background()
+	functionFragments := make(map[string]*CodeFragment)
+	var allFragments []*CodeFragment
+
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		require.NoError(t, err)
+
+		result, err := p.Parse(ctx, content)
+		require.NoError(t, err)
+
+		fragments := detector.ExtractFragmentsWithSource([]*parser.Node{result.AST}, file, content)
+		allFragments = append(allFragments, fragments...)
+		for _, fragment := range fragments {
+			if fragment.ASTNode != nil && fragment.ASTNode.Type == parser.NodeFunctionDef {
+				functionFragments[type4FragmentID(fragment)] = fragment
+			}
+		}
+	}
+
+	require.NotEmpty(t, allFragments)
+	return allFragments, functionFragments
+}
+
+func type4FragmentID(fragment *CodeFragment) string {
+	if fragment == nil || fragment.Location == nil || fragment.ASTNode == nil {
+		return ""
+	}
+	return filepath.Base(fragment.Location.FilePath) + "::" + fragment.ASTNode.Name
+}
+
+func type4PairID(first, second string) string {
+	if first > second {
+		first, second = second, first
+	}
+	return first + "|" + second
+}

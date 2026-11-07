@@ -1,0 +1,1537 @@
+package analyzer
+
+import (
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+)
+
+// Block label constants to avoid magic strings
+const (
+	LabelFunctionBody = "func_body"
+	LabelClassBody    = "class_body"
+	LabelUnreachable  = "unreachable"
+	LabelEntry        = "ENTRY"
+	LabelExit         = "EXIT"
+
+	// Labels of the block receiving the code that follows a terminator. They
+	// record which terminator made that code dead.
+	LabelUnreachableAfterReturn   = LabelUnreachable + "_after_return"
+	LabelUnreachableAfterRaise    = LabelUnreachable + "_after_raise"
+	LabelUnreachableAfterBreak    = LabelUnreachable + "_after_break"
+	LabelUnreachableAfterContinue = LabelUnreachable + "_after_continue"
+
+	// Conditional labels
+	LabelIfThen  = "if_then"
+	LabelIfMerge = "if_merge"
+
+	// Loop-related labels
+	LabelLoopHeader = "loop_header"
+	LabelLoopBody   = "loop_body"
+	LabelLoopExit   = "loop_exit"
+	LabelLoopElse   = "loop_else"
+
+	// Exception-related labels
+	LabelTryBlock     = "try_block"
+	LabelExceptBlock  = "except_block"
+	LabelFinallyBlock = "finally_block"
+	LabelTryElse      = "try_else"
+
+	// Advanced construct labels
+	LabelWithSetup    = "with_setup"
+	LabelWithBody     = "with_body"
+	LabelWithTeardown = "with_teardown"
+	LabelMatchEval    = "match_eval"
+	LabelMatchCase    = "match_case"
+	LabelMatchMerge   = "match_merge"
+
+	// Comprehension labels. Each for clause yields a comp_header decision and
+	// each if filter a comp_filter decision.
+	LabelCompInit   = "comp_init"
+	LabelCompHeader = "comp_header"
+	LabelCompBody   = "comp_body"
+	LabelCompFilter = "comp_filter"
+	LabelCompAppend = "comp_append"
+	LabelCompExit   = "comp_exit"
+)
+
+// loopContext tracks the context of a loop for break/continue handling
+type loopContext struct {
+	headerBlock *BasicBlock // Loop condition/iterator block
+	exitBlock   *BasicBlock // Loop exit point
+	elseBlock   *BasicBlock // Loop else clause (optional)
+	loopType    string      // "for" or "while"
+}
+
+// exceptionContext tracks the context of a try block for exception handling
+type exceptionContext struct {
+	tryBlock          *BasicBlock   // Try block
+	finallyBlock      *BasicBlock   // Finally block (optional)
+	handlers          []*BasicBlock // Exception handler blocks
+	elseBlock         *BasicBlock   // Try else clause (optional)
+	processingFinally bool          // True while processing the finally block body
+}
+
+// CFGBuilder builds control flow graphs from AST nodes
+type CFGBuilder struct {
+	// cfg is the control flow graph being built
+	cfg *CFG
+
+	// currentBlock is the block currently being populated
+	currentBlock *BasicBlock
+
+	// scopeStack tracks nested scopes (functions, classes, etc.)
+	scopeStack []string
+
+	// scopedCFGs stores CFGs for nested execution scopes in source order.
+	scopedCFGs ControlFlowGraphs
+
+	// blockCounter for generating unique block names
+	blockCounter uint
+
+	// logger for error reporting (optional)
+	logger *log.Logger
+
+	// loopStack tracks nested loops for break/continue handling
+	loopStack []*loopContext
+
+	// exceptionStack tracks nested try blocks for exception handling
+	exceptionStack []*exceptionContext
+
+	// inlineClassSuites is enabled only by BuildExecutionFragment. Standard
+	// analysis keeps each class suite in its own typed CFG via BuildAll.
+	inlineClassSuites bool
+}
+
+// NewCFGBuilder creates a new CFG builder
+func NewCFGBuilder() *CFGBuilder {
+	return &CFGBuilder{
+		scopeStack:     []string{},
+		scopedCFGs:     make(ControlFlowGraphs, 0),
+		blockCounter:   0,
+		logger:         nil, // Can be set via SetLogger if needed
+		loopStack:      []*loopContext{},
+		exceptionStack: []*exceptionContext{},
+	}
+}
+
+// SetLogger sets an optional logger for error reporting
+func (b *CFGBuilder) SetLogger(logger *log.Logger) {
+	b.logger = logger
+}
+
+// logError logs an error if a logger is set
+func (b *CFGBuilder) logError(format string, args ...interface{}) {
+	if b.logger != nil {
+		b.logger.Printf("CFGBuilder: "+format, args...)
+	}
+}
+
+// Build constructs a CFG from an AST node
+func (b *CFGBuilder) Build(node *parser.Node) (*CFG, error) {
+	return b.build(node, false)
+}
+
+// BuildExecutionFragment constructs the single graph used for semantic clone
+// comparison. Class suites reached while executing the fragment are inlined,
+// matching Python's class-definition execution; nested function bodies remain
+// separate because defining a function does not execute its body.
+func (b *CFGBuilder) BuildExecutionFragment(node *parser.Node) (*CFG, error) {
+	return b.build(node, true)
+}
+
+func (b *CFGBuilder) build(node *parser.Node, inlineClassSuites bool) (*CFG, error) {
+	if node == nil {
+		return nil, fmt.Errorf("cannot build CFG from nil node")
+	}
+	b.inlineClassSuites = inlineClassSuites
+
+	if len(b.scopeStack) == 0 {
+		b.scopedCFGs = b.scopedCFGs[:0]
+	}
+	b.blockCounter = 0
+	b.loopStack = b.loopStack[:0]
+	b.exceptionStack = b.exceptionStack[:0]
+
+	// Initialize CFG based on node type
+	cfgName := domain.ModuleFunctionName
+	if node.Type == parser.NodeFunctionDef || node.Type == parser.NodeAsyncFunctionDef {
+		cfgName = node.Name
+	} else if node.Type == parser.NodeClassDef {
+		cfgName = node.Name
+	}
+
+	b.cfg = NewCFG(cfgName)
+	b.currentBlock = b.cfg.Entry
+
+	// Store the source root opaquely for complexity and DFA enrichment.
+	b.cfg.FunctionNode = node
+
+	// Build CFG based on node type
+	switch node.Type {
+	case parser.NodeModule:
+		b.buildModule(node)
+	case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+		b.buildFunction(node)
+	case parser.NodeClassDef:
+		if b.inlineClassSuites {
+			b.buildInlineClass(node)
+		} else {
+			b.buildClass(node)
+		}
+	default:
+		// For single statements, process directly
+		b.processStatement(node)
+	}
+
+	// Connect current block to exit if not already connected
+	if b.currentBlock != nil && b.currentBlock != b.cfg.Exit && !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+		b.cfg.ConnectBlocks(b.currentBlock, b.cfg.Exit, EdgeNormal)
+	}
+
+	return b.cfg, nil
+}
+
+// BuildAll builds CFGs for every supported execution scope in source order.
+func (b *CFGBuilder) BuildAll(node *parser.Node) (ControlFlowGraphs, error) {
+	if node == nil {
+		return nil, fmt.Errorf("cannot build CFGs from nil node")
+	}
+
+	// Build the root CFG.
+	mainCFG, err := b.Build(node)
+	if err != nil {
+		return nil, err
+	}
+
+	rootScope := cfgScope(node, mainCFG.Name)
+	allCFGs := make(ControlFlowGraphs, 0, 1+len(b.scopedCFGs))
+	allCFGs = append(allCFGs, ScopedCFG{Scope: rootScope, Graph: mainCFG})
+	allCFGs = append(allCFGs, b.scopedCFGs...)
+	return allCFGs, nil
+}
+
+// buildModule processes a module node
+func (b *CFGBuilder) buildModule(node *parser.Node) {
+	// Process all statements in the module body
+	for _, stmt := range node.Body {
+		b.processStatement(stmt)
+	}
+}
+
+// buildFunction processes a function definition
+func (b *CFGBuilder) buildFunction(node *parser.Node) {
+	// Enter function scope
+	b.enterScope(node.Name)
+	defer b.exitScope()
+
+	// Create a new block for function body
+	bodyBlock := b.createBlock(LabelFunctionBody)
+	b.cfg.ConnectBlocks(b.currentBlock, bodyBlock, EdgeNormal)
+	b.currentBlock = bodyBlock
+
+	// Process all statements in the function body
+	for _, stmt := range node.Body {
+		b.processStatement(stmt)
+	}
+}
+
+// buildClass processes a class definition
+func (b *CFGBuilder) buildClass(node *parser.Node) {
+	// Enter class scope
+	b.enterScope(node.Name)
+	defer b.exitScope()
+
+	// Create a new block for class body
+	bodyBlock := b.createBlock(LabelClassBody)
+	b.cfg.ConnectBlocks(b.currentBlock, bodyBlock, EdgeNormal)
+	b.currentBlock = bodyBlock
+
+	// Process the executable class suite. The class definition itself belongs
+	// to the enclosing scope, where it evaluates decorators and bases before
+	// binding the completed class object.
+	for _, stmt := range node.Body {
+		b.processStatement(stmt)
+	}
+}
+
+// buildInlineClass preserves the execution profile used by fragment analysis:
+// the definition and its suite execute as part of the enclosing fragment.
+func (b *CFGBuilder) buildInlineClass(node *parser.Node) {
+	b.enterScope(node.Name)
+	defer b.exitScope()
+
+	bodyBlock := b.createBlock(LabelClassBody)
+	b.cfg.ConnectBlocks(b.currentBlock, bodyBlock, EdgeNormal)
+	b.currentBlock = bodyBlock
+	b.currentBlock.AddStatement(node)
+
+	for _, stmt := range node.Body {
+		b.processStatement(stmt)
+	}
+}
+
+// buildNestedScope builds a function or class suite without folding its body
+// into the enclosing graph.
+func (b *CFGBuilder) buildNestedScope(node *parser.Node) error {
+	nestedBuilder := NewCFGBuilder()
+
+	// Efficiently copy scope stack
+	nestedBuilder.scopeStack = make([]string, len(b.scopeStack))
+	copy(nestedBuilder.scopeStack, b.scopeStack)
+
+	// Copy logger if set
+	nestedBuilder.logger = b.logger
+
+	graph, err := nestedBuilder.Build(node)
+	if err != nil {
+		b.logError("failed to build CFG for nested scope %s: %v", node.Name, err)
+		b.currentBlock.AddStatement(node)
+		return fmt.Errorf("failed to build nested scope %s: %w", node.Name, err)
+	}
+
+	// Store the scope, followed by descendants produced in source order.
+	fullName := b.getFullScopeName(node.Name)
+	b.scopedCFGs = append(b.scopedCFGs, ScopedCFG{
+		Scope: cfgScope(node, fullName),
+		Graph: graph,
+	})
+	b.scopedCFGs = append(b.scopedCFGs, nestedBuilder.scopedCFGs...)
+
+	// Keep the definition statement in the enclosing execution scope.
+	b.currentBlock.AddStatement(node)
+	return nil
+}
+
+func cfgScope(node *parser.Node, name string) CFGScope {
+	scope := CFGScope{Name: name}
+	if node == nil {
+		return scope
+	}
+
+	scope.StartLine = node.Location.StartLine
+	scope.StartColumn = node.Location.StartCol
+	switch node.Type {
+	case parser.NodeModule:
+		scope.Kind = domain.AnalysisScopeModule
+	case parser.NodeClassDef:
+		scope.Kind = domain.AnalysisScopeClass
+	case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+		scope.Kind = domain.AnalysisScopeFunction
+	}
+	return scope
+}
+
+// processStatement processes a single statement
+func (b *CFGBuilder) processStatement(stmt *parser.Node) {
+	if stmt == nil {
+		return
+	}
+
+	// Handle structural markers that aren't actual executable statements
+	// Note: else_clause and elif_clause should only appear in Orelse of if statements,
+	// not as standalone statements. If they appear here, it's likely an error in the AST.
+	if stmt.Type == parser.NodeElseClause {
+		// Log this as unexpected but try to handle gracefully
+		b.logError("unexpected else_clause as standalone statement")
+		// Try to process the block contents if they exist
+		for _, child := range stmt.Children {
+			if child != nil && child.Type == parser.NodeBlock {
+				for _, blockStmt := range child.Body {
+					b.processStatement(blockStmt)
+				}
+			}
+		}
+		return
+	}
+
+	if stmt.Type == parser.NodeElifClause {
+		// Log this as unexpected but try to handle gracefully
+		b.logError("unexpected elif_clause as standalone statement")
+		// elif_clause should be converted to an if statement
+		ifNode := b.convertElifClauseToIf(stmt)
+		b.processIfStatement(ifNode)
+		return
+	}
+
+	switch stmt.Type {
+	case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+		// Build separate CFG for nested functions
+		if err := b.buildNestedScope(stmt); err != nil {
+			b.logError("error in nested function: %v", err)
+		}
+
+	case parser.NodeClassDef:
+		if b.inlineClassSuites {
+			b.buildInlineClass(stmt)
+		} else {
+			// A class suite is its own execution scope. Keep only the definition
+			// binding and header evaluation in the enclosing graph.
+			if err := b.buildNestedScope(stmt); err != nil {
+				b.logError("error in nested class: %v", err)
+			}
+		}
+
+	case parser.NodeReturn:
+		// Check if the return value is a comprehension
+		if stmt.Value != nil {
+			if valNode, ok := stmt.Value.(*parser.Node); ok {
+				if valNode.Type == parser.NodeListComp || valNode.Type == parser.NodeDictComp ||
+					valNode.Type == parser.NodeSetComp || valNode.Type == parser.NodeGeneratorExp {
+					// Process the comprehension
+					b.processComprehension(valNode)
+				}
+			}
+		}
+
+		// Add return statement to current block
+		b.currentBlock.AddStatement(stmt)
+
+		// Find the next finally block that needs to execute before this return completes.
+		// Walk the exception stack from innermost to outermost, skipping any finally
+		// blocks we're currently inside (to avoid self-loops), until we find the first
+		// enclosing finally block that hasn't been entered yet.
+		var targetFinallyBlock *BasicBlock
+		for i := len(b.exceptionStack) - 1; i >= 0; i-- {
+			exceptionCtx := b.exceptionStack[i]
+			if exceptionCtx.finallyBlock != nil && b.currentBlock != exceptionCtx.finallyBlock {
+				targetFinallyBlock = exceptionCtx.finallyBlock
+				break
+			}
+		}
+
+		if targetFinallyBlock != nil {
+			// Route through the next outer finally block
+			b.cfg.ConnectBlocks(b.currentBlock, targetFinallyBlock, EdgeReturn)
+			// Create unreachable block for any code after return
+			unreachableBlock := b.createBlock(LabelUnreachableAfterReturn)
+			b.currentBlock = unreachableBlock
+			return
+		}
+
+		// No enclosing finally blocks remain - connect directly to exit
+		// This handles: returns outside try blocks, or returns in the outermost finally
+		b.cfg.ConnectBlocks(b.currentBlock, b.cfg.Exit, EdgeReturn)
+		// Create unreachable block for any code following the return statement.
+		// This block will not be connected to the exit, making it truly unreachable
+		// in the CFG, which helps with dead code detection in later analysis phases.
+		unreachableBlock := b.createBlock(LabelUnreachableAfterReturn)
+		b.currentBlock = unreachableBlock
+
+	case parser.NodePass:
+		// Pass statement - just add to current block
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeAssign, parser.NodeAugAssign, parser.NodeAnnAssign:
+		// Check if the assignment value is a comprehension
+		if stmt.Value != nil {
+			if valNode, ok := stmt.Value.(*parser.Node); ok {
+				if valNode.Type == parser.NodeListComp || valNode.Type == parser.NodeDictComp ||
+					valNode.Type == parser.NodeSetComp || valNode.Type == parser.NodeGeneratorExp {
+					// Process the comprehension
+					b.processComprehension(valNode)
+					// Add the assignment statement after comprehension processing
+					b.currentBlock.AddStatement(stmt)
+					return
+				}
+			}
+		}
+		// Regular assignment - just add to current block
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeExpr:
+		// Check if the expression is a comprehension
+		if stmt.Value != nil {
+			if valNode, ok := stmt.Value.(*parser.Node); ok {
+				// Direct comprehension
+				if isComprehensionNode(valNode) {
+					b.processComprehension(valNode)
+					b.currentBlock.AddStatement(stmt)
+					return
+				}
+				// Walrus containing comprehension: (x := [i for i in ...])
+				if valNode.Type == parser.NodeNamedExpr {
+					if inner, ok := valNode.Value.(*parser.Node); ok && isComprehensionNode(inner) {
+						b.processComprehension(inner)
+						b.currentBlock.AddStatement(stmt)
+						return
+					}
+				}
+			}
+		}
+		// Regular expression statement
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeImport, parser.NodeImportFrom:
+		// Import statements
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeGlobal, parser.NodeNonlocal:
+		// Global/nonlocal declarations
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeDelete:
+		// Delete statements
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeAssert:
+		// Assert statements (for now, treat as sequential)
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeIf:
+		// Handle if/elif/else statements
+		b.processIfStatement(stmt)
+
+	case parser.NodeIfExp:
+		// Handle conditional expressions (ternary operators)
+		// For now, treat as a simple expression
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeFor, parser.NodeAsyncFor:
+		// Handle for and async for loops
+		b.processForStatement(stmt)
+
+	case parser.NodeWhile:
+		// Handle while loops
+		b.processWhileStatement(stmt)
+
+	case parser.NodeBreak:
+		// Handle break statements
+		b.processBreakStatement(stmt)
+
+	case parser.NodeContinue:
+		// Handle continue statements
+		b.processContinueStatement(stmt)
+
+	case parser.NodeTry:
+		// Handle try/except/else/finally statements
+		b.processTryStatement(stmt)
+
+	case parser.NodeRaise:
+		// Handle raise statements
+		b.processRaiseStatement(stmt)
+
+	case parser.NodeWith, parser.NodeAsyncWith:
+		// Handle with and async with statements
+		b.processWithStatement(stmt)
+
+	case parser.NodeMatch:
+		// Handle match statements (Python 3.10+)
+		b.processMatchStatement(stmt)
+
+	case parser.NodeAwait:
+		// Handle await expressions - treat as expression in current block
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeYield, parser.NodeYieldFrom:
+		// Handle yield expressions - treat as expression (potential suspend point)
+		b.currentBlock.AddStatement(stmt)
+
+	case parser.NodeListComp, parser.NodeDictComp, parser.NodeSetComp, parser.NodeGeneratorExp:
+		// Handle comprehensions as complex expressions that have internal control flow
+		b.processComprehension(stmt)
+
+	default:
+		// For other statements, just add them to current block
+		b.currentBlock.AddStatement(stmt)
+	}
+}
+
+// processIfStatement handles if/elif/else statements
+func (b *CFGBuilder) processIfStatement(stmt *parser.Node) {
+	// Save the condition block (current block where the test happens)
+	conditionBlock := b.currentBlock
+
+	// Add the test condition to the current block
+	conditionBlock.AddStatement(stmt)
+
+	// Create blocks for the then branch
+	thenBlock := b.createBlock(LabelIfThen)
+
+	// Create merge block only for the outermost if
+	// elif chains will share the same final merge block
+	mergeBlock := b.createBlock(LabelIfMerge)
+
+	// Connect condition block to then block (true branch)
+	b.cfg.ConnectBlocks(conditionBlock, thenBlock, EdgeCondTrue)
+
+	// Process the then branch
+	b.currentBlock = thenBlock
+	for _, bodyStmt := range stmt.Body {
+		b.processStatement(bodyStmt)
+	}
+
+	// Save the end of then branch
+	thenEndBlock := b.currentBlock
+
+	// Process else/elif branches
+	if len(stmt.Orelse) > 0 {
+		// Check if the else clause is another if (elif) or an elif_clause node
+		if len(stmt.Orelse) == 1 && (stmt.Orelse[0].Type == parser.NodeIf || stmt.Orelse[0].Type == parser.NodeElifClause) {
+			// This is an elif - handle it specially
+			elifBlock := b.createBlock("elif")
+			b.cfg.ConnectBlocks(conditionBlock, elifBlock, EdgeCondFalse)
+			b.currentBlock = elifBlock
+
+			// Convert elif_clause to If node if needed
+			elifStmt := stmt.Orelse[0]
+			if elifStmt.Type == parser.NodeElifClause {
+				// Create an If node from elif_clause
+				elifStmt = b.convertElifClauseToIf(elifStmt)
+			}
+
+			// Process elif recursively - it will create its own test, then, and possibly else
+			b.processIfStatementElif(elifStmt, mergeBlock)
+
+			// If the elif chain determined all branches terminate (currentBlock is unreachable),
+			// check if the then branch also terminates
+			if strings.Contains(b.currentBlock.Label, LabelUnreachable) {
+				// All elif/else branches terminated, check if then also terminates
+				if b.blockTerminates(thenEndBlock) {
+					// All branches terminate - stay in unreachable block
+					return
+				}
+				// Then branch doesn't terminate, so merge is reachable
+				b.currentBlock = mergeBlock
+			}
+
+			// Connect then branch to merge if not already connected to exit
+			if !b.hasSuccessor(thenEndBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(thenEndBlock, mergeBlock, EdgeNormal)
+			}
+		} else {
+			// This is a regular else clause
+			elseBlock := b.createBlock("if_else")
+			b.cfg.ConnectBlocks(conditionBlock, elseBlock, EdgeCondFalse)
+
+			// Process else branch
+			b.currentBlock = elseBlock
+
+			// Handle else_clause nodes by extracting their body
+			for _, elseStmt := range stmt.Orelse {
+				if elseStmt.Type == parser.NodeElseClause {
+					// Extract statements from else_clause body
+					for _, bodyStmt := range elseStmt.Body {
+						b.processStatement(bodyStmt)
+					}
+				} else {
+					b.processStatement(elseStmt)
+				}
+			}
+
+			// Check if all branches terminate
+			elseEndBlock := b.currentBlock
+			if b.allBranchesTerminate(thenEndBlock, elseEndBlock, true) {
+				// All branches terminate - don't connect to merge, make it unreachable
+				b.currentBlock = b.createBlock(LabelUnreachable)
+				return
+			}
+
+			// Normal case: connect branches to merge
+			if !b.hasSuccessor(thenEndBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(thenEndBlock, mergeBlock, EdgeNormal)
+			}
+			if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(b.currentBlock, mergeBlock, EdgeNormal)
+			}
+		}
+	} else {
+		// No else clause - connect false branch directly to merge
+		b.cfg.ConnectBlocks(conditionBlock, mergeBlock, EdgeCondFalse)
+
+		// Connect then branch to merge if not already connected to exit
+		if !b.hasSuccessor(thenEndBlock, b.cfg.Exit) {
+			b.cfg.ConnectBlocks(thenEndBlock, mergeBlock, EdgeNormal)
+		}
+	}
+
+	// Continue with merge block
+	b.currentBlock = mergeBlock
+}
+
+// processIfStatementElif handles elif chains specially to maintain proper structure
+func (b *CFGBuilder) processIfStatementElif(stmt *parser.Node, finalMerge *BasicBlock) {
+	// Current block is the elif block
+	conditionBlock := b.currentBlock
+
+	// Add the test condition
+	conditionBlock.AddStatement(stmt)
+
+	// Create then block for this elif
+	thenBlock := b.createBlock("elif_then")
+	b.cfg.ConnectBlocks(conditionBlock, thenBlock, EdgeCondTrue)
+
+	// Process the then branch
+	b.currentBlock = thenBlock
+	for _, bodyStmt := range stmt.Body {
+		b.processStatement(bodyStmt)
+	}
+	thenEndBlock := b.currentBlock
+
+	// Process else/elif branches
+	if len(stmt.Orelse) > 0 {
+		// Check if this is another elif
+		if len(stmt.Orelse) == 1 && (stmt.Orelse[0].Type == parser.NodeIf || stmt.Orelse[0].Type == parser.NodeElifClause) {
+			// Another elif - recurse
+			elifBlock := b.createBlock("elif")
+			b.cfg.ConnectBlocks(conditionBlock, elifBlock, EdgeCondFalse)
+			b.currentBlock = elifBlock
+
+			// Convert elif_clause to If node if needed
+			elifStmt := stmt.Orelse[0]
+			if elifStmt.Type == parser.NodeElifClause {
+				elifStmt = b.convertElifClauseToIf(elifStmt)
+			}
+
+			b.processIfStatementElif(elifStmt, finalMerge)
+		} else {
+			// Final else clause
+			elseBlock := b.createBlock("elif_else")
+			b.cfg.ConnectBlocks(conditionBlock, elseBlock, EdgeCondFalse)
+
+			b.currentBlock = elseBlock
+
+			// Process else clause statements
+			// Handle else_clause nodes by extracting their body
+			for _, elseStmt := range stmt.Orelse {
+				if elseStmt.Type == parser.NodeElseClause {
+					// Extract statements from else_clause body
+					for _, bodyStmt := range elseStmt.Body {
+						b.processStatement(bodyStmt)
+					}
+				} else {
+					b.processStatement(elseStmt)
+				}
+			}
+
+			// Connect else to final merge
+			elseEndBlock := b.currentBlock
+			if b.allBranchesTerminate(thenEndBlock, elseEndBlock, true) {
+				// All branches terminate - subsequent code is unreachable
+				b.currentBlock = b.createBlock(LabelUnreachable)
+				return
+			}
+
+			if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(b.currentBlock, finalMerge, EdgeNormal)
+			}
+		}
+	} else {
+		// No more elif/else - connect false branch to final merge
+		b.cfg.ConnectBlocks(conditionBlock, finalMerge, EdgeCondFalse)
+	}
+
+	// Connect then branch to final merge
+	if !b.hasSuccessor(thenEndBlock, b.cfg.Exit) {
+		b.cfg.ConnectBlocks(thenEndBlock, finalMerge, EdgeNormal)
+	}
+
+	// Set current to final merge for any subsequent processing
+	b.currentBlock = finalMerge
+}
+
+// processForStatement handles for and async for loops
+func (b *CFGBuilder) processForStatement(stmt *parser.Node) {
+	// Create loop header block (iterator evaluation and condition check)
+	headerBlock := b.createBlock(LabelLoopHeader)
+	b.cfg.ConnectBlocks(b.currentBlock, headerBlock, EdgeNormal)
+
+	// Add the for statement (iterator setup) to header
+	headerBlock.AddStatement(stmt)
+
+	// Create loop body block
+	bodyBlock := b.createBlock(LabelLoopBody)
+
+	// Create loop exit block (for normal loop completion)
+	exitBlock := b.createBlock(LabelLoopExit)
+
+	// Create else block if present
+	var elseBlock *BasicBlock
+	if len(stmt.Orelse) > 0 {
+		elseBlock = b.createBlock(LabelLoopElse)
+	}
+
+	// Create loop context for break/continue handling
+	loopCtx := &loopContext{
+		headerBlock: headerBlock,
+		exitBlock:   exitBlock,
+		elseBlock:   elseBlock,
+		loopType:    "for",
+	}
+	b.pushLoopContext(loopCtx)
+	defer b.popLoopContext()
+
+	// Connect header to body (loop condition true - has more items)
+	b.cfg.ConnectBlocks(headerBlock, bodyBlock, EdgeCondTrue)
+
+	// Connect header to exit/else (loop condition false - iterator exhausted)
+	if elseBlock != nil {
+		b.cfg.ConnectBlocks(headerBlock, elseBlock, EdgeCondFalse)
+	} else {
+		b.cfg.ConnectBlocks(headerBlock, exitBlock, EdgeCondFalse)
+	}
+
+	// Process loop body
+	b.currentBlock = bodyBlock
+	for _, bodyStmt := range stmt.Body {
+		b.processStatement(bodyStmt)
+	}
+
+	// Connect body back to header (loop back edge)
+	if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+		b.cfg.ConnectBlocks(b.currentBlock, headerBlock, EdgeLoop)
+	}
+
+	// Process else clause if present
+	if elseBlock != nil {
+		b.currentBlock = elseBlock
+		for _, elseStmt := range stmt.Orelse {
+			b.processStatement(elseStmt)
+		}
+		// Connect else to exit
+		if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+			b.cfg.ConnectBlocks(b.currentBlock, exitBlock, EdgeNormal)
+		}
+	}
+
+	// Continue with exit block
+	b.currentBlock = exitBlock
+}
+
+// processWhileStatement handles while loops
+func (b *CFGBuilder) processWhileStatement(stmt *parser.Node) {
+	// Create loop header block (condition evaluation)
+	headerBlock := b.createBlock(LabelLoopHeader)
+	b.cfg.ConnectBlocks(b.currentBlock, headerBlock, EdgeNormal)
+
+	// Add the while statement (condition) to header
+	headerBlock.AddStatement(stmt)
+
+	// Create loop body block
+	bodyBlock := b.createBlock(LabelLoopBody)
+
+	// Create loop exit block
+	exitBlock := b.createBlock(LabelLoopExit)
+
+	// Create else block if present
+	var elseBlock *BasicBlock
+	if len(stmt.Orelse) > 0 {
+		elseBlock = b.createBlock(LabelLoopElse)
+	}
+
+	// Create loop context for break/continue handling
+	loopCtx := &loopContext{
+		headerBlock: headerBlock,
+		exitBlock:   exitBlock,
+		elseBlock:   elseBlock,
+		loopType:    "while",
+	}
+	b.pushLoopContext(loopCtx)
+	defer b.popLoopContext()
+
+	// Connect header to body (condition true)
+	b.cfg.ConnectBlocks(headerBlock, bodyBlock, EdgeCondTrue)
+
+	// Connect header to exit/else (condition false)
+	if elseBlock != nil {
+		b.cfg.ConnectBlocks(headerBlock, elseBlock, EdgeCondFalse)
+	} else {
+		b.cfg.ConnectBlocks(headerBlock, exitBlock, EdgeCondFalse)
+	}
+
+	// Process loop body
+	b.currentBlock = bodyBlock
+	for _, bodyStmt := range stmt.Body {
+		b.processStatement(bodyStmt)
+	}
+
+	// Connect body back to header (loop back edge)
+	if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+		b.cfg.ConnectBlocks(b.currentBlock, headerBlock, EdgeLoop)
+	}
+
+	// Process else clause if present
+	if elseBlock != nil {
+		b.currentBlock = elseBlock
+		for _, elseStmt := range stmt.Orelse {
+			b.processStatement(elseStmt)
+		}
+		// Connect else to exit
+		if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+			b.cfg.ConnectBlocks(b.currentBlock, exitBlock, EdgeNormal)
+		}
+	}
+
+	// Continue with exit block
+	b.currentBlock = exitBlock
+}
+
+// processBreakStatement handles break statements
+func (b *CFGBuilder) processBreakStatement(stmt *parser.Node) {
+	// Add break statement to current block
+	b.currentBlock.AddStatement(stmt)
+
+	// Get the innermost loop context
+	if len(b.loopStack) == 0 {
+		b.logError("break statement outside of loop")
+		return
+	}
+
+	loopCtx := b.loopStack[len(b.loopStack)-1]
+
+	// Find the next finally block that needs to execute before this break completes.
+	// Walk the exception stack from innermost to outermost, skipping any finally
+	// blocks we're currently processing (to avoid self-loops), until we find the first
+	// enclosing finally block that hasn't been entered yet.
+	var targetFinallyBlock *BasicBlock
+	for i := len(b.exceptionStack) - 1; i >= 0; i-- {
+		exceptionCtx := b.exceptionStack[i]
+		// Skip if currently processing this finally block (break is inside finally)
+		if exceptionCtx.processingFinally {
+			continue
+		}
+		if exceptionCtx.finallyBlock != nil {
+			targetFinallyBlock = exceptionCtx.finallyBlock
+			break
+		}
+	}
+
+	if targetFinallyBlock != nil {
+		// Route through the next outer finally block
+		b.cfg.ConnectBlocks(b.currentBlock, targetFinallyBlock, EdgeBreak)
+	} else {
+		// No enclosing finally blocks - connect directly to loop exit
+		b.cfg.ConnectBlocks(b.currentBlock, loopCtx.exitBlock, EdgeBreak)
+	}
+
+	// Create unreachable block for any code after break
+	unreachableBlock := b.createBlock(LabelUnreachableAfterBreak)
+	b.currentBlock = unreachableBlock
+}
+
+// processContinueStatement handles continue statements
+func (b *CFGBuilder) processContinueStatement(stmt *parser.Node) {
+	// Add continue statement to current block
+	b.currentBlock.AddStatement(stmt)
+
+	// Get the innermost loop context
+	if len(b.loopStack) == 0 {
+		b.logError("continue statement outside of loop")
+		return
+	}
+
+	loopCtx := b.loopStack[len(b.loopStack)-1]
+
+	// Find the next finally block that needs to execute before this continue completes.
+	// Walk the exception stack from innermost to outermost, skipping any finally
+	// blocks we're currently processing (to avoid self-loops), until we find the first
+	// enclosing finally block that hasn't been entered yet.
+	var targetFinallyBlock *BasicBlock
+	for i := len(b.exceptionStack) - 1; i >= 0; i-- {
+		exceptionCtx := b.exceptionStack[i]
+		// Skip if currently processing this finally block (continue is inside finally)
+		if exceptionCtx.processingFinally {
+			continue
+		}
+		if exceptionCtx.finallyBlock != nil {
+			targetFinallyBlock = exceptionCtx.finallyBlock
+			break
+		}
+	}
+
+	if targetFinallyBlock != nil {
+		// Route through the next outer finally block
+		b.cfg.ConnectBlocks(b.currentBlock, targetFinallyBlock, EdgeContinue)
+	} else {
+		// No enclosing finally blocks - connect directly to loop header
+		b.cfg.ConnectBlocks(b.currentBlock, loopCtx.headerBlock, EdgeContinue)
+	}
+
+	// Create unreachable block for any code after continue
+	unreachableBlock := b.createBlock(LabelUnreachableAfterContinue)
+	b.currentBlock = unreachableBlock
+}
+
+// pushLoopContext pushes a loop context onto the stack
+func (b *CFGBuilder) pushLoopContext(ctx *loopContext) {
+	b.loopStack = append(b.loopStack, ctx)
+}
+
+// popLoopContext pops the top loop context from the stack
+func (b *CFGBuilder) popLoopContext() {
+	if len(b.loopStack) > 0 {
+		b.loopStack = b.loopStack[:len(b.loopStack)-1]
+	}
+}
+
+// processTryStatement handles try/except/else/finally blocks
+func (b *CFGBuilder) processTryStatement(stmt *parser.Node) {
+	// Create try block
+	tryBlock := b.createBlock(LabelTryBlock)
+	b.cfg.ConnectBlocks(b.currentBlock, tryBlock, EdgeNormal)
+
+	// Create exit block (final convergence point)
+	exitBlock := b.createBlock("try_exit")
+
+	// Create finally block if present
+	var finallyBlock *BasicBlock
+	if len(stmt.Finalbody) > 0 {
+		finallyBlock = b.createBlock(LabelFinallyBlock)
+	}
+
+	// Create else block if present
+	var elseBlock *BasicBlock
+	if len(stmt.Orelse) > 0 {
+		elseBlock = b.createBlock(LabelTryElse)
+	}
+
+	// Create handler blocks for each except clause
+	handlers := make([]*BasicBlock, len(stmt.Handlers))
+	for i := range stmt.Handlers {
+		handlerBlock := b.createBlock(LabelExceptBlock + "_" + strconv.Itoa(i+1))
+		handlers[i] = handlerBlock
+	}
+
+	// Create exception context
+	exceptionCtx := &exceptionContext{
+		tryBlock:     tryBlock,
+		finallyBlock: finallyBlock,
+		handlers:     handlers,
+		elseBlock:    elseBlock,
+	}
+	b.pushExceptionContext(exceptionCtx)
+	defer b.popExceptionContext()
+
+	// Process try body
+	b.currentBlock = tryBlock
+	for _, bodyStmt := range stmt.Body {
+		b.processStatement(bodyStmt)
+	}
+	tryEndBlock := b.currentBlock
+
+	// If no exception, try flows to else (if present) or finally/exit
+	var nextAfterTry *BasicBlock
+	if elseBlock != nil {
+		nextAfterTry = elseBlock
+	} else if finallyBlock != nil {
+		nextAfterTry = finallyBlock
+	} else {
+		nextAfterTry = exitBlock
+	}
+
+	if !b.hasSuccessor(tryEndBlock, b.cfg.Exit) {
+		b.cfg.ConnectBlocks(tryEndBlock, nextAfterTry, EdgeNormal)
+	}
+
+	// Connect try block to all exception handlers
+	for _, handlerBlock := range handlers {
+		b.cfg.ConnectBlocks(tryBlock, handlerBlock, EdgeException)
+	}
+
+	// Process exception handlers
+	for i, handler := range stmt.Handlers {
+		handlerBlock := handlers[i]
+		b.currentBlock = handlerBlock
+
+		// Add the exception handler node itself
+		handlerBlock.AddStatement(handler)
+
+		// Process handler body
+		for _, handlerStmt := range handler.Body {
+			b.processStatement(handlerStmt)
+		}
+
+		// Handler flows to finally (if present) or exit
+		var nextAfterHandler *BasicBlock
+		if finallyBlock != nil {
+			nextAfterHandler = finallyBlock
+		} else {
+			nextAfterHandler = exitBlock
+		}
+
+		if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+			b.cfg.ConnectBlocks(b.currentBlock, nextAfterHandler, EdgeNormal)
+		}
+	}
+
+	// Process else block if present
+	if elseBlock != nil {
+		b.currentBlock = elseBlock
+		for _, elseStmt := range stmt.Orelse {
+			b.processStatement(elseStmt)
+		}
+
+		// Else flows to finally (if present) or exit
+		var nextAfterElse *BasicBlock
+		if finallyBlock != nil {
+			nextAfterElse = finallyBlock
+		} else {
+			nextAfterElse = exitBlock
+		}
+
+		if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+			b.cfg.ConnectBlocks(b.currentBlock, nextAfterElse, EdgeNormal)
+		}
+	}
+
+	// Process finally block if present
+	if finallyBlock != nil {
+		b.currentBlock = finallyBlock
+		// Mark that we're processing this finally block so break/continue/raise
+		// inside it don't route back to themselves
+		exceptionCtx.processingFinally = true
+		for _, finallyStmt := range stmt.Finalbody {
+			b.processStatement(finallyStmt)
+		}
+		exceptionCtx.processingFinally = false
+
+		// Finally flows to exit in the normal case
+		if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+			b.cfg.ConnectBlocks(b.currentBlock, exitBlock, EdgeNormal)
+		}
+
+		// Additionally, if this finally can be reached via return from inner code,
+		// it must propagate that return to the next enclosing finally (if any) or to CFG.Exit.
+		// This handles nested try-finally where an inner finally returns.
+		// We look for the next outer finally block by searching the exception stack
+		// (excluding the current context which is about to be popped).
+		var nextOuterFinally *BasicBlock
+		for i := len(b.exceptionStack) - 2; i >= 0; i-- {
+			if b.exceptionStack[i].finallyBlock != nil {
+				nextOuterFinally = b.exceptionStack[i].finallyBlock
+				break
+			}
+		}
+
+		if nextOuterFinally != nil {
+			// Connect to next outer finally with return edge
+			if !b.hasSuccessor(finallyBlock, nextOuterFinally) {
+				b.cfg.ConnectBlocks(finallyBlock, nextOuterFinally, EdgeReturn)
+			}
+		} else {
+			// No outer finally - connect to CFG.Exit for return propagation
+			if !b.hasSuccessor(finallyBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(finallyBlock, b.cfg.Exit, EdgeReturn)
+			}
+		}
+
+		// Break/Continue propagation: if this finally is inside a loop,
+		// connect to the next outer finally or to the loop exit/header.
+		if len(b.loopStack) > 0 {
+			loopCtx := b.loopStack[len(b.loopStack)-1]
+
+			// Break propagation
+			if nextOuterFinally != nil {
+				if !b.hasSuccessor(finallyBlock, nextOuterFinally) {
+					b.cfg.ConnectBlocks(finallyBlock, nextOuterFinally, EdgeBreak)
+				}
+			} else {
+				if !b.hasSuccessor(finallyBlock, loopCtx.exitBlock) {
+					b.cfg.ConnectBlocks(finallyBlock, loopCtx.exitBlock, EdgeBreak)
+				}
+			}
+
+			// Continue propagation
+			if nextOuterFinally != nil {
+				if !b.hasSuccessor(finallyBlock, nextOuterFinally) {
+					b.cfg.ConnectBlocks(finallyBlock, nextOuterFinally, EdgeContinue)
+				}
+			} else {
+				if !b.hasSuccessor(finallyBlock, loopCtx.headerBlock) {
+					b.cfg.ConnectBlocks(finallyBlock, loopCtx.headerBlock, EdgeContinue)
+				}
+			}
+		}
+
+		// Exception propagation: connect to next outer finally or exception handlers or exit.
+		// This handles raise statements that route through this finally block.
+		if nextOuterFinally != nil {
+			if !b.hasSuccessor(finallyBlock, nextOuterFinally) {
+				b.cfg.ConnectBlocks(finallyBlock, nextOuterFinally, EdgeException)
+			}
+		} else if len(b.exceptionStack) >= 2 {
+			// Connect to exception handlers of the outer try block
+			outerCtx := b.exceptionStack[len(b.exceptionStack)-2]
+			for _, handler := range outerCtx.handlers {
+				if !b.hasSuccessor(finallyBlock, handler) {
+					b.cfg.ConnectBlocks(finallyBlock, handler, EdgeException)
+				}
+			}
+		} else {
+			// No outer context - connect to exit for exception propagation
+			if !b.hasSuccessor(finallyBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(finallyBlock, b.cfg.Exit, EdgeException)
+			}
+		}
+	}
+
+	// Continue with exit block
+	b.currentBlock = exitBlock
+}
+
+// processRaiseStatement handles raise statements
+func (b *CFGBuilder) processRaiseStatement(stmt *parser.Node) {
+	// Add raise statement to current block
+	b.currentBlock.AddStatement(stmt)
+
+	// Find the next finally block that needs to execute before this raise propagates.
+	// Walk the exception stack from innermost to outermost, skipping any finally
+	// blocks we're currently processing (to avoid self-loops), until we find the first
+	// enclosing finally block that hasn't been entered yet.
+	var targetFinallyBlock *BasicBlock
+	var fallbackExceptionCtx *exceptionContext
+	for i := len(b.exceptionStack) - 1; i >= 0; i-- {
+		exceptionCtx := b.exceptionStack[i]
+		// Skip if currently processing this finally block (raise is inside finally)
+		if exceptionCtx.processingFinally {
+			continue
+		}
+		// Remember the first non-processing context for fallback to handlers
+		if fallbackExceptionCtx == nil {
+			fallbackExceptionCtx = exceptionCtx
+		}
+		if exceptionCtx.finallyBlock != nil {
+			targetFinallyBlock = exceptionCtx.finallyBlock
+			break
+		}
+	}
+
+	if targetFinallyBlock != nil {
+		// Route through the next outer finally block
+		b.cfg.ConnectBlocks(b.currentBlock, targetFinallyBlock, EdgeException)
+	} else if fallbackExceptionCtx != nil && len(fallbackExceptionCtx.handlers) > 0 {
+		// No finally blocks - connect to exception handlers
+		for _, handler := range fallbackExceptionCtx.handlers {
+			b.cfg.ConnectBlocks(b.currentBlock, handler, EdgeException)
+		}
+	} else {
+		// No exception context - connect to exit (unhandled exception)
+		b.cfg.ConnectBlocks(b.currentBlock, b.cfg.Exit, EdgeException)
+	}
+
+	// Create unreachable block for any code after raise
+	unreachableBlock := b.createBlock(LabelUnreachableAfterRaise)
+	b.currentBlock = unreachableBlock
+}
+
+// pushExceptionContext pushes an exception context onto the stack
+func (b *CFGBuilder) pushExceptionContext(ctx *exceptionContext) {
+	b.exceptionStack = append(b.exceptionStack, ctx)
+}
+
+// popExceptionContext pops the top exception context from the stack
+func (b *CFGBuilder) popExceptionContext() {
+	if len(b.exceptionStack) > 0 {
+		b.exceptionStack = b.exceptionStack[:len(b.exceptionStack)-1]
+	}
+}
+
+// processWithStatement handles with and async with statements
+func (b *CFGBuilder) processWithStatement(stmt *parser.Node) {
+	// Create setup block (context manager entry)
+	setupBlock := b.createBlock(LabelWithSetup)
+	b.cfg.ConnectBlocks(b.currentBlock, setupBlock, EdgeNormal)
+
+	// Add the with statement (context manager setup) to setup block
+	setupBlock.AddStatement(stmt)
+
+	// Create body block
+	bodyBlock := b.createBlock(LabelWithBody)
+
+	// Create teardown block (context manager exit - always executed)
+	teardownBlock := b.createBlock(LabelWithTeardown)
+
+	// Create exit block
+	exitBlock := b.createBlock("with_exit")
+
+	// Connect setup to body
+	b.cfg.ConnectBlocks(setupBlock, bodyBlock, EdgeNormal)
+
+	// Process with body
+	b.currentBlock = bodyBlock
+	for _, bodyStmt := range stmt.Body {
+		b.processStatement(bodyStmt)
+	}
+
+	// Connect body to teardown (normal flow)
+	if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+		b.cfg.ConnectBlocks(b.currentBlock, teardownBlock, EdgeNormal)
+	}
+
+	// Connect setup to teardown (exception flow - context manager should clean up)
+	b.cfg.ConnectBlocks(setupBlock, teardownBlock, EdgeException)
+
+	// Process teardown (context manager exit)
+	b.currentBlock = teardownBlock
+
+	// Connect teardown to exit
+	b.cfg.ConnectBlocks(teardownBlock, exitBlock, EdgeNormal)
+
+	// Continue with exit block
+	b.currentBlock = exitBlock
+}
+
+// processMatchStatement handles match statements (Python 3.10+)
+func (b *CFGBuilder) processMatchStatement(stmt *parser.Node) {
+	// Create match evaluation block
+	matchBlock := b.createBlock(LabelMatchEval)
+	b.cfg.ConnectBlocks(b.currentBlock, matchBlock, EdgeNormal)
+
+	// Add the match statement (subject evaluation) to match block
+	matchBlock.AddStatement(stmt)
+
+	// Create exit/merge block
+	mergeBlock := b.createBlock(LabelMatchMerge)
+
+	// Process match cases
+	if len(stmt.Body) > 0 {
+		for i, caseNode := range stmt.Body {
+			// Create case block
+			caseBlock := b.createBlock(LabelMatchCase + "_" + strconv.Itoa(i+1))
+
+			// Connect match evaluation to this case (conditional edge)
+			b.cfg.ConnectBlocks(matchBlock, caseBlock, EdgeCondTrue)
+
+			// Process case body
+			b.currentBlock = caseBlock
+
+			// Add the case node itself
+			caseBlock.AddStatement(caseNode)
+
+			// Process case body statements
+			for _, caseStmt := range caseNode.Body {
+				b.processStatement(caseStmt)
+			}
+
+			// Connect case to merge (if not already connected to exit)
+			if !b.hasSuccessor(b.currentBlock, b.cfg.Exit) {
+				b.cfg.ConnectBlocks(b.currentBlock, mergeBlock, EdgeNormal)
+			}
+		}
+
+		// If no case matches, connect match to merge (default case)
+		b.cfg.ConnectBlocks(matchBlock, mergeBlock, EdgeCondFalse)
+	} else {
+		// No cases - connect directly to merge
+		b.cfg.ConnectBlocks(matchBlock, mergeBlock, EdgeNormal)
+	}
+
+	// Continue with merge block
+	b.currentBlock = mergeBlock
+}
+
+// processComprehension handles list/dict/set comprehensions and generator expressions
+func (b *CFGBuilder) processComprehension(node *parser.Node) {
+	// Comprehensions are modeled as implicit loops that build a result
+	// Structure: init -> loop_header -> [filter] -> body -> append -> loop_header
+	//                 \-> exit
+
+	// Create initialization block (creates result container)
+	initBlock := b.createBlock(LabelCompInit)
+	b.cfg.ConnectBlocks(b.currentBlock, initBlock, EdgeNormal)
+
+	// Add the comprehension node to init block for result container creation
+	initBlock.AddStatement(node)
+
+	// Create exit block (returns completed result)
+	exitBlock := b.createBlock(LabelCompExit)
+
+	// Keep track of the current processing block
+	currentProcessBlock := initBlock
+
+	// Process each for_in_clause (comprehension child)
+	// Comprehensions can have multiple for clauses that nest
+	for _, child := range node.Children {
+		if child.Type == parser.NodeComprehension {
+			// Create loop header block for this iterator
+			headerBlock := b.createBlock(LabelCompHeader)
+			b.cfg.ConnectBlocks(currentProcessBlock, headerBlock, EdgeNormal)
+
+			// Add iterator evaluation to header
+			if child.Iter != nil {
+				headerBlock.AddStatement(child.Iter)
+			}
+
+			// Create body block for element processing
+			bodyBlock := b.createBlock(LabelCompBody)
+
+			// Connect header to body (has more elements)
+			b.cfg.ConnectBlocks(headerBlock, bodyBlock, EdgeCondTrue)
+
+			// Check if there's a filter condition
+			if child.Test != nil {
+				// Create filter block
+				filterBlock := b.createBlock(LabelCompFilter)
+				b.cfg.ConnectBlocks(bodyBlock, filterBlock, EdgeNormal)
+
+				// Add filter test
+				filterBlock.AddStatement(child.Test)
+
+				// Create append block for when filter passes
+				appendBlock := b.createBlock(LabelCompAppend)
+				b.cfg.ConnectBlocks(filterBlock, appendBlock, EdgeCondTrue)
+
+				// Filter false goes back to loop header (skip this element)
+				b.cfg.ConnectBlocks(filterBlock, headerBlock, EdgeCondFalse)
+
+				// Process element generation/transformation
+				if node.Value != nil {
+					if valueNode, ok := node.Value.(*parser.Node); ok {
+						appendBlock.AddStatement(valueNode)
+					}
+				}
+
+				// Loop back to header from append
+				b.cfg.ConnectBlocks(appendBlock, headerBlock, EdgeLoop)
+			} else {
+				// No filter - process element directly in body
+				if node.Value != nil {
+					if valueNode, ok := node.Value.(*parser.Node); ok {
+						bodyBlock.AddStatement(valueNode)
+					}
+				}
+
+				// Create append block
+				appendBlock := b.createBlock(LabelCompAppend)
+				b.cfg.ConnectBlocks(bodyBlock, appendBlock, EdgeNormal)
+
+				// Loop back to header
+				b.cfg.ConnectBlocks(appendBlock, headerBlock, EdgeLoop)
+			}
+
+			// When iterator is exhausted, exit this comprehension level
+			// For nested comprehensions, this continues to next level
+			currentProcessBlock = headerBlock
+		}
+	}
+
+	// Connect the last header block to exit when all iterators are exhausted
+	if currentProcessBlock != initBlock {
+		// Find the last header block and connect it to exit
+		b.cfg.ConnectBlocks(currentProcessBlock, exitBlock, EdgeCondFalse)
+	} else {
+		// No comprehension clauses found (shouldn't happen in valid code)
+		b.cfg.ConnectBlocks(initBlock, exitBlock, EdgeNormal)
+	}
+
+	// Continue with exit block
+	b.currentBlock = exitBlock
+}
+
+// blockBaseLabel returns the label createBlock was given, without the
+// "_<counter>" suffix it appends.
+func blockBaseLabel(block *BasicBlock) string {
+	return block.Label[:max(strings.LastIndexByte(block.Label, '_'), 0)]
+}
+
+// createBlock creates a new basic block
+func (b *CFGBuilder) createBlock(label string) *BasicBlock {
+	b.blockCounter++
+	blockLabel := label + "_" + strconv.FormatUint(uint64(b.blockCounter), 10)
+	return b.cfg.CreateBlock(blockLabel)
+}
+
+// enterScope enters a new scope
+func (b *CFGBuilder) enterScope(name string) {
+	b.scopeStack = append(b.scopeStack, name)
+}
+
+// exitScope exits the current scope
+func (b *CFGBuilder) exitScope() {
+	if len(b.scopeStack) > 0 {
+		b.scopeStack = b.scopeStack[:len(b.scopeStack)-1]
+	}
+}
+
+// getFullScopeName returns the fully qualified scope name
+func (b *CFGBuilder) getFullScopeName(name string) string {
+	if len(b.scopeStack) == 0 {
+		return name
+	}
+
+	// Use strings.Join for efficient concatenation
+	scopePath := strings.Join(b.scopeStack, ".")
+	if scopePath == "" {
+		return name
+	}
+	return scopePath + "." + name
+}
+
+// hasSuccessor checks if a block has a specific successor
+func (b *CFGBuilder) hasSuccessor(from, to *BasicBlock) bool {
+	if from == nil || to == nil {
+		return false
+	}
+	for _, edge := range from.Successors {
+		if edge.To == to {
+			return true
+		}
+	}
+	return false
+}
+
+// getCurrentScope returns the current scope name
+func (b *CFGBuilder) getCurrentScope() string {
+	if len(b.scopeStack) == 0 {
+		return ""
+	}
+	return b.scopeStack[len(b.scopeStack)-1]
+}
+
+// convertElifClauseToIf converts an elif_clause node to an If node
+func (b *CFGBuilder) convertElifClauseToIf(elifNode *parser.Node) *parser.Node {
+	// Create an If node from elif_clause
+	// The parser's buildElifClause() already populates Test, Body, and Orelse from tree-sitter fields
+	ifNode := &parser.Node{
+		Type:   parser.NodeIf,
+		Test:   elifNode.Test,
+		Body:   elifNode.Body,
+		Orelse: elifNode.Orelse,
+	}
+
+	// Validation: panic if expected fields are missing (indicates parser bug)
+	// This is a programming error, not a user input error, so fail-fast is appropriate
+	if len(ifNode.Body) == 0 || ifNode.Test == nil {
+		panic(fmt.Sprintf(
+			"Invalid elif_clause node at %s:%d - parser bug detected (Test exists: %v, Body length: %d)",
+			elifNode.Location.File,
+			elifNode.Location.StartLine,
+			ifNode.Test != nil,
+			len(ifNode.Body),
+		))
+	}
+
+	return ifNode
+}
+
+// blockTerminates checks if a block ends with a terminating statement
+// (return, raise, break, or continue)
+// Only checks the last statement to avoid false positives from nested control flow
+func (b *CFGBuilder) blockTerminates(block *BasicBlock) bool {
+	if block == nil || len(block.Statements) == 0 {
+		return false
+	}
+
+	// Check only the last statement in the block
+	lastStmt := mustPythonNode(block.Statements[len(block.Statements)-1])
+	return lastStmt.Type == parser.NodeReturn ||
+		lastStmt.Type == parser.NodeRaise ||
+		lastStmt.Type == parser.NodeBreak ||
+		lastStmt.Type == parser.NodeContinue
+}
+
+// allBranchesTerminate checks if all branches of a conditional terminate
+// Returns true only if there is an else branch and all paths terminate
+func (b *CFGBuilder) allBranchesTerminate(thenEndBlock, elseEndBlock *BasicBlock, hasElse bool) bool {
+	// If there's no else branch, not all paths terminate
+	if !hasElse || elseEndBlock == nil {
+		return false
+	}
+
+	// Check if both then and else branches terminate
+	return b.blockTerminates(thenEndBlock) && b.blockTerminates(elseEndBlock)
+}

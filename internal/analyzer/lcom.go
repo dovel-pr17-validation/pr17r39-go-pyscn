@@ -1,0 +1,1372 @@
+package analyzer
+
+import (
+	"fmt"
+
+	corelcom "github.com/ludo-technologies/polyscan/core/lcom"
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+)
+
+// LCOMResult holds LCOM4 (Lack of Cohesion of Methods) metrics for a class
+type LCOMResult struct {
+	// Core LCOM4 metric - number of connected components
+	LCOM4 int
+
+	// Class information
+	ClassName string
+	FilePath  string
+	StartLine int
+	EndLine   int
+
+	// Method statistics
+	TotalMethods    int // All methods found in class
+	ExcludedMethods int // @staticmethod/@classmethod/@abstractmethod, constructors, implicit classmethods, empty-bodied methods, and stateless methods excluded
+
+	// Instance variable count
+	InstanceVariables int // Distinct self.xxx variables
+
+	// Connected component details
+	MethodGroups [][]string // Method names grouped by connected component
+
+	// Risk assessment
+	RiskLevel string // "low", "medium", "high"
+}
+
+// LCOMOptions configures LCOM analysis behavior
+type LCOMOptions struct {
+	LowThreshold    int // Default: 2 (LCOM4 <= 2 is low risk)
+	MediumThreshold int // Default: 5 (LCOM4 3-5 is medium risk)
+}
+
+// DefaultLCOMOptions returns default LCOM analysis options
+func DefaultLCOMOptions() *LCOMOptions {
+	return &LCOMOptions{
+		LowThreshold:    domain.DefaultLCOMLowThreshold,
+		MediumThreshold: domain.DefaultLCOMMediumThreshold,
+	}
+}
+
+// LCOMAnalyzer analyzes class cohesion in Python code
+type LCOMAnalyzer struct {
+	options *LCOMOptions
+}
+
+// NewLCOMAnalyzer creates a new LCOM analyzer
+func NewLCOMAnalyzer(options *LCOMOptions) *LCOMAnalyzer {
+	if options == nil {
+		options = DefaultLCOMOptions()
+	}
+	return &LCOMAnalyzer{
+		options: options,
+	}
+}
+
+// AnalyzeClasses analyzes LCOM4 for all classes in the given AST
+func (a *LCOMAnalyzer) AnalyzeClasses(ast *parser.Node, filePath string) ([]*LCOMResult, error) {
+	if ast == nil {
+		return nil, fmt.Errorf("AST is nil")
+	}
+
+	// Collect all class definitions
+	classes := a.collectClasses(ast)
+	ctypesFields := a.collectCtypesFields(ast, classes)
+	imports := collectImportBindings(ast)
+
+	var results []*LCOMResult
+	for _, classNode := range classes {
+		// Protocols and enums carry no instance state to be cohesive about:
+		// a Protocol only declares signatures and an Enum only declares
+		// members, so every method would land in its own component.
+		if imports.isStructuralClass(classNode) {
+			continue
+		}
+		result, err := a.analyzeClass(classNode, filePath, ctypesFields[classNode])
+		if err != nil {
+			continue
+		}
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+// analyzeClass computes LCOM4 for a single class using connected components
+func (a *LCOMAnalyzer) analyzeClass(classNode *parser.Node, filePath string, declaredFields map[string]bool) (*LCOMResult, error) {
+	if classNode.Type != parser.NodeClassDef {
+		return nil, fmt.Errorf("node is not a class definition")
+	}
+
+	result := &LCOMResult{
+		ClassName:    classNode.Name,
+		FilePath:     filePath,
+		StartLine:    classNode.Location.StartLine,
+		EndLine:      classNode.Location.EndLine,
+		MethodGroups: [][]string{},
+	}
+
+	methodNames := a.collectMethodNames(classNode, func(*parser.Node) bool { return true })
+
+	// Step 1: Collect methods, their instance variable accesses, and intra-class calls
+	collected := a.collectMethods(classNode, declaredFields)
+	methods, methodCalls := collected.methods, collected.calls
+	result.TotalMethods = len(methods) + collected.excluded
+	result.ExcludedMethods = collected.excluded
+
+	// Step 2: Collect all distinct instance variables, including the ones only a
+	// constructor touches and ctypes-declared fields that no method accesses.
+	// A `self.<name>` reference to a method defined in the class body is a
+	// method, not instance state.
+	allVars := make(map[string]bool)
+	for _, vars := range methods {
+		for v := range vars {
+			if !methodNames[v] {
+				allVars[v] = true
+			}
+		}
+	}
+	for v := range collected.excludedVars {
+		if !methodNames[v] {
+			allVars[v] = true
+		}
+	}
+	for v := range declaredFields {
+		allVars[v] = true
+	}
+	result.InstanceVariables = len(allVars)
+
+	config := corelcom.Config{
+		LowThreshold:    a.options.LowThreshold,
+		MediumThreshold: a.options.MediumThreshold,
+	}
+
+	// Classes without methods are trivially cohesive (core reports LCOM4=0 for empty input)
+	if len(methods) == 0 {
+		result.LCOM4 = 1
+		result.RiskLevel = string(corelcom.AssessRisk(result.LCOM4, config))
+		return result, nil
+	}
+
+	// Steps 3+4: Connected components via shared-variable and call-edge unions
+	accesses := make([]corelcom.MethodAccess, 0, len(methods))
+	for name, vars := range methods {
+		accesses = append(accesses, corelcom.MethodAccess{
+			MethodName:   name,
+			InstanceVars: vars,
+			Calls:        methodCalls[name],
+		})
+	}
+	coreResult := corelcom.ComputeLCOM4(accesses, config)
+
+	result.LCOM4 = coreResult.LCOM4
+	result.MethodGroups = coreResult.MethodGroups
+	result.RiskLevel = string(coreResult.RiskLevel)
+	return result, nil
+}
+
+// classMethods holds the method-level facts LCOM4 is computed from.
+type classMethods struct {
+	// methods maps a participating method name to the set of instance
+	// variables it accesses.
+	methods map[string]map[string]bool
+
+	// calls holds explicit and protocol-inferred call candidates for each
+	// participating method. Core ignores callees outside the participating set.
+	calls map[string]map[string]bool
+
+	// excludedVars holds instance variables reached only by excluded methods,
+	// so the reported InstanceVariables count still covers attributes that a
+	// constructor introduces.
+	excludedVars map[string]bool
+
+	// excluded counts the methods kept out of the graph.
+	excluded int
+
+	// accessorFields maps a participating method whose body has the shape of a
+	// trivial one-field accessor to the instance variable it reads or writes.
+	accessorFields map[string]string
+}
+
+// collectMethods extracts instance methods and their self.xxx variable accesses from a class.
+func (a *LCOMAnalyzer) collectMethods(classNode *parser.Node, declaredFields map[string]bool) classMethods {
+	methods := make(map[string]map[string]bool)
+	calls := make(map[string]map[string]bool)
+	excludedVars := make(map[string]bool)
+	accessorFields := make(map[string]string)
+	rejectedAccessors := make(map[string]bool)
+	excluded := 0
+
+	// A bare `self.<name>` read of a @property is a method invocation via the
+	// descriptor protocol, not a field access. Collect property names first so
+	// such reads can be recorded as call edges instead of instance variables.
+	propertyNames := a.collectPropertyNames(classNode)
+	propertyProtocol := a.collectPropertyProtocolNames(classNode)
+	protocolDefinitions := collectProtocolDefinitions(classNode)
+	inheritedCalls := a.collectInheritedCalls(classNode, declaredFields)
+
+	for _, node := range classNode.Body {
+		if node == nil {
+			continue
+		}
+
+		if node.Type != parser.NodeFunctionDef && node.Type != parser.NodeAsyncFunctionDef {
+			continue
+		}
+
+		// Check decorators to exclude @classmethod and @staticmethod
+		if a.isClassOrStaticMethod(node) {
+			excluded++
+			continue
+		}
+
+		// Constructors initialize every attribute of the class, so leaving them
+		// in the graph unions all the responsibility clusters they set up and
+		// collapses LCOM4 to 1 for almost any class. Keep their variables for
+		// the InstanceVariables count, but keep the method out of the graph.
+		// Dunder hooks that Python treats as classmethods without a decorator,
+		// and bodies with no statements to access state through.
+		if isImplicitClassMethod(node.Name) || isEmptyBody(node.Body) {
+			excluded++
+			continue
+		}
+
+		if isConstructor(node.Name) {
+			excluded++
+			ctorVars := make(map[string]bool)
+			a.extractInstanceVars(node, ctorVars)
+			for name := range ctorVars {
+				// Same reclassification the participating methods below get: a
+				// bare `self.<prop>` read invokes the getter, so it is not an
+				// instance variable. The constructor is out of the graph, so
+				// there is no call edge left to record for it.
+				if propertyNames[name] || inheritedCalls[name] {
+					continue
+				}
+				excludedVars[name] = true
+			}
+			continue
+		}
+
+		// Extract self.xxx accesses from method body
+		vars := make(map[string]bool)
+		a.extractInstanceVars(node, vars)
+		// A `self.<name>()` call to a method inherited from a base class is the
+		// same call as `super().<name>()`, which records nothing, so it is not
+		// instance state either.
+		for name := range inheritedCalls {
+			delete(vars, name)
+		}
+		if len(declaredFields) > 0 && a.hasBareSelfAccess(node) {
+			for field := range declaredFields {
+				vars[field] = true
+			}
+		}
+		// Two definitions of a property-protocol name share one attribute: a
+		// @property getter and its @<name>.setter (or .deleter) are both live
+		// at runtime. Union the accesses of both instead of letting the last
+		// definition parsed drop the earlier one's, which lost the edges
+		// linking the name to the rest of the class (#879). Plain re-definitions
+		// keep last-wins: only the final def is live Python semantics.
+		if existing, ok := methods[node.Name]; ok && propertyProtocol[node.Name] {
+			for v := range vars {
+				existing[v] = true
+			}
+			vars = existing
+		} else {
+			methods[node.Name] = vars
+		}
+		// The accessor shape is judged per definition. For a merged
+		// property-protocol name every definition is live at runtime, so a
+		// rejected shape must stick: a later trivial definition of the same
+		// name must not restore the candidacy, otherwise a getter with a
+		// self-dependent branch paired with a one-line setter gets excluded
+		// as a trivial accessor while the same pair written as plain methods
+		// stays in the graph. Plain re-definitions keep last-wins: only the
+		// final def is live Python semantics.
+		switch {
+		case rejectedAccessors[node.Name] && propertyProtocol[node.Name]:
+			// Sticky rejection for merged property-protocol names.
+		default:
+			if field, ok := a.trivialAccessorField(node); ok {
+				if prev, seen := accessorFields[node.Name]; seen && propertyProtocol[node.Name] && prev != field {
+					delete(accessorFields, node.Name)
+					rejectedAccessors[node.Name] = true
+				} else {
+					accessorFields[node.Name] = field
+				}
+			} else {
+				delete(accessorFields, node.Name)
+				if propertyProtocol[node.Name] {
+					rejectedAccessors[node.Name] = true
+				}
+			}
+		}
+
+		methodCalls := make(map[string]bool)
+		a.extractMethodCalls(node, methodCalls, protocolDefinitions, len(classNode.Bases) == 0)
+
+		// Reclassify bare `self.<prop>` reads: a property access invokes the
+		// getter via the descriptor protocol, so it is a call edge to that
+		// property, not an instance-variable access. Leaving it as a variable
+		// isolates the consuming method and overcounts LCOM4.
+		for name := range propertyNames {
+			if name != node.Name && vars[name] {
+				methodCalls[name] = true
+				delete(vars, name)
+			}
+		}
+
+		if existingCalls, ok := calls[node.Name]; ok && propertyProtocol[node.Name] {
+			for c := range methodCalls {
+				existingCalls[c] = true
+			}
+		} else {
+			calls[node.Name] = methodCalls
+		}
+	}
+
+	collected := classMethods{
+		methods:        methods,
+		calls:          calls,
+		excludedVars:   excludedVars,
+		excluded:       excluded,
+		accessorFields: accessorFields,
+	}
+	excludeStatelessMethods(&collected)
+	excludeTrivialAccessors(&collected)
+	return collected
+}
+
+// excludeStatelessMethods moves participating methods that touch no instance
+// state and share no call edge with another participating method out of the
+// graph. Such a method can only be its own component, so leaving it in
+// inflates LCOM4 without naming anything to split, the same reason abstract
+// methods stay out. The decision is made once against the full set: dropping
+// one method must not pull its former neighbors out with it. Self-recursion
+// and callees outside the participating set do not count, since core ignores
+// those edges. A bare `self` that expands to declared ctypes fields is already
+// in the variable set, so that method stays.
+func excludeStatelessMethods(collected *classMethods) {
+	var stateless []string
+	for name, vars := range collected.methods {
+		if len(vars) > 0 || methodConnectedByCall(collected.methods, collected.calls, name) {
+			continue
+		}
+		stateless = append(stateless, name)
+	}
+	for _, name := range stateless {
+		delete(collected.methods, name)
+		delete(collected.calls, name)
+		collected.excluded++
+	}
+}
+
+// excludeTrivialAccessors moves one-field getters and setters out of the graph.
+// Such a method touches a single variable whose other uses are in the
+// constructor, in subclasses or through another receiver, so it always ends up
+// as its own component and inflates LCOM4 without naming anything to split.
+// A method qualifies when its body has the accessor shape (see
+// trivialAccessorField), it touches exactly that one variable, it shares no call
+// edge with another participating method, and no participating non-accessor
+// method touches the variable. Like the stateless pass, the decision is made
+// once against the full set. The variable stays in the InstanceVariables count.
+func excludeTrivialAccessors(collected *classMethods) {
+	candidates := make(map[string]string)
+	for name, field := range collected.accessorFields {
+		vars, ok := collected.methods[name]
+		if !ok || len(vars) != 1 || !vars[field] || methodConnectedByCall(collected.methods, collected.calls, name) {
+			continue
+		}
+		candidates[name] = field
+	}
+	var accessors []string
+	for name, field := range candidates {
+		shared := false
+		for other, vars := range collected.methods {
+			if _, isCandidate := candidates[other]; !isCandidate && vars[field] {
+				shared = true
+				break
+			}
+		}
+		if !shared {
+			accessors = append(accessors, name)
+		}
+	}
+	for _, name := range accessors {
+		collected.excludedVars[candidates[name]] = true
+		delete(collected.methods, name)
+		delete(collected.calls, name)
+		collected.excluded++
+	}
+}
+
+// trivialAccessorField reports whether a method body has the shape of a one-field
+// accessor and returns that field. Every statement must be one of:
+//   - a docstring, or pass
+//   - `self.<field> = <expr without self>`
+//   - `return self.<field>`, `return self`, `return <constant>` or a bare return
+//   - a guard that does not use self: `assert <cond>`, or `if <cond>: raise ...`
+//
+// and the statements must touch exactly one field between them.
+func (a *LCOMAnalyzer) trivialAccessorField(fn *parser.Node) (string, bool) {
+	field := ""
+	use := func(name string) bool {
+		if field == "" {
+			field = name
+		}
+		return name != "" && name == field
+	}
+	for _, stmt := range fn.Body {
+		if stmt == nil {
+			continue
+		}
+		switch stmt.Type {
+		case parser.NodeConstant, parser.NodePass:
+		case parser.NodeAssign:
+			if len(stmt.Targets) != 1 || stmt.Targets[0].Type != parser.NodeAttribute || !isDirectSelfAttribute(stmt.Targets[0]) {
+				return "", false
+			}
+			if mentionsSelf(nodeValue(stmt)) || !use(stmt.Targets[0].Name) {
+				return "", false
+			}
+		case parser.NodeReturn:
+			value := nodeValue(stmt)
+			switch {
+			case value == nil, value.Type == parser.NodeConstant:
+			case value.Type == parser.NodeName && value.Name == "self":
+			case value.Type == parser.NodeAttribute && isDirectSelfAttribute(value):
+				if !use(value.Name) {
+					return "", false
+				}
+			default:
+				return "", false
+			}
+		case parser.NodeAssert:
+			if mentionsSelf(stmt.Test) {
+				return "", false
+			}
+		case parser.NodeIf:
+			if mentionsSelf(stmt.Test) || len(stmt.Orelse) > 0 || len(stmt.Body) == 0 {
+				return "", false
+			}
+			for _, inner := range stmt.Body {
+				if inner == nil || inner.Type != parser.NodeRaise || mentionsSelf(inner) {
+					return "", false
+				}
+			}
+		default:
+			return "", false
+		}
+	}
+	return field, field != ""
+}
+
+// isDirectSelfAttribute reports whether node is `self.<name>` with self as the
+// immediate base, as opposed to `self.a.b` or `other.<name>`.
+func isDirectSelfAttribute(node *parser.Node) bool {
+	if node.Name == "" {
+		return false
+	}
+	base := nodeValue(node)
+	if base == nil {
+		base = node.Left
+	}
+	return base != nil && base.Type == parser.NodeName && base.Name == "self"
+}
+
+// methodConnectedByCall reports whether name calls, or is called by, a
+// different method that is still in the participating set.
+func methodConnectedByCall(methods map[string]map[string]bool, calls map[string]map[string]bool, name string) bool {
+	for callee := range calls[name] {
+		if callee == name {
+			continue
+		}
+		if _, ok := methods[callee]; ok {
+			return true
+		}
+	}
+	for caller, callees := range calls {
+		if caller == name || !callees[name] {
+			continue
+		}
+		if _, ok := methods[caller]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isImplicitClassMethod reports whether a dunder method is implicitly a
+// classmethod. These receive `cls`, so they can never touch instance state.
+func isImplicitClassMethod(name string) bool {
+	return name == "__init_subclass__" || name == "__class_getitem__"
+}
+
+// isEmptyBody reports whether a method body only declares the method without
+// implementing it: a docstring, `...`, `pass`, or `raise NotImplementedError`
+// in any combination. Such stubs (Protocol members, ABC-style interfaces,
+// subclass hooks) cannot access instance state, so counting them would only
+// inflate LCOM4.
+func isEmptyBody(body []*parser.Node) bool {
+	for _, stmt := range body {
+		if stmt == nil {
+			continue
+		}
+		switch stmt.Type {
+		case parser.NodePass, parser.NodeConstant, parser.NodeEllipsis:
+			continue
+		case parser.NodeRaise:
+			if raisesNotImplemented(stmt) {
+				continue
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// raisesNotImplemented reports whether a raise statement is a bare
+// `raise NotImplementedError` or `raise NotImplementedError(...)` that never
+// touches self. Arguments or a `from` cause that read instance state (or call
+// sibling methods) make the method a real participant in the cohesion graph.
+func raisesNotImplemented(raiseNode *parser.Node) bool {
+	exc := nodeValue(raiseNode)
+	if exc == nil {
+		return false
+	}
+	if exc.Type == parser.NodeCall {
+		exc = nodeValue(exc)
+	}
+	if exc == nil || exc.Type != parser.NodeName || exc.Name != "NotImplementedError" {
+		return false
+	}
+	return !mentionsSelf(raiseNode)
+}
+
+func mentionsSelf(node *parser.Node) bool {
+	if node == nil {
+		return false
+	}
+	found := false
+	node.WalkDeep(func(n *parser.Node) bool {
+		if n.Type == parser.NodeName && n.Name == "self" {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// structuralBases are the fully qualified base classes whose subclasses hold
+// no instance state for methods to share, making LCOM4 meaningless for them.
+var structuralBases = map[string]bool{
+	"typing.Protocol":            true,
+	"typing_extensions.Protocol": true,
+	"enum.Enum":                  true,
+	"enum.IntEnum":               true,
+	"enum.StrEnum":               true,
+	"enum.Flag":                  true,
+	"enum.IntFlag":               true,
+	"enum.ReprEnum":              true,
+}
+
+// importBindings maps the names an import statement binds in the module to
+// the fully qualified name they refer to, so that a base class can be
+// resolved to its origin rather than matched on its bare name (a Twisted
+// `protocol.Protocol` must not be mistaken for `typing.Protocol`).
+type importBindings struct {
+	names     map[string]string // bound name -> qualified name ("Protocol" -> "typing.Protocol", "t" -> "typing")
+	wildcards []string          // modules imported via `from m import *`
+}
+
+func collectImportBindings(ast *parser.Node) importBindings {
+	imports := importBindings{names: make(map[string]string)}
+	ast.WalkDeep(func(node *parser.Node) bool {
+		switch node.Type {
+		case parser.NodeImport, parser.NodeImportFrom:
+		default:
+			return true
+		}
+		prefix := ""
+		if node.Type == parser.NodeImportFrom {
+			if node.Level > 0 {
+				return true
+			}
+			prefix = node.Module + "."
+		}
+		aliased := make(map[string]bool)
+		for _, child := range node.Children {
+			if child == nil || child.Type != parser.NodeAlias {
+				continue
+			}
+			if alias, ok := child.Value.(string); ok && alias != "" {
+				aliased[child.Name] = true
+				imports.names[alias] = prefix + child.Name
+			}
+		}
+		for _, name := range node.Names {
+			if aliased[name] {
+				continue
+			}
+			if name == "*" {
+				imports.wildcards = append(imports.wildcards, node.Module)
+				continue
+			}
+			// `import a.b` binds `a` to package `a`; `from m import x` binds `x`.
+			bound := importBindingName(name)
+			imports.names[bound] = prefix + bound
+		}
+		return true
+	})
+	return imports
+}
+
+// isStructuralClass reports whether a class derives from typing.Protocol or
+// an enum.Enum variant, resolving aliases, `typing.Protocol`, `Protocol[T]`
+// and `typing.Protocol[T]` forms alike.
+func (imports importBindings) isStructuralClass(classNode *parser.Node) bool {
+	for _, base := range classNode.Bases {
+		if structuralBases[imports.resolveBase(base)] {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBase returns the fully qualified name a base class expression refers
+// to, or "" when it cannot be traced back to an import.
+func (imports importBindings) resolveBase(base *parser.Node) string {
+	if base == nil {
+		return ""
+	}
+	if base.Type == parser.NodeSubscript {
+		base = nodeValue(base)
+		if base == nil {
+			return ""
+		}
+	}
+	switch base.Type {
+	case parser.NodeName:
+		if qualified, ok := imports.names[base.Name]; ok {
+			return qualified
+		}
+		for _, module := range imports.wildcards {
+			if structuralBases[module+"."+base.Name] {
+				return module + "." + base.Name
+			}
+		}
+	case parser.NodeAttribute:
+		if module := nodeValue(base); module != nil && module.Type == parser.NodeName {
+			if qualified, ok := imports.names[module.Name]; ok {
+				return qualified + "." + base.Name
+			}
+		}
+	}
+	return ""
+}
+
+// isConstructor reports whether a method builds the instance rather than using
+// it. `__init__` and `__new__` are Python's constructors; `__post_init__` is the
+// dataclass equivalent and initializes attributes the same way.
+func isConstructor(name string) bool {
+	switch name {
+	case "__init__", "__new__", "__post_init__":
+		return true
+	default:
+		return false
+	}
+}
+
+// isClassOrStaticMethod checks if a method has a @classmethod, @staticmethod, or
+// @abstractmethod decorator. Abstract methods are excluded because they do not
+// access instance variables and inflate LCOM4 in abstract base classes that use
+// the Template Method pattern.
+func (a *LCOMAnalyzer) isClassOrStaticMethod(funcNode *parser.Node) bool {
+	for _, decorator := range funcNode.Decorator {
+		if decorator == nil {
+			continue
+		}
+		name := a.getDecoratorName(decorator)
+		if isExcludedLCOMDecorator(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isExcludedLCOMDecorator(name string) bool {
+	switch name {
+	case "classmethod", "staticmethod", "abstractmethod":
+		return true
+	default:
+		return hasDecoratorSuffix(name, ".abstractmethod")
+	}
+}
+
+// collectPropertyNames returns the set of method names decorated with @property
+// in the class body. Reads of these via `self.<name>` are descriptor-protocol
+// method invocations rather than instance-variable accesses.
+func (a *LCOMAnalyzer) collectPropertyNames(classNode *parser.Node) map[string]bool {
+	return a.collectMethodNames(classNode, a.isProperty)
+}
+
+// collectPropertyProtocolNames returns the set of method names that define
+// more than one live definition: a @property getter and its @<name>.setter or
+// @<name>.deleter all stay bound to the same attribute. Definitions of such a
+// name merge their accesses instead of the last one parsed winning (#879).
+func (a *LCOMAnalyzer) collectPropertyProtocolNames(classNode *parser.Node) map[string]bool {
+	return a.collectMethodNames(classNode, func(node *parser.Node) bool {
+		return a.isProperty(node) || a.hasPropertyMutatorDecorator(node)
+	})
+}
+
+// hasPropertyMutatorDecorator reports whether the method carries an
+// @<name>.setter or @<name>.deleter decorator naming itself, the other half of
+// a property protocol pair.
+func (a *LCOMAnalyzer) hasPropertyMutatorDecorator(funcNode *parser.Node) bool {
+	for _, decorator := range funcNode.Decorator {
+		if decorator == nil {
+			continue
+		}
+		name := a.getDecoratorName(decorator)
+		if name == funcNode.Name+".setter" || name == funcNode.Name+".deleter" {
+			return true
+		}
+	}
+	return false
+}
+
+// collectMethodNames returns the names of the methods defined in the class
+// body that satisfy keep.
+func (a *LCOMAnalyzer) collectMethodNames(classNode *parser.Node, keep func(*parser.Node) bool) map[string]bool {
+	names := make(map[string]bool)
+	for _, node := range classNode.Body {
+		if node == nil {
+			continue
+		}
+		if node.Type != parser.NodeFunctionDef && node.Type != parser.NodeAsyncFunctionDef {
+			continue
+		}
+		if keep(node) {
+			names[node.Name] = true
+		}
+	}
+	return names
+}
+
+// collectInheritedCalls returns the names a subclass only ever reaches as
+// `self.<name>(...)` and never binds in its own body. Such a name can only be
+// a method inherited from a base class. Any other use of `self.<name>`, such
+// as an assignment or a bare read, keeps it as an instance variable, since the
+// class may then be storing a callable on the instance. A class without bases
+// has nothing to inherit from, so its calls keep counting as before. Declared
+// ctypes fields are instance state even when `_fields_` is assigned outside the
+// class body.
+func (a *LCOMAnalyzer) collectInheritedCalls(classNode *parser.Node, declaredFields map[string]bool) map[string]bool {
+	names := make(map[string]bool)
+	if len(classNode.Bases) == 0 {
+		return names
+	}
+
+	callees := make(map[*parser.Node]bool)
+	var accesses []*parser.Node
+	classNode.WalkDeep(func(node *parser.Node) bool {
+		// A nested class has its own `self` and its own bases.
+		if node != classNode && node.Type == parser.NodeClassDef {
+			return false
+		}
+		switch node.Type {
+		case parser.NodeCall:
+			if callee := nodeValue(node); callee != nil {
+				callees[callee] = true
+			}
+		case parser.NodeAttribute:
+			if a.isSelfAccess(node) && node.Name != "" {
+				accesses = append(accesses, node)
+			}
+		}
+		return true
+	})
+
+	otherUses := make(map[string]bool)
+	for _, access := range accesses {
+		if callees[access] {
+			names[access.Name] = true
+		} else {
+			otherUses[access.Name] = true
+		}
+	}
+
+	bound := a.collectClassBodyBindings(classNode)
+	for name := range names {
+		if otherUses[name] || bound[name] || declaredFields[name] {
+			delete(names, name)
+		}
+	}
+	return names
+}
+
+// collectClassBodyBindings returns the names the class body itself binds or
+// declares as instance attributes. On top of the definitions the protocol
+// rules see, this covers nested classes, bare annotations and `__slots__`
+// entries, which declare an attribute without binding a value.
+func (a *LCOMAnalyzer) collectClassBodyBindings(classNode *parser.Node) map[string]bool {
+	bound := make(map[string]bool)
+	for name := range collectProtocolDefinitions(classNode) {
+		bound[name] = true
+	}
+	for _, node := range classNode.Body {
+		if node == nil {
+			continue
+		}
+		switch node.Type {
+		case parser.NodeClassDef:
+			bound[node.Name] = true
+		case parser.NodeAnnAssign:
+			for _, target := range node.Targets {
+				if target != nil && target.Type == parser.NodeName {
+					bound[target.Name] = true
+				}
+			}
+		}
+		if isAssignmentNode(node) && a.assignmentTargetsName(node, "__slots__") {
+			for _, slot := range slotNames(node.Value) {
+				bound[slot] = true
+			}
+		}
+	}
+	return bound
+}
+
+// slotNames returns the string entries of a `__slots__` value, written either
+// as a single string or as a tuple or list of strings.
+func slotNames(value interface{}) []string {
+	valueNode, ok := value.(*parser.Node)
+	if !ok || valueNode == nil {
+		return nil
+	}
+	if slot, ok := valueNode.Value.(string); ok && valueNode.Type == parser.NodeConstant {
+		return []string{slot}
+	}
+	var slots []string
+	for _, child := range valueNode.Children {
+		if child == nil || child.Type != parser.NodeConstant {
+			continue
+		}
+		if slot, ok := child.Value.(string); ok && slot != "" {
+			slots = append(slots, slot)
+		}
+	}
+	return slots
+}
+
+// isProperty reports whether a method is a @property getter. Like
+// isClassOrStaticMethod, this matches the bare decorator name "property" only;
+// other property-like descriptors (cached_property, or dotted forms like
+// @functools.cached_property) are out of scope, matching how the rest of the
+// analyzer resolves decorators.
+func (a *LCOMAnalyzer) isProperty(funcNode *parser.Node) bool {
+	for _, decorator := range funcNode.Decorator {
+		if decorator == nil {
+			continue
+		}
+		name := a.getDecoratorName(decorator)
+		if name == "property" {
+			return true
+		}
+	}
+	return false
+}
+
+// getDecoratorName extracts the decorator name from a decorator node
+func (a *LCOMAnalyzer) getDecoratorName(decorator *parser.Node) string {
+	return decoratorQualifiedName(decorator)
+}
+
+func decoratorQualifiedName(node *parser.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	// Check Name field first (used by some paths)
+	if node.Name != "" && node.Type != parser.NodeAttribute {
+		return node.Name
+	}
+	// Check Value field (set by buildDecorator)
+	if node.Value != nil {
+		if valueNode, ok := node.Value.(*parser.Node); ok {
+			switch node.Type {
+			case parser.NodeDecorator, parser.NodeCall:
+				return decoratorQualifiedName(valueNode)
+			case parser.NodeAttribute:
+				left := decoratorQualifiedName(valueNode)
+				if left == "" {
+					return node.Name
+				}
+				return left + "." + node.Name
+			default:
+				return decoratorQualifiedName(valueNode)
+			}
+		}
+	}
+
+	switch node.Type {
+	case parser.NodeName:
+		return node.Name
+	case parser.NodeAttribute:
+		left := decoratorQualifiedName(node.Left)
+		if left == "" {
+			return node.Name
+		}
+		return left + "." + node.Name
+	}
+
+	return ""
+}
+
+func hasDecoratorSuffix(name, suffix string) bool {
+	return len(name) > len(suffix) && name[len(name)-len(suffix):] == suffix
+}
+
+// protocolDispatch describes direct calls and ordered fallback paths. Each
+// path starts with its entry method, followed by any methods that path calls.
+type protocolDispatch struct {
+	methods         []string
+	paths           [][]string
+	receiverOnRight bool
+}
+
+var lcomProtocolDispatch = map[string]protocolDispatch{
+	"len":  {methods: []string{"__len__"}},
+	"iter": {paths: [][]string{{"__iter__"}, {"__getitem__"}}},
+	"list": {methods: []string{"__len__"}, paths: [][]string{{"__iter__"}, {"__getitem__"}}},
+	"dict": {paths: [][]string{{"keys", "__getitem__"}, {"__iter__"}, {"__getitem__"}}},
+	"==":   {methods: []string{"__eq__"}},
+	"!=":   {paths: [][]string{{"__ne__"}, {"__eq__"}}},
+	"<":    {methods: []string{"__lt__"}},
+	"<=":   {methods: []string{"__le__"}},
+	">":    {methods: []string{"__gt__"}},
+	">=":   {methods: []string{"__ge__"}},
+	"in": {
+		paths:           [][]string{{"__contains__"}, {"__iter__"}, {"__getitem__"}},
+		receiverOnRight: true,
+	},
+	"not in": {
+		paths:           [][]string{{"__contains__"}, {"__iter__"}, {"__getitem__"}},
+		receiverOnRight: true,
+	},
+}
+
+// collectProtocolDefinitions preserves class-body definition order. An assigned
+// protocol name blocks fallback even when it has no analyzable method body.
+func collectProtocolDefinitions(classNode *parser.Node) map[string]*parser.Node {
+	definitions := make(map[string]*parser.Node)
+	for _, node := range classNode.Body {
+		if node == nil {
+			continue
+		}
+		switch node.Type {
+		case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+			definitions[node.Name] = node
+		case parser.NodeAssign, parser.NodeAnnAssign:
+			if node.Value == nil {
+				continue // An annotation without a value does not bind the name.
+			}
+			for _, target := range node.Targets {
+				if target != nil && target.Type == parser.NodeName {
+					definitions[target.Name] = node
+				}
+			}
+		}
+	}
+	return definitions
+}
+
+func addProtocolCalls(calls map[string]bool, definitions map[string]*parser.Node, operation string, allowFallback bool) {
+	rule := lcomProtocolDispatch[operation]
+	addProtocolMethods(calls, definitions, rule.methods...)
+	for i, path := range rule.paths {
+		// An absent local entry method may be inherited. Without resolving
+		// bases, a subclass cannot establish that a fallback will be used.
+		if i > 0 && !allowFallback {
+			break
+		}
+		if definition, declared := definitions[path[0]]; declared {
+			if definition.Type == parser.NodeFunctionDef || definition.Type == parser.NodeAsyncFunctionDef {
+				addProtocolMethods(calls, definitions, path...)
+			}
+			break
+		}
+	}
+}
+
+func addProtocolMethods(calls map[string]bool, definitions map[string]*parser.Node, names ...string) {
+	for _, name := range names {
+		definition, declared := definitions[name]
+		if !declared || definition.Type == parser.NodeFunctionDef || definition.Type == parser.NodeAsyncFunctionDef {
+			calls[name] = true
+		}
+	}
+}
+
+// extractMethodCalls finds explicit and protocol-dispatched sibling calls.
+// Builtin calls are recognized by name; resolving shadowed names is outside
+// this syntax-based cohesion analysis.
+func (a *LCOMAnalyzer) extractMethodCalls(methodNode *parser.Node, calls map[string]bool, definitions map[string]*parser.Node, allowFallback bool) {
+	methodNode.WalkDeep(func(node *parser.Node) bool {
+		if node != methodNode && (node.Type == parser.NodeFunctionDef || node.Type == parser.NodeAsyncFunctionDef ||
+			node.Type == parser.NodeClassDef || node.Type == parser.NodeLambda) {
+			return false
+		}
+		switch node.Type {
+		case parser.NodeCompare:
+			// The parser retains only one operator for a comparison chain.
+			// A single comparison has an unambiguous receiver and operator.
+			if len(node.Children) == 1 {
+				receiver := node.Left
+				if lcomProtocolDispatch[node.Op].receiverOnRight {
+					receiver = node.Children[0]
+				}
+				if isSelfName(receiver) {
+					addProtocolCalls(calls, definitions, node.Op, allowFallback)
+				}
+			}
+		case parser.NodeSubscript:
+			if isSelfName(nodeValue(node)) {
+				switch subscriptContext(node) {
+				case subscriptRead:
+					addProtocolMethods(calls, definitions, "__getitem__")
+				case subscriptWrite:
+					addProtocolMethods(calls, definitions, "__setitem__")
+				case subscriptReadWrite:
+					addProtocolMethods(calls, definitions, "__getitem__", "__setitem__")
+				case subscriptDelete:
+					addProtocolMethods(calls, definitions, "__delitem__")
+				}
+			}
+		case parser.NodeFor, parser.NodeComprehension:
+			if isSelfName(node.Iter) {
+				addProtocolCalls(calls, definitions, "iter", allowFallback)
+			}
+		case parser.NodeCall:
+			callee := nodeValue(node)
+			if callee == nil {
+				break
+			}
+			if callee.Type == parser.NodeAttribute && a.isSelfAccess(callee) && callee.Name != "" {
+				calls[callee.Name] = true
+			}
+			if callee.Type == parser.NodeName &&
+				len(node.Args) == 1 && isSelfName(node.Args[0]) {
+				addProtocolCalls(calls, definitions, callee.Name, allowFallback)
+			}
+		}
+		return true
+	})
+}
+
+func isSelfName(node *parser.Node) bool {
+	return node != nil && node.Type == parser.NodeName && node.Name == "self"
+}
+
+type subscriptAccess uint8
+
+const (
+	subscriptRead subscriptAccess = iota
+	subscriptWrite
+	subscriptReadWrite
+	subscriptDelete
+)
+
+// subscriptContext distinguishes the item protocol used by a subscript.
+// Tuple/list/starred targets keep their assignment context; a subscript in
+// another target's index is an ordinary read.
+func subscriptContext(node *parser.Node) subscriptAccess {
+	for current := node; current.Parent != nil; current = current.Parent {
+		parent := current.Parent
+		switch parent.Type {
+		case parser.NodeTuple, parser.NodeList, parser.NodeStarred:
+			continue
+		case parser.NodeAssign, parser.NodeAnnAssign, parser.NodeAugAssign,
+			parser.NodeDelete, parser.NodeFor, parser.NodeAsyncFor, parser.NodeComprehension:
+			for _, target := range parent.Targets {
+				if target != current {
+					continue
+				}
+				switch parent.Type {
+				case parser.NodeAugAssign:
+					return subscriptReadWrite
+				case parser.NodeDelete:
+					return subscriptDelete
+				default:
+					return subscriptWrite
+				}
+			}
+		}
+		return subscriptRead
+	}
+	return subscriptRead
+}
+
+// extractInstanceVars walks a method's AST to find all self.xxx attribute accesses
+func (a *LCOMAnalyzer) extractInstanceVars(methodNode *parser.Node, vars map[string]bool) {
+	methodNode.WalkDeep(func(node *parser.Node) bool {
+		if node.Type == parser.NodeAttribute {
+			// Check if this is self.xxx
+			if a.isSelfAccess(node) && node.Name != "" {
+				vars[node.Name] = true
+			}
+		}
+		return true
+	})
+}
+
+// hasBareSelfAccess reports whether a method uses self as a value rather than
+// only as the base object in self.attr. ctypes.Structure methods commonly pass
+// self to C functions that read or mutate fields declared in _fields_.
+func (a *LCOMAnalyzer) hasBareSelfAccess(node *parser.Node) bool {
+	if node == nil {
+		return false
+	}
+
+	switch node.Type {
+	case parser.NodeFunctionDef, parser.NodeAsyncFunctionDef:
+		for _, bodyNode := range node.Body {
+			if a.hasBareSelfAccess(bodyNode) {
+				return true
+			}
+		}
+		return false
+	case parser.NodeName:
+		return node.Name == "self"
+	case parser.NodeAttribute:
+		if valueNode := nodeValue(node); valueNode != nil {
+			if valueNode.Type == parser.NodeName && valueNode.Name == "self" {
+				return false
+			}
+			if a.hasBareSelfAccess(valueNode) {
+				return true
+			}
+		}
+		for _, child := range parser.OrderedChildren(node, nil) {
+			if child != nodeValue(node) && a.hasBareSelfAccess(child) {
+				return true
+			}
+		}
+		return false
+	case parser.NodeCall:
+		if valueNode := nodeValue(node); valueNode != nil && a.hasBareSelfAccess(valueNode) {
+			return true
+		}
+		for _, arg := range node.Args {
+			if a.hasBareSelfAccess(arg) {
+				return true
+			}
+		}
+		for _, keyword := range node.Keywords {
+			if a.hasBareSelfAccess(keyword) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, child := range parser.OrderedChildren(node, nil) {
+		if a.hasBareSelfAccess(child) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSelfAccess checks if an attribute node represents self.xxx access
+func (a *LCOMAnalyzer) isSelfAccess(attrNode *parser.Node) bool {
+	// The object (self) can be in Value or Left field
+	if attrNode.Value != nil {
+		if nameNode, ok := attrNode.Value.(*parser.Node); ok {
+			if nameNode.Type == parser.NodeName && nameNode.Name == "self" {
+				return true
+			}
+		}
+	}
+	if attrNode.Left != nil {
+		if attrNode.Left.Type == parser.NodeName && attrNode.Left.Name == "self" {
+			return true
+		}
+	}
+	return false
+}
+
+// collectClasses collects all class definition nodes from the AST
+func (a *LCOMAnalyzer) collectClasses(ast *parser.Node) []*parser.Node {
+	var classes []*parser.Node
+	ast.WalkDeep(func(node *parser.Node) bool {
+		if node.Type == parser.NodeClassDef && node.Name != "" {
+			classes = append(classes, node)
+		}
+		return true
+	})
+	return classes
+}
+
+func (a *LCOMAnalyzer) collectCtypesFields(ast *parser.Node, classes []*parser.Node) map[*parser.Node]map[string]bool {
+	fieldsByClass := make(map[*parser.Node]map[string]bool)
+	// Map class name -> node, with nil marking names that resolve ambiguously
+	// (e.g. two ctypes classes share a name across scopes). Ambiguous names are
+	// skipped for external `<Name>._fields_ = ...` assignments since we cannot
+	// safely attribute them to a specific class.
+	ctypesByName := make(map[string]*parser.Node, len(classes))
+	var ctypesClasses []*parser.Node
+	for _, classNode := range classes {
+		if !a.isCtypesStructureClass(classNode) {
+			continue
+		}
+		ctypesClasses = append(ctypesClasses, classNode)
+		if existing, ok := ctypesByName[classNode.Name]; ok {
+			if existing != nil {
+				ctypesByName[classNode.Name] = nil
+			}
+			continue
+		}
+		ctypesByName[classNode.Name] = classNode
+	}
+	if len(ctypesClasses) == 0 {
+		return fieldsByClass
+	}
+
+	for _, classNode := range ctypesClasses {
+		for _, bodyNode := range classNode.Body {
+			if bodyNode == nil {
+				continue
+			}
+			if !isAssignmentNode(bodyNode) || !a.assignmentTargetsName(bodyNode, "_fields_") {
+				continue
+			}
+			a.addFields(fieldsByClass, classNode, a.extractCtypesFieldNames(bodyNode.Value))
+		}
+	}
+
+	ast.WalkDeep(func(node *parser.Node) bool {
+		if node == nil || !isAssignmentNode(node) {
+			return true
+		}
+		for _, target := range node.Targets {
+			className := a.ctypesFieldsAssignmentClass(target)
+			if className == "" {
+				continue
+			}
+			classNode, ok := ctypesByName[className]
+			if !ok || classNode == nil {
+				continue
+			}
+			a.addFields(fieldsByClass, classNode, a.extractCtypesFieldNames(node.Value))
+		}
+		return true
+	})
+
+	return fieldsByClass
+}
+
+// ctypesStructureBases lists the ctypes base classes whose subclasses declare
+// fields via the _fields_ class attribute (often assigned outside the class
+// body to allow self-referential pointer types).
+var ctypesStructureBases = map[string]bool{
+	"Structure":             true,
+	"Union":                 true,
+	"BigEndianStructure":    true,
+	"LittleEndianStructure": true,
+	"BigEndianUnion":        true,
+	"LittleEndianUnion":     true,
+}
+
+func (a *LCOMAnalyzer) isCtypesStructureClass(classNode *parser.Node) bool {
+	if classNode == nil || classNode.Type != parser.NodeClassDef {
+		return false
+	}
+	for _, base := range classNode.Bases {
+		if base == nil {
+			continue
+		}
+		switch base.Type {
+		case parser.NodeName, parser.NodeAttribute:
+			if ctypesStructureBases[base.Name] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (a *LCOMAnalyzer) assignmentTargetsName(assignNode *parser.Node, name string) bool {
+	for _, target := range assignNode.Targets {
+		if target != nil && target.Type == parser.NodeName && target.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *LCOMAnalyzer) ctypesFieldsAssignmentClass(target *parser.Node) string {
+	if target == nil || target.Type != parser.NodeAttribute || target.Name != "_fields_" {
+		return ""
+	}
+	valueNode := nodeValue(target)
+	if valueNode == nil || valueNode.Type != parser.NodeName {
+		return ""
+	}
+	return valueNode.Name
+}
+
+func (a *LCOMAnalyzer) extractCtypesFieldNames(value interface{}) []string {
+	valueNode, ok := value.(*parser.Node)
+	if !ok || valueNode == nil {
+		return nil
+	}
+
+	var fields []string
+	for _, fieldNode := range valueNode.Children {
+		if fieldNode == nil || fieldNode.Type != parser.NodeTuple || len(fieldNode.Children) == 0 {
+			continue
+		}
+		nameNode := fieldNode.Children[0]
+		if nameNode == nil || nameNode.Type != parser.NodeConstant {
+			continue
+		}
+		fieldName, ok := nameNode.Value.(string)
+		if !ok || fieldName == "" {
+			continue
+		}
+		fields = append(fields, fieldName)
+	}
+	return fields
+}
+
+func (a *LCOMAnalyzer) addFields(fieldsByClass map[*parser.Node]map[string]bool, classNode *parser.Node, fields []string) {
+	if len(fields) == 0 || classNode == nil {
+		return
+	}
+	if fieldsByClass[classNode] == nil {
+		fieldsByClass[classNode] = make(map[string]bool, len(fields))
+	}
+	for _, field := range fields {
+		fieldsByClass[classNode][field] = true
+	}
+}
+
+func isAssignmentNode(node *parser.Node) bool {
+	return node != nil && (node.Type == parser.NodeAssign || node.Type == parser.NodeAnnAssign)
+}
+
+// CalculateLCOM is a convenience function that creates an analyzer with defaults and runs it
+func CalculateLCOM(ast *parser.Node, filePath string) ([]*LCOMResult, error) {
+	analyzer := NewLCOMAnalyzer(nil)
+	return analyzer.AnalyzeClasses(ast, filePath)
+}
+
+// CalculateLCOMWithConfig creates an analyzer with custom options and runs it
+func CalculateLCOMWithConfig(ast *parser.Node, filePath string, options *LCOMOptions) ([]*LCOMResult, error) {
+	analyzer := NewLCOMAnalyzer(options)
+	return analyzer.AnalyzeClasses(ast, filePath)
+}

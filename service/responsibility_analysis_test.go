@@ -1,0 +1,366 @@
+package service
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/analyzer"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAnalyzeResponsibilityDetectsHubModule(t *testing.T) {
+	service := NewSystemAnalysisService()
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	modules := []string{
+		"app.core.hub",
+		"app.api.views",
+		"app.auth.policy",
+		"app.billing.invoice",
+		"app.db.repo",
+		"app.reporting.export",
+	}
+	for _, module := range modules {
+		graph.AddModule(module, "/test/project/"+module+".py")
+	}
+
+	for _, dependency := range modules[1:] {
+		graph.AddDependency("app.core.hub", dependency, analyzer.DependencyEdgeImport, nil)
+		graph.AddDependency(dependency, "app.core.hub", analyzer.DependencyEdgeImport, nil)
+	}
+
+	responsibility, cohesion, violations := service.analyzeResponsibility(graph, defaultResponsibilityOptions())
+
+	require.NotNil(t, responsibility)
+	require.NotNil(t, cohesion)
+	require.Len(t, responsibility.SRPViolations, 1)
+	assert.Equal(t, "app.core.hub", responsibility.SRPViolations[0].Module)
+	assert.Equal(t, []string{"api", "auth", "billing", "db", "reporting"}, responsibility.SRPViolations[0].Responsibilities)
+	assert.Equal(t, []string{"app.core.hub"}, responsibility.OverloadedModules)
+	assert.Equal(t, domain.ViolationTypeResponsibility, violations[0].Type)
+	assert.Equal(t, domain.ViolationSeverityError, violations[0].Severity)
+}
+
+// A hub whose imports all belong to a single concern is a facade over one
+// responsibility and must not be flagged, even when fan-in and fan-out both
+// exceed the project's coupling limits.
+func TestAnalyzeResponsibilitySkipsSingleConcernHub(t *testing.T) {
+	service := NewSystemAnalysisService()
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	modules := []string{
+		"app.core.hub",
+		"app.services.billing",
+		"app.services.orders",
+		"app.api.views",
+		"app.api.admin",
+	}
+	for _, module := range modules {
+		graph.AddModule(module, "/test/project/"+module+".py")
+	}
+
+	graph.AddDependency("app.core.hub", "app.services.billing", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.core.hub", "app.services.orders", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.api.views", "app.core.hub", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.api.admin", "app.core.hub", analyzer.DependencyEdgeImport, nil)
+
+	fanInLimit, fanOutLimit := responsibilityCouplingLimits(graph)
+	hub := graph.Nodes["app.core.hub"]
+	require.GreaterOrEqual(t, hub.InDegree, fanInLimit)
+	require.GreaterOrEqual(t, hub.OutDegree, fanOutLimit)
+
+	responsibility, _, violations := service.analyzeResponsibility(graph, defaultResponsibilityOptions())
+
+	require.NotNil(t, responsibility)
+	assert.Equal(t, []string{"services"}, responsibility.ModuleResponsibilities["app.core.hub"])
+	assert.Empty(t, responsibility.SRPViolations)
+	assert.Empty(t, violations)
+}
+
+// Regression for #693: a dependency-free leaf module must not be flagged as
+// mixing concerns just because many modules import it (fan-in is reuse, not
+// responsibility).
+func TestAnalyzeResponsibilityIgnoresFanInForLeafModules(t *testing.T) {
+	service := NewSystemAnalysisService()
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	importers := []string{
+		"app.api.views",
+		"app.auth.policy",
+		"app.billing.invoice",
+		"app.reporting.export",
+	}
+	graph.AddModule("app.errors", "/test/project/app/errors.py")
+	for _, module := range importers {
+		graph.AddModule(module, "/test/project/"+module+".py")
+		graph.AddDependency(module, "app.errors", analyzer.DependencyEdgeImport, nil)
+	}
+
+	responsibility, _, violations := service.analyzeResponsibility(graph, defaultResponsibilityOptions())
+
+	require.NotNil(t, responsibility)
+	assert.Empty(t, responsibility.SRPViolations)
+	assert.Empty(t, responsibility.OverloadedModules)
+	assert.Empty(t, violations)
+	assert.Empty(t, responsibility.ModuleResponsibilities["app.errors"])
+}
+
+func TestAnalyzeResponsibilityKeepsCohesivePackageClean(t *testing.T) {
+	service := NewSystemAnalysisService()
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	graph.AddModule("app.orders.api", "/test/project/app/orders/api.py")
+	graph.AddModule("app.orders.service", "/test/project/app/orders/service.py")
+	graph.AddModule("app.orders.repo", "/test/project/app/orders/repo.py")
+	graph.AddDependency("app.orders.api", "app.orders.service", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.orders.service", "app.orders.repo", analyzer.DependencyEdgeImport, nil)
+
+	responsibility, cohesion, violations := service.analyzeResponsibility(graph, defaultResponsibilityOptions())
+
+	require.NotNil(t, responsibility)
+	require.NotNil(t, cohesion)
+	assert.Empty(t, responsibility.SRPViolations)
+	assert.Empty(t, responsibility.OverloadedModules)
+	assert.Empty(t, violations)
+	assert.Empty(t, cohesion.LowCohesionPackages)
+	assert.InDelta(t, 1.0, cohesion.PackageCohesion["app.orders"], 0.01)
+}
+
+func TestAnalyzePackageCohesionAttributesPackageInitToItsOwnPackage(t *testing.T) {
+	graph := analyzer.NewDependencyGraph("/test/project")
+	for name, path := range map[string]string{
+		"app":         "app/__init__.py",
+		"app.cli":     "app/cli.py",
+		"app.config":  "app/config.py",
+		"app.utils":   "app/utils/__init__.py",
+		"app.utils.a": "app/utils/a.py",
+		"app.utils.b": "app/utils/b.py",
+		"app.utils.c": "app/utils/c.py",
+	} {
+		graph.AddModule(name, "/test/project/"+path)
+	}
+	for _, edge := range [][2]string{
+		{"app", "app.config"},
+		{"app.cli", "app.config"},
+		{"app.utils", "app.utils.a"},
+		{"app.utils", "app.utils.b"},
+		{"app.utils", "app.utils.c"},
+		{"app.utils.a", "app.utils.b"},
+		{"app.utils.b", "app.utils.c"},
+	} {
+		graph.AddDependency(edge[0], edge[1], analyzer.DependencyEdgeImport, nil)
+	}
+
+	cohesion := analyzePackageCohesion(graph, defaultMinPackageCohesion)
+	assert.Equal(t, 1.0, cohesion.PackageCohesion["app"])
+	assert.Equal(t, 1.0, cohesion.PackageCohesion["app.utils"])
+	assert.Empty(t, cohesion.LowCohesionPackages)
+}
+
+func TestAnalyzePackageCohesionFlagsScatteredPackage(t *testing.T) {
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	graph.AddModule("app.orders.api", "/test/project/app/orders/api.py")
+	graph.AddModule("app.orders.worker", "/test/project/app/orders/worker.py")
+	graph.AddModule("app.orders.admin", "/test/project/app/orders/admin.py")
+	graph.AddModule("app.billing.invoice", "/test/project/app/billing/invoice.py")
+	graph.AddModule("app.reporting.export", "/test/project/app/reporting/export.py")
+	graph.AddModule("app.auth.policy", "/test/project/app/auth/policy.py")
+
+	graph.AddDependency("app.orders.api", "app.billing.invoice", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.orders.worker", "app.reporting.export", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.orders.admin", "app.auth.policy", analyzer.DependencyEdgeImport, nil)
+
+	cohesion := analyzePackageCohesion(graph, defaultMinPackageCohesion)
+
+	assert.Contains(t, cohesion.LowCohesionPackages, "app.orders")
+	assert.Equal(t, 0.0, cohesion.PackageCohesion["app.orders"])
+	assert.NotEmpty(t, cohesion.CohesionSuggestions["app.orders"])
+}
+
+func TestAnalyzePackageCohesionIgnoresTinyPackages(t *testing.T) {
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	graph.AddModule("app.orders.api", "/test/project/app/orders/api.py")
+	graph.AddModule("app.orders.worker", "/test/project/app/orders/worker.py")
+	graph.AddModule("app.billing.invoice", "/test/project/app/billing/invoice.py")
+	graph.AddModule("app.reporting.export", "/test/project/app/reporting/export.py")
+
+	graph.AddDependency("app.orders.api", "app.billing.invoice", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.orders.worker", "app.reporting.export", analyzer.DependencyEdgeImport, nil)
+
+	cohesion := analyzePackageCohesion(graph, defaultMinPackageCohesion)
+
+	assert.NotContains(t, cohesion.LowCohesionPackages, "app.orders")
+}
+
+func TestConcernLabelSkipsGenericSegments(t *testing.T) {
+	label := concernLabel("app.core.hub", "app.common.utils.billing.node")
+
+	assert.Equal(t, "billing", label)
+}
+
+func TestConcernLabelGroupsSiblingModules(t *testing.T) {
+	assert.Equal(t, "mypkg", concernLabel("mypkg._actor", "mypkg._errors"))
+	assert.Equal(t, "unit", concernLabel("engine.unit.unit", "engine.unit.add_leader_buff"))
+	assert.Equal(t, "routers", concernLabel("myapp.core", "myapp.routers.user_router"))
+	assert.Equal(t, "dns", concernLabel("aiomisc.service.dns.service", "aiomisc.service.dns.records"))
+	assert.Equal(t, "", concernLabel("app.utils.dates", "app.utils.strings"))
+}
+
+// Regression for #846: a facade composing private helpers from its own
+// package must count them as one concern, not one per sibling module.
+func TestAnalyzeResponsibilityCountsSiblingModulesAsOneConcern(t *testing.T) {
+	service := NewSystemAnalysisService()
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	siblings := []string{
+		"mypkg._errors",
+		"mypkg._messages",
+		"mypkg._ref",
+		"mypkg._registry",
+	}
+	graph.AddModule("mypkg._actor", "/test/project/mypkg/_actor.py")
+	for _, module := range siblings {
+		graph.AddModule(module, "/test/project/"+module+".py")
+		graph.AddDependency("mypkg._actor", module, analyzer.DependencyEdgeImport, nil)
+	}
+
+	responsibility, _, violations := service.analyzeResponsibility(graph, defaultResponsibilityOptions())
+
+	require.NotNil(t, responsibility)
+	assert.Equal(t, []string{"mypkg"}, responsibility.ModuleResponsibilities["mypkg._actor"])
+	assert.Empty(t, responsibility.SRPViolations)
+	assert.Empty(t, violations)
+}
+
+func TestAnalyzeResponsibilityForRequestKeepsCohesionIndependent(t *testing.T) {
+	service := NewSystemAnalysisService()
+	graph := analyzer.NewDependencyGraph("/test/project")
+
+	graph.AddModule("app.orders.api", "/test/project/app/orders/api.py")
+	graph.AddModule("app.orders.worker", "/test/project/app/orders/worker.py")
+	graph.AddModule("app.orders.admin", "/test/project/app/orders/admin.py")
+	graph.AddModule("app.billing.invoice", "/test/project/app/billing/invoice.py")
+	graph.AddModule("app.reporting.export", "/test/project/app/reporting/export.py")
+	graph.AddModule("app.auth.policy", "/test/project/app/auth/policy.py")
+	graph.AddDependency("app.orders.api", "app.billing.invoice", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.orders.worker", "app.reporting.export", analyzer.DependencyEdgeImport, nil)
+	graph.AddDependency("app.orders.admin", "app.auth.policy", analyzer.DependencyEdgeImport, nil)
+
+	validateResponsibility := false
+	validateCohesion := true
+	responsibility, cohesion, violations, checks := service.analyzeResponsibilityForRequest(graph, domain.SystemAnalysisRequest{
+		ValidateResponsibility:    &validateResponsibility,
+		ValidateCohesion:          &validateCohesion,
+		CohesionViolationSeverity: domain.ViolationSeverityError,
+	})
+
+	assert.Nil(t, responsibility)
+	require.NotNil(t, cohesion)
+	require.Len(t, violations, 1)
+	assert.Equal(t, len(cohesion.PackageCohesion), checks,
+		"checks should equal the number of packages whose cohesion was evaluated")
+	assert.Equal(t, domain.ViolationTypeCohesion, violations[0].Type)
+	assert.Equal(t, domain.ViolationSeverityError, violations[0].Severity)
+	assert.Equal(t, "app.orders", violations[0].Module)
+}
+
+func TestResponsibilityOptionsFromRequestUsesConfiguredThresholds(t *testing.T) {
+	options := responsibilityOptionsFromRequest(domain.SystemAnalysisRequest{
+		MinCohesion:                     0.75,
+		MaxResponsibilities:             2,
+		CohesionViolationSeverity:       domain.ViolationSeverityError,
+		ResponsibilityViolationSeverity: domain.ViolationSeverityCritical,
+	})
+
+	assert.Equal(t, 0.75, options.minPackageCohesion)
+	assert.Equal(t, 2, options.maxResponsibilities)
+	assert.Equal(t, domain.ViolationSeverityError, options.cohesionSeverity)
+	assert.Equal(t, domain.ViolationSeverityCritical, options.severity)
+}
+
+func TestParseViolationSeverityFallsBackToWarning(t *testing.T) {
+	assert.Equal(t, domain.ViolationSeverityInfo, parseViolationSeverity("info"))
+	assert.Equal(t, domain.ViolationSeverityError, parseViolationSeverity("error"))
+	assert.Equal(t, domain.ViolationSeverityCritical, parseViolationSeverity("critical"))
+	assert.Equal(t, domain.ViolationSeverityWarning, parseViolationSeverity("unknown"))
+}
+
+func TestResponsibilitySeverityDoesNotDowngradeCritical(t *testing.T) {
+	severity := responsibilitySeverity(domain.ViolationSeverityCritical, 5, 3, true)
+
+	assert.Equal(t, domain.ViolationSeverityCritical, severity)
+}
+
+func TestAnalyzeArchitectureRunsResponsibilityWithoutLayerRules(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte("[project]\nname = \"srp-repro\"\n"), 0o644))
+
+	files := map[string]string{
+		"app/__init__.py":        "",
+		"app/red/__init__.py":    "",
+		"app/blue/__init__.py":   "",
+		"app/green/__init__.py":  "",
+		"app/yellow/__init__.py": "",
+		"app/orange/__init__.py": "",
+		"app/red/hub.py":         "from ..blue.node import render\nfrom ..green.node import save\nfrom ..yellow.node import authorize\nfrom ..orange.node import export\n\ndef process(user, payload):\n    authorize(user)\n    result = render(payload)\n    save(result)\n    return export(result)\n",
+		"app/blue/node.py":       "from ..red.hub import process\n\ndef render(payload):\n    return payload\n",
+		"app/green/node.py":      "from ..red.hub import process\n\ndef save(row):\n    return row\n",
+		"app/yellow/node.py":     "from ..red.hub import process\n\ndef authorize(user):\n    return bool(user)\n",
+		"app/orange/node.py":     "from ..red.hub import process\n\ndef export(result):\n    return result\n",
+	}
+
+	paths := make([]string, 0, len(files))
+	for name, content := range files {
+		path := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		if filepath.Ext(path) == ".py" {
+			paths = append(paths, path)
+		}
+	}
+
+	service := NewSystemAnalysisService()
+	result, err := service.AnalyzeArchitecture(context.Background(), domain.SystemAnalysisRequest{
+		Paths:             paths,
+		IncludeStdLib:     domain.BoolPtr(false),
+		IncludeThirdParty: domain.BoolPtr(false),
+		FollowRelative:    domain.BoolPtr(true),
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result.ResponsibilityAnalysis)
+	require.Len(t, result.ResponsibilityAnalysis.SRPViolations, 1)
+	assert.Equal(t, "app.red.hub", result.ResponsibilityAnalysis.SRPViolations[0].Module)
+	assert.Equal(t, 1, result.TotalViolations)
+	assert.Zero(t, result.LayerAnalysis.LayersAnalyzed)
+
+	// The repo has many modules and only one SRP violation, so TotalRules
+	// (rule invocations) must exceed TotalViolations and ComplianceScore must
+	// not collapse to zero. Regression test for #426.
+	assert.Greater(t, result.TotalRules, result.TotalViolations,
+		"TotalRules should count every module checked against the SRP rule, not just the violations")
+	assert.Greater(t, result.ComplianceScore, 0.0,
+		"ComplianceScore should not be zero when most modules pass the responsibility rule")
+
+	// Regression for #444: ComplianceScore must be reproducible from the
+	// WeightedViolations / TotalRules fields exposed in the result, so JSON
+	// consumers can rebuild the score without knowing the severity weights.
+	severities := result.SeverityBreakdown
+	expectedWeighted := severities[domain.ViolationSeverityError]*5 + severities[domain.ViolationSeverityWarning]*1
+	assert.Equal(t, expectedWeighted, result.WeightedViolations,
+		"WeightedViolations should equal error*5 + warning*1")
+	if result.TotalRules > 0 {
+		expectedScore := 1.0 - float64(result.WeightedViolations)/float64(result.TotalRules)
+		if expectedScore < 0 {
+			expectedScore = 0
+		}
+		assert.InDelta(t, expectedScore, result.ComplianceScore, 1e-9,
+			"ComplianceScore must match 1 - WeightedViolations/TotalRules (clamped)")
+	}
+}

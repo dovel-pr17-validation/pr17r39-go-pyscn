@@ -1,0 +1,220 @@
+<div align="center">
+
+[English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [Français](README.fr.md)
+
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img alt="pyscn" src="assets/logo-light.svg" width="320">
+</picture>
+
+**AI コーディング時代の Python コード品質解析。**
+
+Cursor、Claude、ChatGPT で開発していますか？pyscn は構造解析により、AI が生成したコードの保守性を保ちます。
+
+[![Article](https://img.shields.io/badge/dev.to-Article-0A0A0A?style=flat-square&logo=dev.to)](https://dev.to/daisukeyoda/pyscn-the-code-quality-analyzer-for-vibe-coders-18hk)
+[![PyPI](https://img.shields.io/pypi/v/pyscn?style=flat-square&logo=pypi)](https://pypi.org/project/pyscn/)
+[![Downloads](https://img.shields.io/pypi/dm/pyscn?style=flat-square&logo=pypi&label=downloads)](https://pypi.org/project/pyscn/)
+[![Go](https://img.shields.io/github/go-mod/go-version/ludo-technologies/pyscn?style=flat-square&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/github/license/ludo-technologies/pyscn?style=flat-square)](LICENSE)
+
+<a href="https://github.com/apps/polyscan-app/installations/select_target"><img alt="Install Polyscan App for free" src="https://img.shields.io/badge/Polyscan_App-Install_for_free-2ea44f?style=for-the-badge&logo=github&logoColor=white" height="44"></a>
+
+</div>
+
+## クイックスタート
+
+```bash
+# インストール不要で解析を実行
+uvx pyscn@latest analyze .
+# または
+pipx run pyscn analyze .
+```
+
+## デモ
+
+<img alt="pyscn analysis report" src="https://raw.githubusercontent.com/ludo-technologies/pyscn/main/assets/demo-report.png" width="720">
+
+## 機能
+
+コマンド 1 つでコードベース全体を採点し（100 点満点 + A〜F グレード）、どこから直すべきかが分かる HTML レポートを生成します。
+
+pyscn はコードを 5 つの視点で分析します:
+
+- 🧹 **デッドコード** - 安全に削除できる到達不能コードを発見
+- 📋 **重複コード** - コピペや構造がよく似たコードを検出し、まとめる候補を提示（Type 1-4 クローン検出）
+- 🌀 **複雑度** - 読みにくくテストしづらい関数を特定（サイクロマティック複雑度 + 認知的複雑度）
+- 🏗️ **アーキテクチャ** - 循環インポート、レイヤールール違反（clean / layered / hexagonal / MVC プリセット）、モジュールコミュニティの自動検出でコードの実際の構造を可視化
+- 🧩 **クラス設計** - 責務や依存を抱え込みすぎたクラスを検出（結合度 CBO、凝集度 LCOM4）
+
+**100,000 行/秒以上** • Go + tree-sitter で構築
+
+## 他の言語
+
+pyscn は [polyscan](https://github.com/ludo-technologies/polyscan) の Python 向けアナライザーです。JavaScript、TypeScript、Go、Rust、C++ は次のコマンドで解析できます。
+
+```bash
+npx polyscan analyze .
+```
+
+同じ5つの観点、同じ 0-100 のスコアで、1つの HTML レポートにまとまります。
+
+## GitHub 版 Polyscan
+
+[Polyscan App](https://github.com/apps/polyscan-app/installations/select_target) は週次の監査レポートを GitHub Issue として作成します。公開リポジトリは無料です。
+
+<a href="https://github.com/apps/polyscan-app/installations/select_target"><img alt="Install Polyscan App for free" src="https://img.shields.io/badge/Polyscan_App-Install_for_free-2ea44f?style=for-the-badge&logo=github&logoColor=white" height="44"></a>
+
+## AI エージェント連携
+
+pyscn は、各分析の使いどころと実行方法を AI コーディングエージェントに教える Agent Skills（ヘルスチェック、リファクタリング、アーキテクチャレビュー、CI 向けレポート）を同梱しています。
+
+### Agent Skills（推奨）
+
+```bash
+uvx add-skills ludo-technologies/pyscn
+```
+
+プロジェクトに Skills がインストールされます。Claude Code、Cursor、Codex、Gemini CLI など[多くのエージェント](https://github.com/ludo-technologies/add-skills)で使えます（`--agent cursor` などで対象を指定、`--global` で全プロジェクト共通にインストール）。
+
+あとはエージェントに指示するだけです：
+
+1. 「app/ ディレクトリのコード品質を解析して」
+
+2. 「重複コードを見つけてリファクタリングを手伝って」
+
+3. 「複雑なコードを見せて、シンプルにするのを手伝って」
+
+### MCP サーバー（オプション）
+
+より密な連携には、同梱の `pyscn-mcp` サーバーが同じ解析を MCP ツールとして Claude Code、Cursor、ChatGPT などの MCP クライアントに公開します。
+
+**Claude Code プラグイン（MCP サーバーと Skills をまとめてセットアップ）：**
+
+```bash
+claude plugin marketplace add ludo-technologies/pyscn
+claude plugin install pyscn-mcp@pyscn-marketplace
+```
+
+**Claude Code の手動セットアップ：**
+
+```bash
+claude mcp add pyscn-mcp uvx -- pyscn-mcp
+```
+
+**Cursor / Claude Desktop：** MCP 設定（`~/.config/claude-desktop/config.json` または Cursor の設定）に追加：
+
+```json
+{
+  "mcpServers": {
+    "pyscn-mcp": {
+      "command": "uvx",
+      "args": ["pyscn-mcp"],
+      "env": {
+        "PYSCN_CONFIG": "/path/to/.pyscn.toml"
+      }
+    }
+  }
+}
+```
+
+セットアップ手順の詳細は `mcp/README.md`、アーキテクチャの詳細は `docs/MCP_INTEGRATION.md` をご覧ください。
+
+## インストール
+
+```bash
+# pipx でインストール（推奨）
+pipx install pyscn
+
+# または uv でインストール
+uv tool install pyscn
+```
+
+<details>
+<summary>その他のインストール方法</summary>
+
+### ソースからビルド
+```bash
+git clone https://github.com/ludo-technologies/pyscn.git
+cd pyscn
+make build
+```
+
+### Go install
+```bash
+go install github.com/ludo-technologies/pyscn/cmd/pyscn@latest
+```
+
+</details>
+
+## よく使うコマンド
+
+### `pyscn analyze`
+HTML レポート付きの包括的な解析を実行
+```bash
+pyscn analyze .                              # 全解析 + HTML レポート
+pyscn analyze --json .                       # JSON レポートを生成
+pyscn analyze --select complexity .          # 複雑度解析のみ
+pyscn analyze --select deps .                # 依存関係解析のみ
+pyscn analyze --select complexity,deps,deadcode . # 複数の解析
+pyscn analyze --skip-communities .           # モジュールコミュニティ検出をスキップ
+```
+
+### `pyscn check`
+CI 向けの高速品質ゲート
+```bash
+pyscn check .                         # クイックな合否チェック
+pyscn check --max-complexity 15 .     # カスタム閾値
+pyscn check --max-cycles 0 .          # 循環依存 0 のみ許可
+pyscn check --select deps .           # 循環依存のみチェック
+pyscn check --select di .             # DI アンチパターンを検出（オプトイン）
+pyscn check --allow-circular-deps .   # 循環依存を許可（警告のみ）
+```
+
+### `pyscn init`
+設定ファイルを作成
+```bash
+pyscn init                         # .pyscn.toml を生成
+```
+
+> 💡 すべてのオプションは `pyscn --help` または `pyscn <command> --help` で確認できます
+
+## 設定
+
+`.pyscn.toml` を作成するか、`pyproject.toml` に `[tool.pyscn]` を追加します：
+
+```toml
+# .pyscn.toml
+[complexity]
+max_complexity = 15
+
+[dead_code]
+min_severity = "warning"
+
+[output]
+directory = "reports"
+```
+
+> ⚙️ `pyscn init` を実行すると、利用可能なすべてのオプションを含む完全な設定ファイルが生成されます
+
+---
+
+## ドキュメント
+
+📖 **[pyscn ドキュメントサイト](https://docs.codescan.dev/pyscn/ja/)** — インストール、ルールカタログ、CLI リファレンス、設定、出力仕様
+
+コントリビューター向け: **[開発ガイド](docs/DEVELOPMENT.md)** • **[アーキテクチャ](docs/ARCHITECTURE.md)** • **[テスト](docs/TESTING.md)**
+
+## エンタープライズサポート
+
+商用サポート、カスタム連携、コンサルティングについては contact@ludo-tech.org までお問い合わせください
+
+## ライセンス
+
+MIT License — 詳細は [LICENSE](LICENSE) をご覧ください
+
+---
+
+*Go と tree-sitter で ❤️ を込めて構築*

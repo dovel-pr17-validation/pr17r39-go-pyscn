@@ -1,0 +1,991 @@
+package service
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/analyzer"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newDefaultCloneRequest(paths ...string) *domain.CloneRequest {
+	if len(paths) == 0 {
+		paths = []string{"../testdata/python/simple/functions.py"}
+	}
+	return &domain.CloneRequest{
+		Paths:             paths,
+		MinLines:          3,
+		MinNodes:          10,
+		MinSimilarity:     0.7,
+		MaxSimilarity:     1.0,
+		Type1Threshold:    0.95,
+		Type2Threshold:    0.85,
+		Type3Threshold:    0.75,
+		Type4Threshold:    0.65,
+		CloneTypes:        []domain.CloneType{domain.Type1Clone, domain.Type2Clone},
+		OutputFormat:      domain.OutputFormatJSON,
+		ShowDetails:       domain.BoolPtr(true),
+		ShowContent:       domain.BoolPtr(false),
+		GroupClones:       domain.BoolPtr(true),
+		IgnoreLiterals:    domain.BoolPtr(true),
+		IgnoreIdentifiers: domain.BoolPtr(false),
+	}
+}
+
+func clonePairTypes(pairs []*domain.ClonePair) []domain.CloneType {
+	types := make([]domain.CloneType, 0, len(pairs))
+	for _, pair := range pairs {
+		types = append(types, pair.Type)
+	}
+	return types
+}
+
+func TestNewCloneService(t *testing.T) {
+	service := NewCloneService()
+
+	assert.NotNil(t, service)
+}
+
+func TestCloneService_AnalyzeSnapshotUsesCapturedSource(t *testing.T) {
+	sourcePath := writeSnapshotFixture(t)
+	snapshot := BuildProjectSnapshot(context.Background(), []string{sourcePath})
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatalf("remove source after snapshot: %v", err)
+	}
+
+	response, err := NewCloneService().AnalyzeSnapshot(
+		context.Background(),
+		snapshot,
+		newDefaultCloneRequest(sourcePath),
+	)
+	if err != nil {
+		t.Fatalf("analyze captured project snapshot: %v", err)
+	}
+	if response.Statistics.FilesAnalyzed != 1 {
+		t.Fatalf("expected snapshot source to remain analyzable, got %+v", response.Statistics)
+	}
+	if len(response.Errors) != 0 {
+		t.Fatalf("expected no file-system errors after capture, got %v", response.Errors)
+	}
+}
+
+func TestCloneService_AnalyzeSnapshotHonorsRequestSelection(t *testing.T) {
+	projectRoot := t.TempDir()
+	includedPath := filepath.Join(projectRoot, "pkg", "included.py")
+	excludedPath := filepath.Join(projectRoot, "vendor", "excluded.py")
+	for _, path := range []string{includedPath, excludedPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create fixture directory: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("def value():\n    return 1\n"), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+	snapshot := BuildAnalysisProjectSnapshot(
+		context.Background(),
+		[]string{includedPath, excludedPath},
+		[]string{includedPath, excludedPath},
+		ProjectSnapshotOptions{ProjectRoot: projectRoot},
+	)
+	req := newDefaultCloneRequest(projectRoot)
+	req.IncludePatterns = []string{"**/pkg/**/*.py"}
+
+	response, err := NewCloneService().AnalyzeSnapshot(context.Background(), snapshot, req)
+	if err != nil {
+		t.Fatalf("analyze scoped snapshot: %v", err)
+	}
+	if response.Statistics.FilesAnalyzed != 1 {
+		t.Fatalf("expected one captured analysis file, got %+v", response.Statistics)
+	}
+}
+
+func TestCloneService_DetectClones(t *testing.T) {
+	service := NewCloneService()
+	ctx := context.Background()
+
+	t.Run("nil context should return error", func(t *testing.T) {
+		req := &domain.CloneRequest{
+			Paths:             []string{"../testdata/python/simple/functions.py"},
+			MinLines:          3,
+			MinNodes:          10,
+			MinSimilarity:     0.7,
+			MaxSimilarity:     1.0,
+			Type1Threshold:    0.95,
+			Type2Threshold:    0.85,
+			Type3Threshold:    0.75,
+			Type4Threshold:    0.65,
+			CloneTypes:        []domain.CloneType{domain.Type1Clone, domain.Type2Clone},
+			OutputFormat:      domain.OutputFormatJSON,
+			ShowDetails:       domain.BoolPtr(true),
+			ShowContent:       domain.BoolPtr(false),
+			GroupClones:       domain.BoolPtr(true),
+			IgnoreLiterals:    domain.BoolPtr(true),
+			IgnoreIdentifiers: domain.BoolPtr(false),
+		}
+
+		//nolint:staticcheck // Intentionally testing nil context error handling
+		_, err := service.DetectClones(nil, req)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context cannot be nil")
+	})
+
+	t.Run("nil request should return error", func(t *testing.T) {
+		_, err := service.DetectClones(ctx, nil)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "clone request cannot be nil")
+	})
+
+	t.Run("successful clone detection with valid files", func(t *testing.T) {
+		req := newDefaultCloneRequest("../testdata/python/simple/functions.py", "../testdata/python/simple/control_flow.py")
+		req.MinSimilarity = 0.5
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone}
+		req.MaxEditDistance = 10.0
+
+		// Skip validation check since Validate method may not exist
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.True(t, response.Success)
+		assert.NotNil(t, response.Statistics)
+		assert.NotNil(t, response.Request)
+		assert.GreaterOrEqual(t, response.Duration, int64(0))
+		assert.GreaterOrEqual(t, response.Statistics.FilesAnalyzed, 0)
+		assert.GreaterOrEqual(t, response.Statistics.LinesAnalyzed, 0)
+
+		// Verify clone pairs structure if any found
+		for _, pair := range response.ClonePairs {
+			assert.NotNil(t, pair.Clone1)
+			assert.NotNil(t, pair.Clone2)
+			assert.NotNil(t, pair.Clone1.Location)
+			assert.NotNil(t, pair.Clone2.Location)
+			assert.GreaterOrEqual(t, pair.Similarity, req.MinSimilarity)
+			assert.LessOrEqual(t, pair.Similarity, req.MaxSimilarity)
+		}
+
+		// Verify clone groups structure if any found
+		for _, group := range response.CloneGroups {
+			assert.GreaterOrEqual(t, len(group.Clones), 2)
+			assert.GreaterOrEqual(t, group.Similarity, req.MinSimilarity)
+			assert.LessOrEqual(t, group.Similarity, req.MaxSimilarity)
+		}
+	})
+
+	t.Run("empty file list should succeed but return empty results", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.Paths = []string{}
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		// Should return error for empty file paths
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "file paths cannot be empty")
+		assert.Nil(t, response)
+	})
+
+	t.Run("context cancellation should be handled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+
+		req := newDefaultCloneRequest()
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		_, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cancelled")
+	})
+
+	t.Run("request with timeout should be respected", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+		req.Timeout = time.Millisecond * 1 // Very short timeout
+
+		startTime := time.Now()
+		_, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+		duration := time.Since(startTime)
+
+		// Should either succeed quickly or timeout
+		if err != nil {
+			// If it fails, it should be due to timeout or cancellation
+			assert.True(t,
+				duration < time.Millisecond*100 || // Finished quickly
+					err.Error() != "" && (ctx.Err() == context.DeadlineExceeded || duration < time.Second), // Or timed out reasonably
+				"Expected quick completion or timeout, got duration: %v, error: %v", duration, err)
+		}
+	})
+}
+
+func TestCloneService_DetectClonesInFiles(t *testing.T) {
+	service := NewCloneService()
+	ctx := context.Background()
+
+	t.Run("nil context should return error", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		//nolint:staticcheck // Intentionally testing nil context error handling
+		_, err := service.DetectClonesInFiles(nil, []string{"test.py"}, req)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context cannot be nil")
+	})
+
+	t.Run("nil request should return error", func(t *testing.T) {
+		_, err := service.DetectClonesInFiles(ctx, []string{"test.py"}, nil)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "clone request cannot be nil")
+	})
+
+	t.Run("empty file paths should return error", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		_, err := service.DetectClonesInFiles(ctx, []string{}, req)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "file paths cannot be empty")
+	})
+
+	t.Run("non-existent files should be skipped with warnings", func(t *testing.T) {
+		req := newDefaultCloneRequest("../testdata/non_existent_file.py")
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		// Should succeed but with empty results (files are skipped)
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.True(t, response.Success)
+		assert.Empty(t, response.Clones)
+		assert.Empty(t, response.ClonePairs)
+		assert.Empty(t, response.CloneGroups)
+	})
+
+	t.Run("files analyzed counts only successfully processed files", func(t *testing.T) {
+		valid := "../testdata/python/simple/functions.py"
+		missing := "../testdata/python/missing.py"
+
+		req := newDefaultCloneRequest(valid, missing)
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.NotNil(t, response.Statistics)
+		assert.Equal(t, 1, response.Statistics.FilesAnalyzed)
+	})
+
+	t.Run("parsing failures are not counted", func(t *testing.T) {
+		// Create brokenFile
+		tmpDir := t.TempDir()
+		brokenFile := filepath.Join(tmpDir, "broken.py")
+		assert.NoError(t, os.WriteFile(brokenFile, []byte("def oops(:\n    pass"), 0o644))
+
+		valid := "../testdata/python/simple/functions.py"
+
+		req := newDefaultCloneRequest(valid, brokenFile)
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.NotNil(t, response.Statistics)
+		assert.Equal(t, 1, response.Statistics.FilesAnalyzed)
+	})
+
+	t.Run("statistics uses processed file count after detection", func(t *testing.T) {
+		tmp := t.TempDir()
+		f1 := filepath.Join(tmp, "a.py")
+		f2 := filepath.Join(tmp, "b.py")
+		missing := "../testdata/python/missing.py"
+
+		body := "def foo(x):\n	return x\n"
+		require.NoError(t, os.WriteFile(f1, []byte(body), 0o644))
+		require.NoError(t, os.WriteFile(f2, []byte(body), 0o644))
+
+		req := newDefaultCloneRequest(f1, f2, missing)
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		assert.NoError(t, err)
+		assert.NotNil(t, response)
+		assert.NotNil(t, response.Statistics)
+		assert.Equal(t, 2, response.Statistics.FilesAnalyzed) // skips missing; counts only processed files
+	})
+
+	t.Run("identical source fragments are reported as type1", func(t *testing.T) {
+		tmp := t.TempDir()
+		f1 := filepath.Join(tmp, "a.py")
+		f2 := filepath.Join(tmp, "b.py")
+
+		source := `def calculate(value):
+    if value > 10:
+        result = value * 2
+    else:
+        result = value + 2
+    return result
+`
+		require.NoError(t, os.WriteFile(f1, []byte(source), 0o644))
+		require.NoError(t, os.WriteFile(f2, []byte(source), 0o644))
+
+		req := newDefaultCloneRequest(f1, f2)
+		req.MinLines = 3
+		req.MinNodes = 1
+		req.SimilarityThreshold = domain.DefaultType4CloneThreshold
+		req.Type1Threshold = domain.DefaultType1CloneThreshold
+		req.Type2Threshold = domain.DefaultType2CloneThreshold
+		req.Type3Threshold = domain.DefaultType3CloneThreshold
+		req.Type4Threshold = domain.DefaultType4CloneThreshold
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone, domain.Type4Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		assert.Contains(t, clonePairTypes(response.ClonePairs), domain.Type1Clone)
+	})
+
+	t.Run("structural matches with different text are not type1", func(t *testing.T) {
+		tmp := t.TempDir()
+		f1 := filepath.Join(tmp, "a.py")
+		f2 := filepath.Join(tmp, "b.py")
+
+		source1 := `def scan_paths(items):
+    if items:
+        total = len(items)
+        total += 1
+    else:
+        total = 0
+    return total
+`
+		source2 := `def measure_radius(values):
+    if values:
+        area = len(values)
+        area += 1
+    else:
+        area = 0
+    return area
+`
+		require.NoError(t, os.WriteFile(f1, []byte(source1), 0o644))
+		require.NoError(t, os.WriteFile(f2, []byte(source2), 0o644))
+
+		req := newDefaultCloneRequest(f1, f2)
+		req.MinLines = 3
+		req.MinNodes = 1
+		req.SimilarityThreshold = domain.DefaultType4CloneThreshold
+		req.Type1Threshold = domain.DefaultType1CloneThreshold
+		req.Type2Threshold = domain.DefaultType2CloneThreshold
+		req.Type3Threshold = domain.DefaultType3CloneThreshold
+		req.Type4Threshold = domain.DefaultType4CloneThreshold
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone, domain.Type4Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.NotEmpty(t, response.ClonePairs)
+		for _, pair := range response.ClonePairs {
+			assert.NotEqual(t, domain.Type1Clone, pair.Type)
+			assert.Less(t, pair.Similarity, 1.0)
+		}
+	})
+
+	t.Run("unrelated cross-file class bodies are not reported as type2", func(t *testing.T) {
+		page := filepath.Join("..", "testdata", "python", "clones", "type2_false_positive", "parsera_page.py")
+		parsera := filepath.Join("..", "testdata", "python", "clones", "type2_false_positive", "parsera_parsera.py")
+
+		req := newDefaultCloneRequest(page, parsera)
+		req.MinLines = 5
+		req.MinNodes = 10
+		req.SimilarityThreshold = domain.DefaultType4CloneThreshold
+		req.Type1Threshold = domain.DefaultType1CloneThreshold
+		req.Type2Threshold = domain.DefaultType2CloneThreshold
+		req.Type3Threshold = domain.DefaultType3CloneThreshold
+		req.Type4Threshold = domain.DefaultType4CloneThreshold
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone, domain.Type4Clone}
+
+		response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		for _, pair := range response.ClonePairs {
+			if pair.Type != domain.Type2Clone {
+				continue
+			}
+			assert.False(t, isParseraClassBodyPair(pair, page, parsera), "unexpected cross-file class-body Type-2 clone: %s and %s",
+				pair.Clone1.Location.FilePath, pair.Clone2.Location.FilePath)
+		}
+	})
+}
+
+func isParseraClassBodyPair(pair *domain.ClonePair, pagePath, parseraPath string) bool {
+	if pair == nil || pair.Clone1 == nil || pair.Clone2 == nil ||
+		pair.Clone1.Location == nil || pair.Clone2.Location == nil {
+		return false
+	}
+
+	return (isWholeFileClass(pair.Clone1, pagePath, 168) && isWholeFileClass(pair.Clone2, parseraPath, 90)) ||
+		(isWholeFileClass(pair.Clone1, parseraPath, 90) && isWholeFileClass(pair.Clone2, pagePath, 168))
+}
+
+func isWholeFileClass(clone *domain.Clone, filePath string, endLine int) bool {
+	return clone.Location.FilePath == filePath &&
+		clone.Location.StartLine == 1 &&
+		clone.Location.EndLine == endLine
+}
+
+func TestCloneService_ComputeSimilarity(t *testing.T) {
+	service := NewCloneService()
+	ctx := context.Background()
+
+	t.Run("compute similarity between identical fragments", func(t *testing.T) {
+		fragment1 := "def hello():\n    print('Hello, World!')\n    return True"
+		fragment2 := "def hello():\n    print('Hello, World!')\n    return True"
+
+		similarity, err := service.ComputeSimilarity(ctx, fragment1, fragment2)
+
+		assert.NoError(t, err)
+		assert.Equal(t, 1.0, similarity) // Identical should be 1.0
+	})
+
+	t.Run("compute similarity between similar fragments", func(t *testing.T) {
+		fragment1 := "def hello():\n    print('Hello, World!')\n    return True"
+		fragment2 := "def greet():\n    print('Hello, World!')\n    return True"
+
+		similarity, err := service.ComputeSimilarity(ctx, fragment1, fragment2)
+
+		assert.NoError(t, err)
+		assert.Greater(t, similarity, 0.0)
+		assert.Less(t, similarity, 1.0)
+	})
+
+	t.Run("compute similarity between different fragments", func(t *testing.T) {
+		fragment1 := "def hello():\n    print('Hello, World!')"
+		fragment2 := "class MyClass:\n    def __init__(self):\n        self.value = 42"
+
+		similarity, err := service.ComputeSimilarity(ctx, fragment1, fragment2)
+
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, similarity, 0.0)
+		assert.LessOrEqual(t, similarity, 1.0)
+	})
+
+	t.Run("empty fragments should return error", func(t *testing.T) {
+		_, err := service.ComputeSimilarity(ctx, "", "def test(): pass")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "fragments cannot be empty")
+
+		_, err = service.ComputeSimilarity(ctx, "def test(): pass", "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "fragments cannot be empty")
+	})
+
+	t.Run("nil context should return error", func(t *testing.T) {
+		fragment1 := "def hello(): pass"
+		fragment2 := "def world(): pass"
+
+		//nolint:staticcheck // Intentionally testing nil context error handling
+		_, err := service.ComputeSimilarity(nil, fragment1, fragment2)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context cannot be nil")
+	})
+
+	t.Run("excessively large fragments should return error", func(t *testing.T) {
+		// Create a fragment larger than the 1MB limit
+		largeFragment := "def large_function():\n"
+		for i := 0; i < 100000; i++ {
+			largeFragment += "    # This is a very long comment to make the fragment large\n"
+		}
+
+		normalFragment := "def normal(): pass"
+
+		_, err := service.ComputeSimilarity(ctx, largeFragment, normalFragment)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "fragment size exceeds maximum allowed size")
+	})
+
+	t.Run("invalid Python syntax should return error", func(t *testing.T) {
+		invalidFragment := "def invalid syntax here:"
+		validFragment := "def valid(): pass"
+
+		_, err := service.ComputeSimilarity(ctx, invalidFragment, validFragment)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse")
+	})
+}
+
+func TestCloneService_CreateDetectorConfig(t *testing.T) {
+	service := NewCloneService()
+
+	req := newDefaultCloneRequest()
+	req.MinLines = 5
+	req.MinNodes = 20
+	req.MaxEditDistance = 15.0
+	req.IgnoreIdentifiers = domain.BoolPtr(false)
+
+	config := service.createDetectorConfig(req)
+
+	assert.NotNil(t, config)
+	assert.Equal(t, 5, config.MinLines)
+	assert.Equal(t, 20, config.MinNodes)
+	assert.Equal(t, 0.95, config.Type1Threshold)
+	assert.Equal(t, 0.85, config.Type2Threshold)
+	assert.Equal(t, 0.75, config.Type3Threshold)
+	assert.Equal(t, 0.65, config.Type4Threshold)
+	assert.Equal(t, 15.0, config.MaxEditDistance)
+	assert.Equal(t, true, config.IgnoreLiterals)
+	assert.Equal(t, false, config.IgnoreIdentifiers)
+	assert.Equal(t, "python", config.CostModelType)
+	assert.Equal(t, 10000, config.MaxClonePairs)
+	assert.Equal(t, 50, config.BatchSizeThreshold)
+}
+
+func TestCloneService_ConvertCloneType(t *testing.T) {
+	testCases := []struct {
+		name               string
+		analyzerType       analyzer.CloneType
+		expectedDomainType domain.CloneType
+	}{
+		{"Type1", analyzer.Type1Clone, domain.Type1Clone},
+		{"Type2", analyzer.Type2Clone, domain.Type2Clone},
+		{"Type3", analyzer.Type3Clone, domain.Type3Clone},
+		{"Type4", analyzer.Type4Clone, domain.Type4Clone},
+		{"Unknown", analyzer.CloneType(99), domain.Type4Clone},
+	}
+
+	service := NewCloneService()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expectedDomainType, service.convertCloneType(tc.analyzerType))
+		})
+	}
+}
+
+func TestCloneService_FilterClonePairs(t *testing.T) {
+	service := NewCloneService()
+
+	pairs := []*domain.ClonePair{
+		{
+			ID:         1,
+			Similarity: 0.8,
+			Type:       domain.Type1Clone,
+		},
+		{
+			ID:         2,
+			Similarity: 0.6,
+			Type:       domain.Type2Clone,
+		},
+		{
+			ID:         3,
+			Similarity: 0.9,
+			Type:       domain.Type3Clone,
+		},
+		{
+			ID:         4,
+			Similarity: 0.4,
+			Type:       domain.Type1Clone,
+		},
+	}
+
+	t.Run("filter by similarity range", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.MinSimilarity = 0.7
+		req.MaxSimilarity = 0.85
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone}
+
+		filtered := service.filterClonePairsBySimilarity(service.filterClonePairsByType(pairs, req), req)
+
+		require.Len(t, filtered, 1)
+		assert.Equal(t, 1, filtered[0].ID)
+		assert.Equal(t, 0.8, filtered[0].Similarity)
+	})
+
+	t.Run("filter by clone types", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.MinSimilarity = 0.0
+		req.MaxSimilarity = 1.0
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone}
+
+		filtered := service.filterClonePairsByType(pairs, req)
+
+		require.Len(t, filtered, 2)
+		assert.Equal(t, domain.Type1Clone, filtered[0].Type)
+		assert.Equal(t, domain.Type1Clone, filtered[1].Type)
+	})
+
+	t.Run("filter by both similarity and types", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.MinSimilarity = 0.7
+		req.MaxSimilarity = 1.0
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type3Clone}
+
+		filtered := service.filterClonePairsBySimilarity(service.filterClonePairsByType(pairs, req), req)
+
+		require.Len(t, filtered, 2)
+		assert.Contains(t, []domain.CloneType{domain.Type1Clone, domain.Type3Clone}, filtered[0].Type)
+		assert.Contains(t, []domain.CloneType{domain.Type1Clone, domain.Type3Clone}, filtered[1].Type)
+	})
+}
+
+func TestCloneService_FilterCloneGroups(t *testing.T) {
+	service := NewCloneService()
+
+	groups := []*domain.CloneGroup{
+		{
+			ID:         1,
+			Similarity: 0.8,
+			Type:       domain.Type1Clone,
+		},
+		{
+			ID:         2,
+			Similarity: 0.6,
+			Type:       domain.Type2Clone,
+		},
+		{
+			ID:         3,
+			Similarity: 0.9,
+			Type:       domain.Type3Clone,
+		},
+	}
+
+	t.Run("filter by similarity range", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.MinSimilarity = 0.7
+		req.MaxSimilarity = 0.85
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone}
+
+		filtered := service.filterCloneGroupsBySimilarity(service.filterCloneGroupsByType(groups, req), req)
+
+		require.Len(t, filtered, 1)
+		assert.Equal(t, 1, filtered[0].ID)
+		assert.Equal(t, 0.8, filtered[0].Similarity)
+	})
+
+	t.Run("filter by clone types", func(t *testing.T) {
+		req := newDefaultCloneRequest()
+		req.MinSimilarity = 0.0
+		req.MaxSimilarity = 1.0
+		req.CloneTypes = []domain.CloneType{domain.Type2Clone, domain.Type3Clone}
+
+		filtered := service.filterCloneGroupsByType(groups, req)
+
+		require.Len(t, filtered, 2)
+		assert.Contains(t, []domain.CloneType{domain.Type2Clone, domain.Type3Clone}, filtered[0].Type)
+		assert.Contains(t, []domain.CloneType{domain.Type2Clone, domain.Type3Clone}, filtered[1].Type)
+	})
+}
+
+func TestCloneService_BuildCloneStatistics(t *testing.T) {
+	service := NewCloneService()
+
+	cloneA := &domain.Clone{ID: 1, Location: &domain.CloneLocation{FilePath: "a.py", StartLine: 1, EndLine: 10}}
+	cloneB := &domain.Clone{ID: 2, Location: &domain.CloneLocation{FilePath: "b.py", StartLine: 1, EndLine: 10}}
+	cloneC := &domain.Clone{ID: 3, Location: &domain.CloneLocation{FilePath: "c.py", StartLine: 1, EndLine: 10}}
+
+	pairs := []*domain.ClonePair{
+		{ID: 1, Clone1: cloneA, Clone2: cloneB, Similarity: 0.8, Type: domain.Type1Clone},
+		{ID: 2, Clone1: cloneB, Clone2: cloneC, Similarity: 0.9, Type: domain.Type2Clone},
+		{ID: 3, Clone1: cloneA, Clone2: cloneC, Similarity: 0.7, Type: domain.Type1Clone},
+	}
+
+	groups := []*domain.CloneGroup{
+		{ID: 1, Clones: []*domain.Clone{cloneA, cloneB}},
+		{ID: 2, Clones: []*domain.Clone{cloneB, cloneC}},
+	}
+
+	fragA := &analyzer.CodeFragment{Location: &analyzer.CodeLocation{FilePath: "a.py", StartLine: 1, EndLine: 10}}
+	fragB := &analyzer.CodeFragment{Location: &analyzer.CodeLocation{FilePath: "b.py", StartLine: 1, EndLine: 10}}
+	fragC := &analyzer.CodeFragment{Location: &analyzer.CodeLocation{FilePath: "c.py", StartLine: 1, EndLine: 10}}
+
+	result := &analyzer.CloneDetectionResult{
+		Pairs: []*analyzer.ClonePair{
+			{Fragment1: fragA, Fragment2: fragB, Similarity: 0.8, CloneType: analyzer.Type1Clone},
+			{Fragment1: fragB, Fragment2: fragC, Similarity: 0.9, CloneType: analyzer.Type2Clone},
+			{Fragment1: fragA, Fragment2: fragC, Similarity: 0.7, CloneType: analyzer.Type1Clone},
+		},
+		Groups: []*analyzer.CloneGroup{
+			{Fragments: []*analyzer.CodeFragment{fragA, fragB}},
+			{Fragments: []*analyzer.CodeFragment{fragB, fragC}},
+		},
+		Statistics: &analyzer.CloneDetectionStatistics{TotalFragments: 10},
+	}
+
+	filesAnalyzed := 5
+	linesAnalyzed := 1000
+	nodesAnalyzed := 500
+
+	stats := service.buildCloneStatistics(result, pairs, groups, pairs, groups, filesAnalyzed, linesAnalyzed, nodesAnalyzed)
+
+	assert.NotNil(t, stats)
+	assert.Equal(t, 10, stats.TotalFragments)
+	assert.Equal(t, 3, stats.DuplicatedFragments) // 3 unique fragments in the scored population
+	assert.Equal(t, 30, stats.DuplicatedLines)    // 10 lines in each of three files
+	assert.Equal(t, 3, stats.TotalClones)         // 3 unique fragments from union of pairs and groups
+	assert.Equal(t, 3, stats.TotalClonePairs)
+	assert.Equal(t, 2, stats.TotalCloneGroups)
+	assert.Equal(t, 5, stats.FilesAnalyzed)
+	assert.Equal(t, 1000, stats.LinesAnalyzed)
+	assert.Equal(t, 500, stats.NodesAnalyzed)
+	assert.InDelta(t, 0.8, stats.AverageSimilarity, 0.01) // (0.8 + 0.9 + 0.7) / 3
+
+	// Check clone type counts
+	assert.Equal(t, 2, stats.ClonesByType["Type-1"])
+	assert.Equal(t, 1, stats.ClonesByType["Type-2"])
+
+	// When groups are pruned but pairs exist, TotalClones should still count pair endpoints
+	statsNilGroups := service.buildCloneStatistics(result, pairs, nil, pairs, nil, filesAnalyzed, linesAnalyzed, nodesAnalyzed)
+	assert.Equal(t, 3, statsNilGroups.TotalClones)
+
+	// An output filter that hides every pair must not shrink DuplicatedFragments
+	statsAllHidden := service.buildCloneStatistics(result, nil, nil, pairs, groups, filesAnalyzed, linesAnalyzed, nodesAnalyzed)
+	assert.Equal(t, 0, statsAllHidden.TotalClones)
+	assert.Equal(t, 3, statsAllHidden.DuplicatedFragments)
+	assert.Equal(t, 30, statsAllHidden.DuplicatedLines)
+}
+
+func TestCloneService_ResponseStructure(t *testing.T) {
+	service := NewCloneService()
+	ctx := context.Background()
+
+	req := newDefaultCloneRequest()
+	req.MinLines = 1
+	req.MinNodes = 1
+	req.MinSimilarity = 0.0
+	req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone, domain.Type4Clone}
+	req.ShowContent = domain.BoolPtr(true)
+
+	response, err := service.DetectClonesInFiles(ctx, req.Paths, req)
+
+	assert.NoError(t, err)
+	require.NotNil(t, response)
+
+	// Verify response structure
+	assert.NotNil(t, response.Clones)
+	// ClonePairs and CloneGroups can be nil if no clones are found
+	assert.NotNil(t, response.Statistics)
+	if response.Request != nil {
+		assert.Equal(t, req, response.Request)
+	}
+	assert.True(t, response.Success)
+	assert.GreaterOrEqual(t, response.Duration, int64(0))
+	assert.Empty(t, response.Error)
+
+	// Verify statistics structure
+	stats := response.Statistics
+	assert.GreaterOrEqual(t, stats.TotalClones, 0)
+	assert.GreaterOrEqual(t, stats.TotalClonePairs, 0)
+	assert.GreaterOrEqual(t, stats.TotalCloneGroups, 0)
+	assert.GreaterOrEqual(t, stats.FilesAnalyzed, 1)
+	assert.GreaterOrEqual(t, stats.LinesAnalyzed, 0)
+	assert.GreaterOrEqual(t, stats.AverageSimilarity, 0.0)
+	assert.LessOrEqual(t, stats.AverageSimilarity, 1.0)
+	assert.NotNil(t, stats.ClonesByType)
+}
+
+// TestCloneService_OutputFiltersDoNotChangeScoredPopulation pins the contract
+// that min_similarity/max_similarity only trim the returned clone lists. The
+// scored line coverage must remain stable when display options change.
+func TestCloneService_OutputFiltersDoNotChangeScoredPopulation(t *testing.T) {
+	service := NewCloneService()
+	ctx := context.Background()
+
+	newRequest := func() *domain.CloneRequest {
+		req := newDefaultCloneRequest("../testdata/python/clone_presentation_filters/dup.py")
+		req.MinSimilarity = 0.0
+		req.MaxSimilarity = 1.0
+		req.CloneTypes = []domain.CloneType{domain.Type1Clone, domain.Type2Clone, domain.Type3Clone, domain.Type4Clone}
+		return req
+	}
+
+	baseline, err := service.DetectClones(ctx, newRequest())
+	require.NoError(t, err)
+	require.Equal(t, 2, baseline.Statistics.TotalClonePairs, "fixture must produce pairs at two different similarities")
+	require.Equal(t, 4, baseline.Statistics.DuplicatedFragments)
+	require.Equal(t, 24, baseline.Statistics.DuplicatedLines, "overlapping fragments must not count source lines twice")
+
+	cases := []struct {
+		name      string
+		mutate    func(*domain.CloneRequest)
+		wantPairs int
+	}{
+		{"min_similarity hides the less similar pair", func(req *domain.CloneRequest) { req.MinSimilarity = 0.99 }, 1},
+		{"max_similarity hides the most similar pair", func(req *domain.CloneRequest) { req.MaxSimilarity = 0.96 }, 1},
+		{"max_similarity hides every pair", func(req *domain.CloneRequest) { req.MaxSimilarity = 0.5 }, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newRequest()
+			tc.mutate(req)
+
+			response, err := service.DetectClones(ctx, req)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantPairs, response.Statistics.TotalClonePairs, "the filter must trim the reported pairs")
+			assert.Len(t, response.ClonePairs, tc.wantPairs, "the reported counts must match the returned pairs")
+			for _, group := range response.CloneGroups {
+				members := make(map[int]bool)
+				for _, clone := range group.Clones {
+					members[clone.ID] = true
+				}
+				backed := make(map[int]bool)
+				for _, pair := range response.ClonePairs {
+					if members[pair.Clone1.ID] && members[pair.Clone2.ID] {
+						backed[pair.Clone1.ID] = true
+						backed[pair.Clone2.ID] = true
+					}
+				}
+				assert.Equal(t, members, backed, "every displayed group member needs a displayed pair within its group")
+			}
+			assert.Equal(t, baseline.Statistics.TotalFragments, response.Statistics.TotalFragments, "the analyzed fragment population must not move")
+			assert.Equal(t, baseline.Statistics.DuplicatedFragments, response.Statistics.DuplicatedFragments, "the scored fragment population must not move")
+			assert.Equal(t, baseline.Statistics.LinesAnalyzed, response.Statistics.LinesAnalyzed, "the source-line denominator must not move")
+			assert.Equal(t, baseline.Statistics.DuplicatedLines, response.Statistics.DuplicatedLines, "display filters must not move scored line coverage")
+		})
+	}
+}
+
+// writeIdenticalBodyFixture writes a module whose sibling classes share
+// byte-identical method bodies that are far shorter than MinLines/MinNodes.
+func writeIdenticalBodyFixture(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "backends.py")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	return path
+}
+
+func TestCloneService_DetectsIdenticalShortMethodBodies(t *testing.T) {
+	const siblings = `class Sib1:
+    def tick(self):
+        self.n += 1
+        return self.n
+
+
+class Sib2:
+    def tick(self):
+        self.n += 1
+        return self.n
+`
+
+	path := writeIdenticalBodyFixture(t, siblings)
+	req := domain.DefaultCloneRequest()
+	req.Paths = []string{path}
+	req.OutputFormat = domain.OutputFormatJSON
+
+	response, err := NewCloneService().DetectClones(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, response.ClonePairs, 1, "identical 3-line sibling methods should be reported despite min_lines=%d", req.MinLines)
+	pair := response.ClonePairs[0]
+	assert.Equal(t, domain.Type1Clone, pair.Type)
+	assert.Equal(t, 1.0, pair.Similarity)
+	assert.Equal(t, 3, pair.Clone1.LineCount)
+	assert.Equal(t, 3, pair.Clone2.LineCount)
+}
+
+func TestCloneService_IgnoresShortBodiesWithoutIdenticalTwin(t *testing.T) {
+	const siblings = `class Sib1:
+    def tick(self):
+        self.n += 1
+        return self.n
+
+
+class Sib2:
+    def tick(self):
+        self.n += 2
+        return self.n
+`
+
+	path := writeIdenticalBodyFixture(t, siblings)
+	req := domain.DefaultCloneRequest()
+	req.Paths = []string{path}
+	req.OutputFormat = domain.OutputFormatJSON
+
+	response, err := NewCloneService().DetectClones(context.Background(), req)
+	require.NoError(t, err)
+
+	assert.Empty(t, response.ClonePairs, "near-identical short bodies stay below the size gate")
+	assert.Zero(t, response.Statistics.TotalFragments, "unvindicated short fragments should not be retained")
+}
+
+func TestCloneService_IgnoresIdenticalSingleStatementOverrides(t *testing.T) {
+	const siblings = `class Sib1:
+    def close(self):
+        raise NotImplementedError
+
+
+class Sib2:
+    def close(self):
+        raise NotImplementedError
+`
+
+	path := writeIdenticalBodyFixture(t, siblings)
+	req := domain.DefaultCloneRequest()
+	req.Paths = []string{path}
+	req.OutputFormat = domain.OutputFormatJSON
+
+	response, err := NewCloneService().DetectClones(context.Background(), req)
+	require.NoError(t, err)
+
+	assert.Empty(t, response.ClonePairs, "single-statement overrides are boilerplate, not duplication")
+}
+
+// TestCloneService_GroupTypeIsLoosestBackingPair pins issue #878: one identical
+// pair must not label a group Type-1 when another member only matches it after
+// renames.
+func TestCloneService_GroupTypeIsLoosestBackingPair(t *testing.T) {
+	req := domain.DefaultCloneRequest()
+	dir := "../testdata/python/clone_group_type"
+	req.Paths = []string{filepath.Join(dir, "ninepatch.py"), filepath.Join(dir, "shape.py"), filepath.Join(dir, "sprite.py")}
+	req.OutputFormat = domain.OutputFormatJSON
+
+	response, err := NewCloneService().DetectClones(context.Background(), req)
+	require.NoError(t, err)
+
+	var group *domain.CloneGroup
+	for _, g := range response.CloneGroups {
+		for _, clone := range g.Clones {
+			if filepath.Base(clone.Location.FilePath) == "shape.py" && clone.Location.StartLine == 7 {
+				group = g
+			}
+		}
+	}
+	require.NotNil(t, group, "the three delete() bodies must form a group")
+	require.Equal(t, 3, group.Size)
+
+	members := make(map[int]bool)
+	for _, clone := range group.Clones {
+		members[clone.ID] = true
+	}
+	pairTypes := make(map[domain.CloneType]int)
+	for _, pair := range response.ClonePairs {
+		if members[pair.Clone1.ID] && members[pair.Clone2.ID] {
+			pairTypes[pair.Type]++
+		}
+	}
+	require.Equal(t, map[domain.CloneType]int{domain.Type1Clone: 1, domain.Type2Clone: 2}, pairTypes,
+		"the group must be backed by one identical pair and two renamed pairs")
+
+	assert.Equal(t, domain.Type2Clone, group.Type)
+	for _, clone := range group.Clones {
+		assert.Equal(t, domain.Type2Clone, clone.Type)
+	}
+}

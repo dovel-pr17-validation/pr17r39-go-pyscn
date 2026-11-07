@@ -1,0 +1,2034 @@
+package analyzer
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"testing"
+
+	coreclone "github.com/ludo-technologies/polyscan/core/clone"
+	"github.com/ludo-technologies/pyscn/domain"
+	"github.com/ludo-technologies/pyscn/internal/parser"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCloneDetector_Creation(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	assert.NotNil(t, detector, "Detector should be created")
+	assert.Equal(t, *config, detector.cloneDetectorConfig, "Config should be set correctly")
+	assert.NotNil(t, detector.analyzer, "APTED analyzer should be initialized")
+	assert.NotNil(t, detector.converter, "Tree converter should be initialized")
+}
+
+func TestCloneDetectorConfig_Defaults(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+
+	assert.Equal(t, domain.DefaultCloneMinLines, config.MinLines, "Default min lines should match constant")
+	assert.Equal(t, domain.DefaultCloneMinNodes, config.MinNodes, "Default min nodes should match constant")
+	assert.Equal(t, domain.DefaultType1CloneThreshold, config.Type1Threshold, "Default Type-1 threshold should match constant")
+	assert.Equal(t, domain.DefaultType2CloneThreshold, config.Type2Threshold, "Default Type-2 threshold should match constant")
+	assert.Equal(t, domain.DefaultType3CloneThreshold, config.Type3Threshold, "Default Type-3 threshold should match constant")
+	assert.Equal(t, domain.DefaultType4CloneThreshold, config.Type4Threshold, "Default Type-4 threshold should match constant")
+	assert.Equal(t, 50.0, config.MaxEditDistance, "Default max edit distance should be 50.0")
+	assert.Equal(t, defaultLSHMaxCandidates, config.LSHMaxCandidates, "Default LSH candidate cap should be set")
+	assert.False(t, config.IgnoreLiterals, "Default ignore literals should be false")
+	assert.False(t, config.IgnoreIdentifiers, "Default ignore identifiers should be false")
+	assert.True(t, config.SkipDocstrings, "Default skip docstrings should be true")
+	assert.Equal(t, "python", config.CostModelType, "Default cost model should be python")
+}
+
+func TestCloneType_String(t *testing.T) {
+	tests := []struct {
+		cloneType CloneType
+		expected  string
+	}{
+		{Type1Clone, "Type-1 (Identical)"},
+		{Type2Clone, "Type-2 (Renamed)"},
+		{Type3Clone, "Type-3 (Near-Miss)"},
+		{Type4Clone, "Type-4 (Semantic)"},
+		{CloneType(99), "Unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.expected, func(t *testing.T) {
+			result := tt.cloneType.String()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestCodeLocation_String(t *testing.T) {
+	location := &CodeLocation{
+		FilePath:  "/path/to/file.py",
+		StartLine: 10,
+		EndLine:   20,
+		StartCol:  5,
+		EndCol:    15,
+	}
+
+	expected := "/path/to/file.py:10:5-20:15"
+	result := location.String()
+	assert.Equal(t, expected, result)
+}
+
+func TestCodeFragment_Creation(t *testing.T) {
+	location := &CodeLocation{
+		FilePath:  "/test/file.py",
+		StartLine: 1,
+		EndLine:   10,
+		StartCol:  1,
+		EndCol:    20,
+	}
+
+	// Create a simple mock AST node
+	astNode := &parser.Node{
+		Type: parser.NodeFunctionDef,
+		Name: "test_function",
+	}
+
+	content := "def test_function():\n    pass"
+	fragment := NewCodeFragment(location, astNode, content)
+
+	assert.NotNil(t, fragment, "Fragment should be created")
+	assert.Equal(t, location, fragment.Location, "Location should be set")
+	assert.Equal(t, astNode, fragment.ASTNode, "AST node should be set")
+	assert.Equal(t, content, fragment.Content, "Content should be set")
+	assert.Equal(t, 10, fragment.LineCount, "Line count should be calculated correctly")
+	assert.Greater(t, fragment.Size, 0, "Size should be calculated")
+	assert.NotEmpty(t, fragment.Hash, "Hash should be computed from content")
+}
+
+func TestCodeFragment_Hash(t *testing.T) {
+	location := &CodeLocation{FilePath: "/test/file.py", StartLine: 1, EndLine: 2}
+	astNode := &parser.Node{Type: parser.NodeFunctionDef, Name: "f"}
+
+	newFragment := func(content string) *CodeFragment {
+		return NewCodeFragment(location, astNode, content)
+	}
+
+	t.Run("non-empty content produces 16-char hex hash", func(t *testing.T) {
+		fragment := newFragment("def f():\n    return 1")
+		assert.Regexp(t, "^[0-9a-f]{16}$", fragment.Hash)
+	})
+
+	t.Run("empty content produces empty hash", func(t *testing.T) {
+		fragment := newFragment("")
+		assert.Empty(t, fragment.Hash, "Fragments extracted without source content should have no hash")
+	})
+
+	t.Run("Type-1 variants share the same hash", func(t *testing.T) {
+		original := newFragment("def f():\n    return 1")
+		reformatted := newFragment("def f():\n        return  1")
+		commented := newFragment("def f():  # comment\n    return 1")
+
+		assert.Equal(t, original.Hash, reformatted.Hash, "Whitespace differences should not change the hash")
+		assert.Equal(t, original.Hash, commented.Hash, "Comments should not change the hash")
+	})
+
+	t.Run("different code produces different hashes", func(t *testing.T) {
+		f1 := newFragment("def f():\n    return 1")
+		f2 := newFragment("def f():\n    return 2")
+		assert.NotEqual(t, f1.Hash, f2.Hash)
+	})
+}
+
+func TestCalculateASTSize(t *testing.T) {
+	// Test with nil node
+	size := calculateASTSize(nil)
+	assert.Equal(t, 0, size, "Nil node should have size 0")
+
+	// Test with single node
+	node := &parser.Node{
+		Type: parser.NodeName,
+		Name: "variable",
+	}
+	size = calculateASTSize(node)
+	assert.Equal(t, 1, size, "Single node should have size 1")
+
+	// Test with node with children
+	parent := &parser.Node{
+		Type: parser.NodeFunctionDef,
+		Name: "test_func",
+		Children: []*parser.Node{
+			{Type: parser.NodeName, Name: "param1"},
+			{Type: parser.NodeName, Name: "param2"},
+		},
+	}
+	size = calculateASTSize(parent)
+	assert.Equal(t, 3, size, "Node with 2 children should have size 3")
+
+	// Expression fields count as real AST size.
+	expressionNode := &parser.Node{
+		Type: parser.NodeAssign,
+		Targets: []*parser.Node{
+			{Type: parser.NodeName, Name: "value"},
+		},
+		Value: &parser.Node{
+			Type:  parser.NodeSubscript,
+			Value: &parser.Node{Type: parser.NodeName, Name: "items"},
+			Children: []*parser.Node{
+				{Type: parser.NodeName, Name: "index"},
+			},
+		},
+	}
+	size = calculateASTSize(expressionNode)
+	assert.Equal(t, 5, size, "Expression fields should be included in AST size")
+
+	// Shared nodes are counted once per parent, matching tree conversion.
+	shared := &parser.Node{Type: parser.NodeName, Name: "condition"}
+	duplicateReference := &parser.Node{
+		Type:     parser.NodeIf,
+		Children: []*parser.Node{shared},
+		Test:     shared,
+	}
+	size = calculateASTSize(duplicateReference)
+	assert.Equal(t, 2, size, "Duplicate child references should not inflate AST size")
+}
+
+func TestCompareWithAPTEDExpressionOnlyDifferenceReportsDistance(t *testing.T) {
+	left := `if cond:
+    value = items[i]
+`
+	right := `if cond:
+    value = items[j]
+`
+
+	leftTree := parseFirstStatementTree(t, left)
+	rightTree := parseFirstStatementTree(t, right)
+	PrepareTreeForAPTED(leftTree)
+	PrepareTreeForAPTED(rightTree)
+
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 1
+	config.MinNodes = 1
+	detector := NewCloneDetector(config)
+
+	pair := detector.compareWithAPTED(
+		&CodeFragment{
+			Location:  &CodeLocation{FilePath: "left.py", StartLine: 1, EndLine: 2},
+			TreeNode:  leftTree,
+			Content:   left,
+			Size:      leftTree.Size(),
+			LineCount: 2,
+		},
+		&CodeFragment{
+			Location:  &CodeLocation{FilePath: "right.py", StartLine: 1, EndLine: 2},
+			TreeNode:  rightTree,
+			Content:   right,
+			Size:      rightTree.Size(),
+			LineCount: 2,
+		},
+	)
+
+	require.NotNil(t, pair)
+	assert.Greater(t, pair.Distance, 0.0)
+	assert.Equal(t, Type2Clone, pair.CloneType)
+}
+
+func TestCompareWithAPTEDDoesNotReportUnrelatedClassBodiesAsType2(t *testing.T) {
+	leftFragment := parseFirstFragmentFromFile(t, "parsera_page.py")
+	rightFragment := parseFirstFragmentFromFile(t, "parsera_parsera.py")
+
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 1
+	config.MinNodes = 1
+	detector := NewCloneDetector(config)
+
+	pair := detector.compareWithAPTED(leftFragment, rightFragment)
+	if pair != nil && pair.CloneType == Type2Clone {
+		t.Fatalf("unrelated class bodies should not be Type-2 clones, got similarity %.3f", pair.Similarity)
+	}
+}
+
+func TestClonePair_String(t *testing.T) {
+	fragment1 := &CodeFragment{
+		Location: &CodeLocation{
+			FilePath:  "/test1.py",
+			StartLine: 1,
+			EndLine:   5,
+		},
+	}
+
+	fragment2 := &CodeFragment{
+		Location: &CodeLocation{
+			FilePath:  "/test2.py",
+			StartLine: 10,
+			EndLine:   14,
+		},
+	}
+
+	pair := &ClonePair{
+		Fragment1:  fragment1,
+		Fragment2:  fragment2,
+		Similarity: 0.85,
+		CloneType:  Type2Clone,
+	}
+
+	result := pair.String()
+	expected := "Type-2 (Renamed) clone: /test1.py:1:0-5:0 <-> /test2.py:10:0-14:0 (similarity: 0.850)"
+	assert.Equal(t, expected, result)
+}
+
+func parseFirstFragmentWithContent(t *testing.T, filePath, source string) *CodeFragment {
+	t.Helper()
+
+	p := parser.New()
+	result, err := p.Parse(t.Context(), []byte(source))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.AST)
+	require.NotEmpty(t, result.AST.Body)
+
+	classNode := result.AST.Body[0]
+	location := &CodeLocation{
+		FilePath:  filePath,
+		StartLine: classNode.Location.StartLine,
+		EndLine:   classNode.Location.EndLine,
+		StartCol:  classNode.Location.StartCol,
+		EndCol:    classNode.Location.EndCol,
+	}
+	fragment := NewCodeFragment(location, classNode, source)
+	converter := NewTreeConverterWithConfig(true)
+	fragment.TreeNode = converter.ConvertAST(classNode)
+	require.NotNil(t, fragment.TreeNode)
+	PrepareTreeForAPTED(fragment.TreeNode)
+	fragment.Size = fragment.TreeNode.Size()
+
+	return fragment
+}
+
+func parseFirstFragmentFromFile(t *testing.T, name string) *CodeFragment {
+	t.Helper()
+
+	path := filepath.Join("..", "..", "testdata", "python", "clones", "type2_false_positive", name)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	return parseFirstFragmentWithContent(t, path, string(content))
+}
+
+func TestCloneGroup_Operations(t *testing.T) {
+	group := NewCloneGroup(1)
+	assert.Equal(t, 1, group.ID, "Group ID should be set")
+	assert.Equal(t, 0, group.Size, "Initial size should be 0")
+	assert.Empty(t, group.Fragments, "Initial fragments should be empty")
+
+	// Add fragment
+	fragment := &CodeFragment{
+		Location: &CodeLocation{FilePath: "/test.py"},
+		Size:     10,
+	}
+	group.AddFragment(fragment)
+
+	assert.Equal(t, 1, group.Size, "Size should be updated after adding fragment")
+	assert.Len(t, group.Fragments, 1, "Fragments should contain added fragment")
+	assert.Equal(t, fragment, group.Fragments[0], "Fragment should be stored correctly")
+}
+
+func TestCloneDetector_IsFragmentCandidate(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	tests := []struct {
+		name     string
+		nodeType parser.NodeType
+		expected bool
+	}{
+		{"function definition", parser.NodeFunctionDef, true},
+		{"async function definition", parser.NodeAsyncFunctionDef, true},
+		{"class definition", parser.NodeClassDef, true},
+		{"for loop", parser.NodeFor, true},
+		{"async for loop", parser.NodeAsyncFor, true},
+		{"while loop", parser.NodeWhile, true},
+		{"if statement", parser.NodeIf, true},
+		{"try statement", parser.NodeTry, true},
+		{"with statement", parser.NodeWith, true},
+		{"async with statement", parser.NodeAsyncWith, true},
+		{"simple expression", parser.NodeName, false},
+		{"constant", parser.NodeConstant, false},
+		{"binary operation", parser.NodeBinOp, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &parser.Node{Type: tt.nodeType}
+			result := detector.isFragmentCandidate(node)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestCloneDetector_ShouldIncludeFragment(t *testing.T) {
+	config := &CloneDetectorConfig{
+		MinLines: 5,
+		MinNodes: 10,
+	}
+	detector := NewCloneDetector(config)
+
+	tests := []struct {
+		name      string
+		size      int
+		lineCount int
+		expected  bool
+	}{
+		{"meets both requirements", 15, 8, true},
+		{"too few nodes", 8, 8, false},
+		{"too few lines", 15, 3, false},
+		{"meets neither requirement", 5, 3, false},
+		{"exactly at thresholds", 10, 5, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fragment := &CodeFragment{
+				Size:      tt.size,
+				LineCount: tt.lineCount,
+			}
+			result := detector.shouldIncludeFragment(fragment)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestCloneDetector_ClassifyClonePair(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+	exact := parseFirstFragmentWithContent(t, "same.py", "def same():\n    return 1\n")
+	different := parseFirstFragmentWithContent(t, "different.py", "def different():\n    return 2\n")
+
+	tests := []struct {
+		name       string
+		similarity float64
+		fragment1  *CodeFragment
+		fragment2  *CodeFragment
+		expected   CloneType
+	}{
+		{"exact text at type1 threshold", 0.99, exact, exact, Type1Clone},
+		{"text mismatch at type1 threshold", 0.99, exact, different, Type2Clone},
+		{"medium similarity", 0.80, exact, different, Type2Clone},
+		{"type3 range", 0.72, exact, different, Type3Clone},
+		{"type4 range", 0.65, exact, different, Type4Clone},
+		{"very low similarity", 0.50, exact, different, CloneType(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, _ := detector.classifyClonePair(tt.fragment1, tt.fragment2, tt.similarity)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+type stubSimilarityAnalyzer struct {
+	name string
+	sim  float64
+}
+
+func (s stubSimilarityAnalyzer) ComputeSimilarity(f1, f2 *CodeFragment) float64 { return s.sim }
+func (s stubSimilarityAnalyzer) GetName() string                                { return s.name }
+
+func TestCloneDetector_SemanticType4SimilarityIsCapped(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.EnableMultiDimensionalAnalysis = true
+	config.EnableSemanticAnalysis = true
+	detector := NewCloneDetector(config)
+
+	// Force the classifier down the semantic Type-4 path with a raw semantic
+	// similarity above the Type-1 threshold.
+	detector.classifier.textualAnalyzer = nil
+	detector.classifier.syntacticAnalyzer = stubSimilarityAnalyzer{name: "syntactic", sim: 0}
+	detector.classifier.structuralAnalyzer = stubSimilarityAnalyzer{name: "structural", sim: 0}
+	detector.classifier.semanticAnalyzer = stubSimilarityAnalyzer{name: "semantic", sim: 0.98}
+
+	f1 := parseFirstFragmentWithContent(t, "a.py", "def a():\n    return 1\n")
+	f2 := parseFirstFragmentWithContent(t, "b.py", "def b():\n    return 2\n")
+
+	pair := detector.compareFragmentsWithClassifier(f1, f2)
+	require.NotNil(t, pair)
+	assert.Equal(t, Type4Clone, pair.CloneType)
+	// Non-textual pairs never report a Type-1-level similarity (#733).
+	assert.Less(t, pair.Similarity, config.Type1Threshold)
+	assert.Equal(t, math.Nextafter(config.Type1Threshold, 0), pair.Similarity)
+
+	// Below the threshold the measured similarity passes through unchanged.
+	detector.classifier.semanticAnalyzer = stubSimilarityAnalyzer{name: "semantic", sim: 0.7}
+	pair = detector.compareFragmentsWithClassifier(f1, f2)
+	require.NotNil(t, pair)
+	assert.Equal(t, Type4Clone, pair.CloneType)
+	assert.Equal(t, 0.7, pair.Similarity)
+}
+
+func TestCloneDetector_Type1RequiresTextualMatch(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 1
+	config.MinNodes = 1
+	detector := NewCloneDetector(config)
+
+	newFragment := func(content string) *CodeFragment {
+		root := NewTreeNode(1, "If")
+		root.AddChild(NewTreeNode(2, "Assign"))
+		root.AddChild(NewTreeNode(3, "Assign"))
+		PrepareTreeForAPTED(root)
+
+		return &CodeFragment{
+			Location:  &CodeLocation{FilePath: "test.py", StartLine: 1, EndLine: 4},
+			TreeNode:  root,
+			Content:   content,
+			Size:      3,
+			LineCount: 4,
+		}
+	}
+
+	clone := detector.compareWithAPTED(
+		newFragment("if enabled:\n    value = 1\nelse:\n    value = 2\n"),
+		newFragment("if enabled:\n value = 1 # same logic\nelse:\n value = 2\n"),
+	)
+	require.NotNil(t, clone)
+	assert.Equal(t, Type1Clone, clone.CloneType)
+
+	textMismatch := detector.compareWithAPTED(
+		newFragment("if path.endswith('.py'):\n    count += 1\nelse:\n    count -= 1\n"),
+		newFragment("if radius > 0:\n    area = radius * radius\nelse:\n    area = 0\n"),
+	)
+	require.NotNil(t, textMismatch)
+	assert.Equal(t, Type2Clone, textMismatch.CloneType)
+	assert.Less(t, textMismatch.Similarity, 1.0)
+	assert.Less(t, textMismatch.Similarity, config.Type1Threshold)
+	assert.GreaterOrEqual(t, textMismatch.Similarity, config.Type2Threshold)
+}
+
+func TestCloneDetector_IsSignificantClone(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	fragment1 := &CodeFragment{Size: 30, LineCount: 15}
+	fragment2 := &CodeFragment{Size: 24, LineCount: 13}
+
+	tests := []struct {
+		name       string
+		similarity float64
+		distance   float64
+		expected   bool
+	}{
+		{"high similarity, low distance", 0.85, 10.0, true},
+		{"low similarity", 0.40, 10.0, false},
+		{"high distance", 0.85, 100.0, false},
+		{"threshold values", 0.65, 50.0, true}, // 0.65 equals Type4 threshold (0.65)
+		{"below threshold", 0.60, 10.0, false}, // 0.60 is below Type4 threshold (0.65)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pair := &ClonePair{
+				Fragment1:  fragment1,
+				Fragment2:  fragment2,
+				Similarity: tt.similarity,
+				Distance:   tt.distance,
+			}
+			result := detector.isSignificantClone(pair)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestCloneDetector_IsSameLocation(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	loc1 := &CodeLocation{
+		FilePath:  "/test.py",
+		StartLine: 10,
+		EndLine:   20,
+	}
+
+	loc2 := &CodeLocation{
+		FilePath:  "/test.py",
+		StartLine: 10,
+		EndLine:   20,
+	}
+
+	loc3 := &CodeLocation{
+		FilePath:  "/other.py",
+		StartLine: 10,
+		EndLine:   20,
+	}
+
+	assert.True(t, detector.isSameLocation(loc1, loc2), "Identical locations should be same")
+	assert.False(t, detector.isSameLocation(loc1, loc3), "Different file paths should not be same")
+}
+
+func TestCloneDetector_CalculateConfidence(t *testing.T) {
+	fragment1 := &CodeFragment{
+		Size:       50,
+		Complexity: 5,
+	}
+
+	fragment2 := &CodeFragment{
+		Size:       45,
+		Complexity: 5,
+	}
+
+	confidence := coreclone.CalculateConfidence(fragment1.coreFragment(), fragment2.coreFragment(), 0.8)
+
+	assert.GreaterOrEqual(t, confidence, 0.8, "Confidence should be at least the similarity")
+	assert.LessOrEqual(t, confidence, 1.0, "Confidence should not exceed 1.0")
+}
+
+// Regression for #793: the default grouping mode must not chain A~B and B~C
+// into one group when A and C were never scored above the threshold.
+func TestCloneDetector_DefaultGroupingDoesNotChainUnscoredPairs(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	require.Equal(t, GroupingMode(domain.DefaultCloneGroupMode), config.GroupingMode)
+	config.GroupingThreshold = 0.80
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: 1, EndLine: 10}}
+	}
+	a, b, c := fragment("a.py"), fragment("b.py"), fragment("c.py")
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: a, Fragment2: b, Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: b, Fragment2: c, Similarity: 0.90, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(0.80, 2)
+
+	require.NotEmpty(t, detector.cloneGroups)
+	for _, group := range detector.cloneGroups {
+		if contains(group.Fragments, a) && contains(group.Fragments, c) {
+			t.Fatalf("a and c share a group although that pair was never scored")
+		}
+	}
+}
+
+func contains(fragments []*CodeFragment, target *CodeFragment) bool {
+	for _, fragment := range fragments {
+		if fragment == target {
+			return true
+		}
+	}
+	return false
+}
+
+// Regression for #793: complete linkage keeps a fragment in one group only, so
+// a hub that clones several others must still surface its remaining pairs.
+func TestCloneDetector_DefaultGroupingCoversEveryPair(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.GroupingThreshold = 0.65
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: 1, EndLine: 10}}
+	}
+	hub := fragment("hub.py")
+	spokes := []*CodeFragment{fragment("a.py"), fragment("b.py"), fragment("c.py")}
+	for i, spoke := range spokes {
+		detector.clonePairs = append(detector.clonePairs, &ClonePair{
+			Fragment1:  hub,
+			Fragment2:  spoke,
+			Similarity: 0.85 - 0.05*float64(i),
+			CloneType:  Type3Clone,
+		})
+	}
+
+	detector.groupClones(0.65, 2)
+
+	for _, pair := range detector.clonePairs {
+		grouped := false
+		for _, group := range detector.cloneGroups {
+			if contains(group.Fragments, pair.Fragment1) && contains(group.Fragments, pair.Fragment2) {
+				grouped = true
+				break
+			}
+		}
+		assert.True(t, grouped, "pair %s~%s reached no group",
+			pair.Fragment1.Location.FilePath, pair.Fragment2.Location.FilePath)
+	}
+}
+
+// k-core prunes fragments with fewer than k similar neighbours, so filling in
+// uncovered pairs must not resurrect what it excluded.
+func TestCloneDetector_KCoreGroupingKeepsPairsBelowDegreeExcluded(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.GroupingMode = GroupingModeKCore
+	config.GroupingThreshold = 0.80
+	config.KCoreK = 2
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: 1, EndLine: 10}}
+	}
+	a, b := fragment("a.py"), fragment("b.py")
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: a, Fragment2: b, Similarity: 0.90, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(0.80, 2)
+
+	assert.Empty(t, detector.cloneGroups, "each fragment has one neighbour, below k=2")
+}
+
+// Regression for #798: suppressing a member must not leave the rest of the
+// group reported as one family when no surviving pair connects them.
+func TestCloneDetector_GroupIsResplitAfterMemberSuppression(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.GroupingMode = GroupingModeConnected
+	config.GroupingThreshold = 0.80
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string, start, end int) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: start, EndLine: end}}
+	}
+	a := fragment("a.py", 1, 10)
+	inner := fragment("b.py", 1, 10)
+	outer := fragment("b.py", 1, 20)
+	c := fragment("c.py", 1, 10)
+
+	// outer covers inner, so inner is suppressed and both of its pairs go with
+	// it. That leaves c connected to nothing.
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: a, Fragment2: inner, Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: inner, Fragment2: c, Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: a, Fragment2: outer, Similarity: 0.90, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(0.80, 2)
+
+	require.Len(t, detector.cloneGroups, 1)
+	assert.Equal(t, []*CodeFragment{a, outer}, detector.cloneGroups[0].Fragments)
+}
+
+func TestCloneDetector_StarGroupingFiltersMembersBelowMedoidThreshold(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.GroupingMode = GroupingModeStar
+	config.GroupingThreshold = 0.80
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: 1, EndLine: 10}}
+	}
+	a, b, c, d := fragment("a.py"), fragment("b.py"), fragment("c.py"), fragment("d.py")
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: a, Fragment2: b, Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: b, Fragment2: c, Similarity: 0.81, CloneType: Type3Clone},
+		{Fragment1: c, Fragment2: d, Similarity: 0.90, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(0.80, 2)
+
+	require.Len(t, detector.cloneGroups, 2)
+	assert.Equal(t, []*CodeFragment{a, b, c}, detector.cloneGroups[0].Fragments)
+	// d stays out of the star group, but its pair with c is still above the
+	// threshold and surfaces as its own group rather than disappearing.
+	assert.Equal(t, []*CodeFragment{c, d}, detector.cloneGroups[1].Fragments)
+}
+
+func TestCloneDetector_CentroidGroupingComputesMissingSimilarities(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.GroupingMode = GroupingModeCentroid
+	config.GroupingThreshold = 0.80
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string) *CodeFragment {
+		tree := NewTreeNode(0, "FunctionDef")
+		tree.AddChild(NewTreeNode(1, "Return"))
+		PrepareTreeForAPTED(tree)
+		return &CodeFragment{
+			Location: &CodeLocation{FilePath: path, StartLine: 1, EndLine: 10},
+			TreeNode: tree,
+			Size:     2,
+		}
+	}
+	a, b, c := fragment("a.py"), fragment("b.py"), fragment("c.py")
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: a, Fragment2: b, Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: b, Fragment2: c, Similarity: 0.90, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(0.80, 2)
+
+	require.Len(t, detector.cloneGroups, 1)
+	assert.Equal(t, []*CodeFragment{a, b, c}, detector.cloneGroups[0].Fragments)
+	assert.Equal(t, Type1Clone, detector.cloneGroups[0].CloneType)
+	assert.Equal(t, 1.0, detector.cloneGroups[0].Similarity)
+}
+
+func TestCloneDetector_GetStatistics(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	// Add some mock data
+	detector.fragments = make([]*CodeFragment, 10)
+	detector.clonePairs = []*ClonePair{
+		{CloneType: Type1Clone, Similarity: 0.95},
+		{CloneType: Type2Clone, Similarity: 0.85},
+		{CloneType: Type1Clone, Similarity: 0.98},
+	}
+	detector.cloneGroups = make([]*CloneGroup, 2)
+
+	stats := detector.GetStatistics()
+
+	assert.Equal(t, 10, stats["total_fragments"])
+	assert.Equal(t, 3, stats["total_clone_pairs"])
+	assert.Equal(t, 2, stats["total_clone_groups"])
+
+	typeStats := stats["clone_types"].(map[string]int)
+	assert.Equal(t, 2, typeStats["Type-1 (Identical)"])
+	assert.Equal(t, 1, typeStats["Type-2 (Renamed)"])
+
+	avgSimilarity := stats["average_similarity"].(float64)
+	expected := (0.95 + 0.85 + 0.98) / 3
+	assert.InDelta(t, expected, avgSimilarity, 0.001)
+}
+
+func TestCloneDetector_ExtractFragments_MeasuresSLOC(t *testing.T) {
+	// Both functions span 10 raw lines. commented has only 5 SLOC once its
+	// comments, blank lines and docstring are excluded, so it falls below
+	// MinLines; dense clears it with 10.
+	source := `def commented(items):
+    """Sum the items."""
+    # accumulate
+
+    total = 0
+    for item in items:
+        # skip empties
+        total += item
+
+    return total
+
+def dense(items):
+    total = 0
+    count = 0
+    for item in items:
+        total += item
+        count += 1
+    if count == 0:
+        return 0
+    mean = total / count
+    return mean
+`
+	result, err := parser.New().Parse(context.Background(), []byte(source))
+	require.NoError(t, err)
+
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 10
+	config.MinNodes = 1
+	detector := NewCloneDetector(config)
+
+	fragments := detector.ExtractFragmentsWithSource([]*parser.Node{result.AST}, "test.py", []byte(source))
+
+	lineCounts := map[string]int{}
+	for _, fragment := range fragments {
+		if fragment.ASTNode.Type == parser.NodeFunctionDef && !fragment.belowSizeGate {
+			lineCounts[fragment.ASTNode.Name] = fragment.LineCount
+		}
+	}
+	assert.Equal(t, map[string]int{"dense": 10}, lineCounts)
+}
+
+func TestCloneDetector_DetectClones(t *testing.T) {
+	tests := []struct {
+		name           string
+		config         *CloneDetectorConfig
+		fragments      []*CodeFragment
+		expectedPairs  int
+		expectedGroups int
+		description    string
+	}{
+		{
+			name: "identical functions",
+			config: &CloneDetectorConfig{
+				MinLines:           2,
+				MinNodes:           2,
+				Type1Threshold:     0.95,
+				Type2Threshold:     0.85,
+				Type3Threshold:     0.70,
+				Type4Threshold:     0.60,
+				MaxEditDistance:    50.0,
+				MaxClonePairs:      10000,
+				BatchSizeThreshold: 50,
+			},
+			fragments: func() []*CodeFragment {
+				// Create two identical code fragments
+				ast1 := &parser.Node{
+					Type:     parser.NodeFunctionDef,
+					Name:     "func1",
+					Location: parser.Location{StartLine: 1, EndLine: 5},
+					Children: []*parser.Node{
+						{Type: parser.NodeReturn, Children: []*parser.Node{
+							{Type: parser.NodeConstant, Value: "1"},
+						}},
+					},
+				}
+				ast2 := &parser.Node{
+					Type:     parser.NodeFunctionDef,
+					Name:     "func2",
+					Location: parser.Location{StartLine: 10, EndLine: 14},
+					Children: []*parser.Node{
+						{Type: parser.NodeReturn, Children: []*parser.Node{
+							{Type: parser.NodeConstant, Value: "1"},
+						}},
+					},
+				}
+
+				loc1 := &CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 5}
+				loc2 := &CodeLocation{FilePath: "/test.py", StartLine: 10, EndLine: 14}
+
+				frag1 := NewCodeFragment(loc1, ast1, "def func1():\n    return 1")
+				frag2 := NewCodeFragment(loc2, ast2, "def func2():\n    return 1")
+
+				// Convert to TreeNode for comparison
+				converter := NewTreeConverter()
+				frag1.TreeNode = converter.ConvertAST(ast1)
+				frag2.TreeNode = converter.ConvertAST(ast2)
+
+				return []*CodeFragment{frag1, frag2}
+			}(),
+			expectedPairs:  1,
+			expectedGroups: 1,
+			description:    "Should detect Type-1 clone for identical functions",
+		},
+		{
+			name: "different variable names",
+			config: &CloneDetectorConfig{
+				MinLines:           2,
+				MinNodes:           2,
+				Type1Threshold:     0.95,
+				Type2Threshold:     0.85,
+				Type3Threshold:     0.70,
+				Type4Threshold:     0.60,
+				MaxEditDistance:    50.0,
+				MaxClonePairs:      10000,
+				BatchSizeThreshold: 50,
+			},
+			fragments: func() []*CodeFragment {
+				// Create two similar fragments with different variable names
+				ast1 := &parser.Node{
+					Type:     parser.NodeFunctionDef,
+					Name:     "process_data",
+					Location: parser.Location{StartLine: 1, EndLine: 5},
+					Children: []*parser.Node{
+						{Type: parser.NodeAssign, Children: []*parser.Node{
+							{Type: parser.NodeName, Name: "x"},
+							{Type: parser.NodeBinOp, Op: "*", Children: []*parser.Node{
+								{Type: parser.NodeName, Name: "x"},
+								{Type: parser.NodeConstant, Value: "2"},
+							}},
+						}},
+					},
+				}
+				ast2 := &parser.Node{
+					Type:     parser.NodeFunctionDef,
+					Name:     "calculate",
+					Location: parser.Location{StartLine: 10, EndLine: 14},
+					Children: []*parser.Node{
+						{Type: parser.NodeAssign, Children: []*parser.Node{
+							{Type: parser.NodeName, Name: "y"},
+							{Type: parser.NodeBinOp, Op: "*", Children: []*parser.Node{
+								{Type: parser.NodeName, Name: "y"},
+								{Type: parser.NodeConstant, Value: "2"},
+							}},
+						}},
+					},
+				}
+
+				loc1 := &CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 5}
+				loc2 := &CodeLocation{FilePath: "/test.py", StartLine: 10, EndLine: 14}
+
+				frag1 := NewCodeFragment(loc1, ast1, "def process_data(x):\n    x = x * 2")
+				frag2 := NewCodeFragment(loc2, ast2, "def calculate(y):\n    y = y * 2")
+
+				converter := NewTreeConverter()
+				frag1.TreeNode = converter.ConvertAST(ast1)
+				frag2.TreeNode = converter.ConvertAST(ast2)
+
+				return []*CodeFragment{frag1, frag2}
+			}(),
+			expectedPairs:  1,
+			expectedGroups: 1,
+			description:    "Should detect Type-2 clone for renamed variables",
+		},
+		{
+			name: "no clones",
+			config: &CloneDetectorConfig{
+				MinLines:           2,
+				MinNodes:           2,
+				Type1Threshold:     0.95,
+				Type2Threshold:     0.85,
+				Type3Threshold:     0.70,
+				Type4Threshold:     0.60,
+				MaxEditDistance:    50.0,
+				MaxClonePairs:      10000,
+				BatchSizeThreshold: 50,
+			},
+			fragments: func() []*CodeFragment {
+				// Create completely different fragments
+				ast1 := &parser.Node{
+					Type:     parser.NodeFunctionDef,
+					Name:     "read_file",
+					Location: parser.Location{StartLine: 1, EndLine: 5},
+					Children: []*parser.Node{
+						{Type: parser.NodeCall, Name: "open"},
+					},
+				}
+				ast2 := &parser.Node{
+					Type:     parser.NodeClassDef,
+					Name:     "DataProcessor",
+					Location: parser.Location{StartLine: 10, EndLine: 20},
+					Children: []*parser.Node{
+						{Type: parser.NodeFunctionDef, Name: "__init__"},
+					},
+				}
+
+				loc1 := &CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 5}
+				loc2 := &CodeLocation{FilePath: "/test.py", StartLine: 10, EndLine: 20}
+
+				frag1 := NewCodeFragment(loc1, ast1, "def read_file():\n    open()")
+				frag2 := NewCodeFragment(loc2, ast2, "class DataProcessor:\n    def __init__()")
+
+				converter := NewTreeConverter()
+				frag1.TreeNode = converter.ConvertAST(ast1)
+				frag2.TreeNode = converter.ConvertAST(ast2)
+
+				return []*CodeFragment{frag1, frag2}
+			}(),
+			expectedPairs:  0,
+			expectedGroups: 0,
+			description:    "Should not detect clones for completely different code",
+		},
+		{
+			name: "multiple clones",
+			config: &CloneDetectorConfig{
+				MinLines:           1,
+				MinNodes:           1,
+				Type1Threshold:     0.95,
+				Type2Threshold:     0.85,
+				Type3Threshold:     0.50,
+				Type4Threshold:     0.30, // Lowered for small test trees with max-based normalization
+				MaxEditDistance:    50.0,
+				MaxClonePairs:      10000,
+				BatchSizeThreshold: 50,
+			},
+			fragments: func() []*CodeFragment {
+				// Create three similar fragments
+				fragments := make([]*CodeFragment, 3)
+				converter := NewTreeConverter()
+
+				for i := 0; i < 3; i++ {
+					ast := &parser.Node{
+						Type:     parser.NodeFunctionDef,
+						Name:     fmt.Sprintf("func%d", i),
+						Location: parser.Location{StartLine: i*10 + 1, EndLine: i*10 + 3},
+						Children: []*parser.Node{
+							{Type: parser.NodeReturn, Children: []*parser.Node{
+								{Type: parser.NodeConstant, Value: fmt.Sprintf("%d", i)},
+							}},
+						},
+					}
+
+					loc := &CodeLocation{
+						FilePath:  "/test.py",
+						StartLine: i*10 + 1,
+						EndLine:   i*10 + 3,
+					}
+
+					fragments[i] = NewCodeFragment(loc, ast, fmt.Sprintf("def func%d():\n    return %d", i, i))
+					fragments[i].TreeNode = converter.ConvertAST(ast)
+				}
+
+				return fragments
+			}(),
+			expectedPairs:  3, // (0,1), (0,2), (1,2)
+			expectedGroups: 1, // All three in one group
+			description:    "Should detect all pairs and group them together",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detector := NewCloneDetector(tt.config)
+
+			// Detect clones
+			result := detector.DetectClones(tt.fragments)
+			pairs, groups := result.Pairs, result.Groups
+
+			assert.Len(t, pairs, tt.expectedPairs, tt.description+" - pairs count")
+			assert.Len(t, groups, tt.expectedGroups, tt.description+" - groups count")
+
+			// Verify that all pairs have valid similarity scores
+			for _, pair := range pairs {
+				assert.GreaterOrEqual(t, pair.Similarity, 0.0, "Similarity should be >= 0")
+				assert.LessOrEqual(t, pair.Similarity, 1.0, "Similarity should be <= 1")
+				assert.NotNil(t, pair.Fragment1, "Fragment1 should not be nil")
+				assert.NotNil(t, pair.Fragment2, "Fragment2 should not be nil")
+				assert.Greater(t, pair.CloneType, CloneType(0), "CloneType should be valid")
+			}
+
+			// Verify groups
+			for _, group := range groups {
+				assert.NotEmpty(t, group.Fragments, "Group should have fragments")
+				assert.GreaterOrEqual(t, group.Similarity, 0.0, "Group similarity should be >= 0")
+				assert.LessOrEqual(t, group.Similarity, 1.0, "Group similarity should be <= 1")
+			}
+		})
+	}
+}
+
+func TestCloneDetector_compareFragments(t *testing.T) {
+	config := &CloneDetectorConfig{
+		MinLines:        1,
+		MinNodes:        1,
+		Type1Threshold:  0.95,
+		Type2Threshold:  0.85,
+		Type3Threshold:  0.70,
+		Type4Threshold:  0.60,
+		MaxEditDistance: 50.0,
+	}
+	detector := NewCloneDetector(config)
+	converter := NewTreeConverter()
+
+	tests := []struct {
+		name          string
+		fragment1     *CodeFragment
+		fragment2     *CodeFragment
+		expectPair    bool
+		minSimilarity float64
+	}{
+		{
+			name: "identical fragments",
+			fragment1: func() *CodeFragment {
+				ast := &parser.Node{
+					Type: parser.NodeFunctionDef,
+					Name: "test",
+					Children: []*parser.Node{
+						{Type: parser.NodeReturn},
+					},
+				}
+				frag := NewCodeFragment(
+					&CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 3},
+					ast, "def test():\n    return",
+				)
+				frag.TreeNode = converter.ConvertAST(ast)
+				return frag
+			}(),
+			fragment2: func() *CodeFragment {
+				ast := &parser.Node{
+					Type: parser.NodeFunctionDef,
+					Name: "test",
+					Children: []*parser.Node{
+						{Type: parser.NodeReturn},
+					},
+				}
+				frag := NewCodeFragment(
+					&CodeLocation{FilePath: "/test.py", StartLine: 5, EndLine: 7},
+					ast, "def test():\n    return",
+				)
+				frag.TreeNode = converter.ConvertAST(ast)
+				return frag
+			}(),
+			expectPair:    true,
+			minSimilarity: 0.95,
+		},
+		{
+			name: "nil tree nodes",
+			fragment1: NewCodeFragment(
+				&CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 3},
+				nil, "def test():\n    return",
+			),
+			fragment2: NewCodeFragment(
+				&CodeLocation{FilePath: "/test.py", StartLine: 5, EndLine: 7},
+				nil, "def test():\n    return",
+			),
+			expectPair: false,
+		},
+		{
+			name: "same location",
+			fragment1: func() *CodeFragment {
+				ast := &parser.Node{Type: parser.NodeFunctionDef, Name: "test"}
+				frag := NewCodeFragment(
+					&CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 3},
+					ast, "def test():",
+				)
+				frag.TreeNode = converter.ConvertAST(ast)
+				return frag
+			}(),
+			fragment2: func() *CodeFragment {
+				ast := &parser.Node{Type: parser.NodeFunctionDef, Name: "test"}
+				frag := NewCodeFragment(
+					&CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 3},
+					ast, "def test():",
+				)
+				frag.TreeNode = converter.ConvertAST(ast)
+				return frag
+			}(),
+			expectPair:    true, // compareFragments doesn't filter same location, that's done at higher level
+			minSimilarity: 0.95,
+		},
+		{
+			name: "low similarity",
+			fragment1: func() *CodeFragment {
+				ast := &parser.Node{
+					Type: parser.NodeFunctionDef,
+					Name: "read_file",
+					Children: []*parser.Node{
+						{Type: parser.NodeCall, Name: "open"},
+						{Type: parser.NodeCall, Name: "read"},
+						{Type: parser.NodeCall, Name: "close"},
+					},
+				}
+				frag := NewCodeFragment(
+					&CodeLocation{FilePath: "/test.py", StartLine: 1, EndLine: 5},
+					ast, "def read_file():\n    open()\n    read()\n    close()",
+				)
+				frag.TreeNode = converter.ConvertAST(ast)
+				return frag
+			}(),
+			fragment2: func() *CodeFragment {
+				ast := &parser.Node{
+					Type: parser.NodeClassDef,
+					Name: "Calculator",
+					Children: []*parser.Node{
+						{Type: parser.NodeFunctionDef, Name: "add"},
+						{Type: parser.NodeFunctionDef, Name: "subtract"},
+					},
+				}
+				frag := NewCodeFragment(
+					&CodeLocation{FilePath: "/test.py", StartLine: 10, EndLine: 15},
+					ast, "class Calculator:\n    def add()\n    def subtract()",
+				)
+				frag.TreeNode = converter.ConvertAST(ast)
+				return frag
+			}(),
+			expectPair:    false, // With max-based normalization, structurally different code should not match
+			minSimilarity: 0.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pair := detector.compareFragments(tt.fragment1, tt.fragment2)
+
+			if tt.expectPair {
+				assert.NotNil(t, pair, "Expected a clone pair")
+				if pair != nil {
+					assert.GreaterOrEqual(t, pair.Similarity, tt.minSimilarity,
+						"Similarity should be at least %f", tt.minSimilarity)
+					assert.Equal(t, tt.fragment1, pair.Fragment1)
+					assert.Equal(t, tt.fragment2, pair.Fragment2)
+				}
+			} else {
+				assert.Nil(t, pair, "Expected no clone pair")
+			}
+		})
+	}
+}
+
+// Test error conditions and edge cases
+func TestCloneDetector_EdgeCases(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	// Test with empty fragments
+	emptyFragments := []*CodeFragment{}
+	result := detector.DetectClones(emptyFragments)
+	pairs, groups := result.Pairs, result.Groups
+	assert.Empty(t, pairs, "Should return empty pairs for empty input")
+	assert.Empty(t, groups, "Should return empty groups for empty input")
+
+	// Test with single fragment
+	singleFragment := []*CodeFragment{
+		{
+			Location:  &CodeLocation{FilePath: "/test.py"},
+			TreeNode:  NewTreeNode(1, "Test"),
+			Size:      10,
+			LineCount: 5,
+		},
+	}
+	result = detector.DetectClones(singleFragment)
+	pairs, groups = result.Pairs, result.Groups
+	assert.Empty(t, pairs, "Should return empty pairs for single fragment")
+	assert.Empty(t, groups, "Should return empty groups for single fragment")
+
+	// Test with fragments that have no tree nodes
+	fragmentsWithoutTrees := []*CodeFragment{
+		{Location: &CodeLocation{FilePath: "/test1.py"}, TreeNode: nil},
+		{Location: &CodeLocation{FilePath: "/test2.py"}, TreeNode: nil},
+	}
+	result = detector.DetectClones(fragmentsWithoutTrees)
+	pairs, groups = result.Pairs, result.Groups
+	assert.Empty(t, pairs, "Should handle fragments without tree nodes gracefully")
+	assert.Empty(t, groups, "Should handle fragments without tree nodes gracefully")
+}
+
+// TestExtractFragments_SkipDocstringsExcludesDocstringFromSize is a regression
+// test for issue #774: docstrings must not count toward MinLines/MinNodes when
+// skip_docstrings is enabled, otherwise one-statement functions with long
+// docstrings are compared as clones.
+func TestExtractFragments_SkipDocstringsExcludesDocstringFromSize(t *testing.T) {
+	src := `def get_pset(element, pset_name):
+    """Get a property set of an IFC element.
+
+    Args:
+        element: IFC Element to get the property set for.
+        pset_name: Name of the property set.
+
+    Returns:
+        Property set.
+    """
+    return next(
+        p
+        for p in iterate_property_sets(element, include_type_psets=True)
+        if p.Name == pset_name
+    )
+`
+	pyParser := parser.New()
+	parseResult, err := pyParser.Parse(t.Context(), []byte(src))
+	require.NoError(t, err)
+
+	extract := func(skipDocstrings bool) *CodeFragment {
+		cfg := DefaultCloneDetectorConfig()
+		cfg.MinLines = 1
+		cfg.MinNodes = 1
+		cfg.SkipDocstrings = skipDocstrings
+		fragments := NewCloneDetector(cfg).ExtractFragmentsWithSource([]*parser.Node{parseResult.AST}, "/test/a.py", []byte(src))
+		require.Len(t, fragments, 1)
+		return fragments[0]
+	}
+
+	withDocstring := extract(false)
+	withoutDocstring := extract(true)
+	assert.Equal(t, 6, withoutDocstring.LineCount, "9 docstring lines must be excluded")
+	assert.Equal(t, 6, withDocstring.LineCount, "LineCount is SLOC, which never counts docstrings")
+	assert.Equal(t, withDocstring.Size-1, withoutDocstring.Size, "docstring node must be excluded")
+
+	cfg := DefaultCloneDetectorConfig()
+	cfg.MinLines = 10
+	cfg.MinNodes = 1
+	assert.Empty(t, NewCloneDetector(cfg).ExtractFragmentsWithSource([]*parser.Node{parseResult.AST}, "/test/a.py", []byte(src)),
+		"function should fall below min_lines once its docstring is excluded")
+}
+
+// TestCloneDetector_PairsPromotedToGroups is a regression test for issue #525.
+// Every detected clone pair whose similarity is at or above the configured
+// grouping threshold must have both of its fragments present in at least one
+// emitted clone group. Otherwise the pair is silently lost from the
+// refactoring-facing group output.
+func TestCloneDetector_PairsPromotedToGroups(t *testing.T) {
+	src := `class Agg:
+    async def sum(self, field, session=None, ignore_cache=False):
+        pipeline = [
+            {"$match": self._build_match(session, ignore_cache)},
+            {"$group": {"_id": None, "v": {"$sum": f"${field}"}}},
+        ]
+        result = await self.aggregate(pipeline, session=session)
+        if result and len(result) > 0:
+            return result[0]["v"]
+        return None
+
+    async def avg(self, field, session=None, ignore_cache=False):
+        pipeline = [
+            {"$match": self._build_match(session, ignore_cache)},
+            {"$group": {"_id": None, "v": {"$avg": f"${field}"}}},
+        ]
+        result = await self.aggregate(pipeline, session=session)
+        if result and len(result) > 0:
+            return result[0]["v"]
+        return None
+
+    async def max(self, field, session=None, ignore_cache=False):
+        pipeline = [
+            {"$match": self._build_match(session, ignore_cache)},
+            {"$group": {"_id": None, "v": {"$max": f"${field}"}}},
+        ]
+        result = await self.aggregate(pipeline, session=session)
+        if result and len(result) > 0:
+            return result[0]["v"]
+        return None
+
+    async def min(self, field, session=None, ignore_cache=False):
+        pipeline = [
+            {"$match": self._build_match(session, ignore_cache)},
+            {"$group": {"_id": None, "v": {"$min": f"${field}"}}},
+        ]
+        result = await self.aggregate(pipeline, session=session)
+        if result and len(result) > 0:
+            return result[0]["v"]
+        return None
+`
+
+	pyParser := parser.New()
+	parseResult, err := pyParser.Parse(t.Context(), []byte(src))
+	require.NoError(t, err)
+	require.NotNil(t, parseResult)
+	require.NotNil(t, parseResult.AST)
+
+	cfg := DefaultCloneDetectorConfig()
+	cfg.MinLines = 5 // the aggregation methods are 8 lines each
+	cfg.MinNodes = 10
+	cfg.GroupingThreshold = domain.DefaultType4CloneThreshold
+	detector := NewCloneDetector(cfg)
+	fragments := detector.ExtractFragmentsWithSource([]*parser.Node{parseResult.AST}, "/test/aggregation.py", []byte(src))
+	require.GreaterOrEqual(t, len(fragments), 4, "expected at least the four aggregation methods as fragments")
+
+	result := detector.DetectClones(fragments)
+	pairs, groups := result.Pairs, result.Groups
+	require.NotEmpty(t, pairs, "expected clone pairs to be detected")
+	require.NotEmpty(t, groups, "expected clone groups to be emitted")
+
+	// Build a location-keyed set of group members.
+	groupMemberKeys := make(map[string]struct{})
+	for _, g := range groups {
+		for _, f := range g.Fragments {
+			groupMemberKeys[fragmentLocationKey(f)] = struct{}{}
+		}
+	}
+
+	missing := 0
+	for _, p := range pairs {
+		if p == nil || p.Fragment1 == nil || p.Fragment2 == nil {
+			continue
+		}
+		if p.Similarity < cfg.GroupingThreshold {
+			continue
+		}
+		pairInGroup := false
+		for _, g := range groups {
+			if groupContainsFragment(g, p.Fragment1) && groupContainsFragment(g, p.Fragment2) {
+				pairInGroup = true
+				break
+			}
+		}
+		if !pairInGroup {
+			missing++
+			t.Logf("pair not in any group: %s <-> %s (sim=%.3f type=%v)",
+				fragmentLocationKey(p.Fragment1), fragmentLocationKey(p.Fragment2), p.Similarity, p.CloneType)
+		}
+	}
+	require.Zero(t, missing, "%d clone pair(s) above the grouping threshold are absent from all groups", missing)
+}
+
+func fragmentLocationKey(f *CodeFragment) string {
+	if f == nil || f.Location == nil {
+		return ""
+	}
+	loc := f.Location
+	return fmt.Sprintf("%s|%d|%d", loc.FilePath, loc.StartLine, loc.EndLine)
+}
+
+func groupContainsFragment(g *CloneGroup, f *CodeFragment) bool {
+	if g == nil || f == nil {
+		return false
+	}
+	key := fragmentLocationKey(f)
+	for _, member := range g.Fragments {
+		if fragmentLocationKey(member) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// extractAllFragments runs extraction over source exactly as the clone service
+// does, so the size gate and the identical-body carve-out both apply.
+func extractAllFragments(t *testing.T, detector *CloneDetector, filePath, source string) []*CodeFragment {
+	t.Helper()
+
+	p := parser.New()
+	result, err := p.Parse(t.Context(), []byte(source))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.AST)
+
+	return detector.ExtractFragmentsWithSource([]*parser.Node{result.AST}, filePath, []byte(source))
+}
+
+func TestCloneDetector_RetainIdenticalUndersizedFragments(t *testing.T) {
+	const twin = `class Backend:
+    def has_connections(self):
+        if self.pool is not None:
+            return len(self.pool) > 0
+        return False
+`
+	const single = `class Other:
+    def close(self):
+        raise NotImplementedError
+`
+
+	detector := NewCloneDetector(DefaultCloneDetectorConfig())
+
+	t.Run("keeps undersized function bodies that repeat", func(t *testing.T) {
+		fragments := append(
+			extractAllFragments(t, detector, "a.py", twin),
+			extractAllFragments(t, detector, "b.py", twin)...,
+		)
+
+		retained := RetainIdenticalUndersizedFragments(fragments)
+
+		require.Len(t, retained, 2)
+		for _, fragment := range retained {
+			assert.True(t, fragment.belowSizeGate)
+			assert.Equal(t, parser.NodeFunctionDef, fragment.ASTNode.Type)
+		}
+		assert.Equal(t, retained[0].Hash, retained[1].Hash)
+	})
+
+	t.Run("drops undersized function bodies that do not", func(t *testing.T) {
+		fragments := extractAllFragments(t, detector, "a.py", twin)
+		require.Len(t, fragments, 1)
+
+		assert.Empty(t, RetainIdenticalUndersizedFragments(fragments))
+	})
+
+	t.Run("never holds single-statement bodies", func(t *testing.T) {
+		fragments := append(
+			extractAllFragments(t, detector, "a.py", single),
+			extractAllFragments(t, detector, "b.py", single)...,
+		)
+
+		assert.Empty(t, fragments)
+	})
+}
+
+func TestCloneDetector_IdenticalBodyTwinAcrossSizeGate(t *testing.T) {
+	// The same body either side of MinLines: line breaks are collapsed in the
+	// hash but a wrapped statement spans more SLOC, so only the wrapped copy
+	// clears the gate on its own.
+	const bare = `def apply(self, payload):
+    total = 0
+    for item in payload:
+        if item.enabled:
+            total += item.weight
+        else:
+            total -= item.weight
+    self.total = total
+    return max(total, 0)
+`
+	const wrapped = `def apply(self, payload):
+    total = 0
+    for item in payload:
+        if item.enabled:
+            total += item.weight
+        else:
+            total -= item.weight
+    self.total = total
+    return max(
+        total, 0
+    )
+`
+
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 10
+	detector := NewCloneDetector(config)
+	bareFragments := extractAllFragments(t, detector, "bare.py", bare)
+	wrappedFragments := extractAllFragments(t, detector, "wrapped.py", wrapped)
+	require.Len(t, bareFragments, 1)
+	require.Len(t, wrappedFragments, 1)
+	require.True(t, bareFragments[0].belowSizeGate, "the unwrapped copy should be one line short of the gate")
+	require.False(t, wrappedFragments[0].belowSizeGate, "the wrapped copy should clear the gate on its own")
+	require.Equal(t, bareFragments[0].Hash, wrappedFragments[0].Hash, "line breaks must not change the hash")
+
+	retained := RetainIdenticalUndersizedFragments(append(bareFragments, wrappedFragments...))
+
+	assert.Len(t, retained, 2, "a twin that cleared the gate still vindicates the held fragment")
+}
+
+func TestIsSingleStatementFragment(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   bool
+	}{
+		{
+			name: "one call",
+			source: `def pagination_tag(parser, token):
+    """Render the pagination."""
+    return InclusionAdminNode(
+        "pagination",
+        parser,
+        token,
+    )
+`,
+			want: true,
+		},
+		{
+			name: "one call with a one-line tail",
+			source: `def __init__(self, expression, **extra):
+    warnings.warn(
+        "BitAnd is deprecated.",
+        category=RemovedInDjango2028Warning,
+    )
+    super().__init__(expression, **extra)
+`,
+			want: true,
+		},
+		{
+			name: "nested definitions carry no logic",
+			source: `class BitAnd(_BitAnd):
+    def __init__(self, expression, **extra):
+        warnings.warn(
+            "BitAnd is deprecated.",
+            category=RemovedInDjango2028Warning,
+        )
+        super().__init__(expression, **extra)
+`,
+			want: true,
+		},
+		{
+			name: "guarded call",
+			source: `def ones(xp, shape):
+    if is_numpy(xp):
+        return xp.ones(
+            shape,
+        )
+`,
+			want: true,
+		},
+		{
+			name: "two multi-line statements",
+			source: `def __mul__(self, other):
+    if isinstance(other, NUMERIC_TYPES):
+        return self.__class__(
+            default_unit=self._default_unit,
+        )
+    else:
+        raise TypeError(
+            "must be multiplied with number",
+        )
+`,
+			want: false,
+		},
+		{
+			name: "three statements",
+			source: `def __eq__(self, other):
+    if not isinstance(other, self.__class__):
+        return NotImplemented
+    return (
+        self.limit_value == other.limit_value
+    )
+`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := parser.New().Parse(t.Context(), []byte(tt.source))
+			require.NoError(t, err)
+			require.NotEmpty(t, result.AST.Body)
+
+			assert.Equal(t, tt.want, isSingleStatementFragment(result.AST.Body[0]))
+		})
+	}
+}
+
+func TestCloneDetector_SingleStatementFragmentsPairOnlyAsIdentical(t *testing.T) {
+	const shim = `class Bit%s(_Bit%s):
+    def __init__(self, expression, **extra):
+        warnings.warn(
+            "The PostgreSQL-specific Bit%s function is deprecated. Use "
+            "django.db.models.aggregates.Bit%s instead.",
+            category=RemovedInDjango2028Warning,
+            stacklevel=2,
+        )
+        super().__init__(expression, **extra)
+`
+	shimFor := func(name string) string { return fmt.Sprintf(shim, name, name, name, name) }
+
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 6
+	detector := NewCloneDetector(config)
+
+	t.Run("shape-only match is not reported", func(t *testing.T) {
+		fragments := append(
+			extractAllFragments(t, detector, "a.py", shimFor("And")),
+			extractAllFragments(t, detector, "b.py", shimFor("Or"))...,
+		)
+		require.Len(t, fragments, 4)
+
+		assert.Empty(t, detector.DetectClones(fragments).Pairs)
+	})
+
+	t.Run("identical copy is still reported", func(t *testing.T) {
+		fragments := append(
+			extractAllFragments(t, detector, "a.py", shimFor("And")),
+			extractAllFragments(t, detector, "b.py", shimFor("And"))...,
+		)
+
+		pairs := detector.DetectClones(fragments).Pairs
+		require.NotEmpty(t, pairs)
+		for _, pair := range pairs {
+			assert.Equal(t, Type1Clone, pair.CloneType)
+		}
+	})
+}
+
+func TestDropShadowedSemanticPairs(t *testing.T) {
+	iterBytes, aiterBytes := &CodeFragment{}, &CodeFragment{}
+	iterLines, aiterLines := &CodeFragment{}, &CodeFragment{}
+	loner := &CodeFragment{}
+	pair := func(f1, f2 *CodeFragment, cloneType CloneType, similarity float64) *ClonePair {
+		return &ClonePair{Fragment1: f1, Fragment2: f2, CloneType: cloneType, Similarity: similarity}
+	}
+
+	bytesTwins := pair(iterBytes, aiterBytes, Type2Clone, 0.85)
+	linesTwins := pair(iterLines, aiterLines, Type2Clone, 0.85)
+	nearCounterpart := pair(aiterBytes, aiterLines, Type4Clone, 0.75)
+	oneSideShadowed := pair(iterLines, loner, Type4Clone, 0.66)
+	pairs := []*ClonePair{
+		bytesTwins,
+		linesTwins,
+		pair(iterBytes, iterLines, Type4Clone, 0.67),
+		nearCounterpart,
+		oneSideShadowed,
+	}
+
+	assert.Equal(t,
+		[]*ClonePair{bytesTwins, linesTwins, nearCounterpart, oneSideShadowed},
+		dropShadowedSemanticPairs(pairs))
+}
+
+// Grouping depends on pair order, so ties in similarity must be broken by
+// location rather than by the order workers produced the pairs.
+func TestLimitAndSortClonePairsBreaksTiesByLocation(t *testing.T) {
+	fragment := func(line int) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: "a.py", StartLine: line, EndLine: line + 5}}
+	}
+	a, b, c := fragment(1), fragment(10), fragment(20)
+	pair := func(f1, f2 *CodeFragment, similarity float64) *ClonePair {
+		return &ClonePair{Fragment1: f1, Fragment2: f2, Similarity: similarity}
+	}
+	best := pair(b, c, 0.9)
+	tieAC := pair(c, a, 0.8)
+	tieBC := pair(b, c, 0.8)
+	tieAB := pair(b, a, 0.8)
+	want := []*ClonePair{best, tieAB, tieAC, tieBC}
+
+	for _, input := range [][]*ClonePair{
+		{tieBC, tieAC, best, tieAB},
+		{tieAB, best, tieBC, tieAC},
+	} {
+		cd := &CloneDetector{clonePairs: input}
+		cd.limitAndSortClonePairs(10)
+		assert.Equal(t, want, cd.clonePairs)
+	}
+}
+
+// At the pair cap, the exhaustive per-worker heap must keep the same pair as
+// LSH, which sorts all pairs first: ties go to the earliest location.
+func TestCloneDetector_PairCapKeepsSameTiedPairWithAndWithoutLSH(t *testing.T) {
+	const source = `def process(items):
+    total = 0
+    for item in items:
+        if item > 0:
+            total += item
+        else:
+            total -= item
+    return total
+`
+	detect := func(useLSH bool) [2]string {
+		config := DefaultCloneDetectorConfig()
+		config.MaxClonePairs = 1
+		config.MaxGoroutines = 1
+		config.UseLSH = useLSH
+		detector := NewCloneDetector(config)
+		var fragments []*CodeFragment
+		for _, file := range []string{"C.py", "B.py", "A.py"} {
+			fragments = append(fragments, extractAllFragments(t, detector, file, source)...)
+		}
+		result := detector.DetectClonesWithLSH(t.Context(), fragments)
+		require.Len(t, result.Pairs, 1)
+		first, second := orderedPairFragments(result.Pairs[0])
+		return [2]string{first.Location.FilePath, second.Location.FilePath}
+	}
+
+	assert.Equal(t, [2]string{"A.py", "B.py"}, detect(false))
+	assert.Equal(t, [2]string{"A.py", "B.py"}, detect(true))
+}
+
+func TestIsFlatDispatchChain(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   bool
+	}{
+		{
+			name: "one-line branches",
+			source: `if content is not None:
+    return encode_content(content)
+elif text is not None:
+    return encode_text(text)
+else:
+    return encode_json(json)
+`,
+			want: true,
+		},
+		{
+			name: "multi-line branch",
+			source: `if content is not None:
+    return encode_content(
+        content,
+    )
+elif text is not None:
+    return encode_text(text)
+`,
+			want: false,
+		},
+		{
+			name: "two-statement branch",
+			source: `if content is not None:
+    return encode_content(content)
+elif text is not None:
+    log(text)
+    return encode_text(text)
+`,
+			want: false,
+		},
+		{
+			name: "nested if in else",
+			source: `if content is not None:
+    return encode_content(content)
+else:
+    if text is not None:
+        return encode_text(text)
+`,
+			want: false,
+		},
+		{
+			name: "not an if",
+			source: `for item in items:
+    handle(item)
+`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := parser.New().Parse(t.Context(), []byte(tt.source))
+			require.NoError(t, err)
+			require.NotEmpty(t, result.AST.Body)
+
+			assert.Equal(t, tt.want, isFlatDispatchChain(result.AST.Body[0]))
+		})
+	}
+}
+
+func TestCloneDetector_FlatDispatchChainsDoNotPairAsSemantic(t *testing.T) {
+	const encodeRequest = `def encode_request(content=None, data=None, files=None, json=None, boundary=None):
+    if data is not None and not isinstance(data, Mapping):
+        message = "Use 'content=<...>' to upload raw bytes/text content."
+        warnings.warn(message, DeprecationWarning, stacklevel=2)
+        return encode_content(data)
+
+    if content is not None:
+        return encode_content(content)
+    elif files:
+        return encode_multipart_data(data or {}, files, boundary)
+    elif data:
+        return encode_urlencoded_data(data)
+    elif json is not None:
+        return encode_json(json)
+    return {}, ByteStream(b"")
+`
+	const encodeResponse = `def encode_response(content=None, text=None, html=None, json=None):
+    if content is not None:
+        return encode_content(content)
+    elif text is not None:
+        return encode_text(text)
+    elif html is not None:
+        return encode_html(html)
+    elif json is not None:
+        return encode_json(json)
+    return {}, ByteStream(b"")
+`
+	config := DefaultCloneDetectorConfig()
+	config.EnableDFAAnalysis = true
+	detector := NewCloneDetector(config)
+	fragments := append(
+		extractAllFragments(t, detector, "a.py", encodeRequest),
+		extractAllFragments(t, detector, "b.py", encodeResponse)...,
+	)
+
+	for _, pair := range detector.DetectClones(fragments).Pairs {
+		assert.NotEqual(t, Type4Clone, pair.CloneType,
+			"lines %d and %d pair on shape alone", pair.Fragment1.Location.StartLine, pair.Fragment2.Location.StartLine)
+	}
+}
+
+// Regression for #833: a pair promoted to its own two-member group by
+// appendUncoveredPairGroups used to skip the covered-group dedup that #518
+// introduced, so a nested window a stronger group already contains came back
+// as a group of its own. Here {base_matrix, outline, posterize:21-31} covers
+// the promoted pair {base_matrix, posterize:23-31}, because the with block at
+// posterize:23-31 sits inside the draw method at posterize:21-31.
+func TestCloneDetector_PromotedPairCoveredByStrongerGroupIsNotReportedTwice(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string, start, end int) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: start, EndLine: end}}
+	}
+	baseMatrix := fragment("base_matrix.py", 32, 41)
+	outline := fragment("outline.py", 24, 33)
+	draw := fragment("effects/posterize.py", 21, 31)
+	withBlock := fragment("effects/posterize.py", 23, 31)
+
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: baseMatrix, Fragment2: draw, Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: outline, Fragment2: draw, Similarity: 0.84, CloneType: Type3Clone},
+		{Fragment1: baseMatrix, Fragment2: outline, Similarity: 0.80, CloneType: Type3Clone},
+		{Fragment1: baseMatrix, Fragment2: withBlock, Similarity: 0.768, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(config.GroupingThreshold, 2)
+
+	require.Len(t, detector.cloneGroups, 1,
+		"the promoted pair sits inside a group that already reports it")
+	assert.Equal(t, []*CodeFragment{baseMatrix, draw, outline}, detector.cloneGroups[0].Fragments)
+
+	// The nested window describes no duplication the surviving group does not
+	// already report, so it must not be counted as a duplicated fragment
+	// either.
+	reportedPairs := make([]string, 0, len(detector.clonePairs))
+	for _, pair := range detector.clonePairs {
+		reportedPairs = append(reportedPairs,
+			fragmentLocationKey(pair.Fragment1)+" ~ "+fragmentLocationKey(pair.Fragment2))
+	}
+	assert.NotContains(t, reportedPairs, fragmentLocationKey(withBlock)+" ~ "+fragmentLocationKey(baseMatrix))
+	assert.NotContains(t, reportedPairs, fragmentLocationKey(baseMatrix)+" ~ "+fragmentLocationKey(withBlock))
+}
+
+// The dedup only withdraws promoted groups that a surviving group already
+// covers. A promoted pair whose fragments no group contains must keep both its
+// group and its pair, which is the whole point of appendUncoveredPairGroups.
+func TestCloneDetector_PromotedPairNoGroupCoversStillSurfaces(t *testing.T) {
+	config := DefaultCloneDetectorConfig()
+	config.GroupingThreshold = 0.70
+	detector := NewCloneDetector(config)
+
+	fragment := func(path string, start, end int) *CodeFragment {
+		return &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: start, EndLine: end}}
+	}
+	hub := fragment("hub.py", 1, 10)
+	spokes := []*CodeFragment{
+		fragment("a.py", 1, 10),
+		fragment("b.py", 1, 10),
+		// A window no group member contains, so no covering group exists.
+		fragment("nested.py", 1, 5),
+	}
+	detector.clonePairs = []*ClonePair{
+		{Fragment1: hub, Fragment2: spokes[0], Similarity: 0.90, CloneType: Type3Clone},
+		{Fragment1: hub, Fragment2: spokes[1], Similarity: 0.82, CloneType: Type3Clone},
+		{Fragment1: hub, Fragment2: spokes[2], Similarity: 0.75, CloneType: Type3Clone},
+	}
+
+	detector.groupClones(config.GroupingThreshold, 2)
+
+	require.Len(t, detector.cloneGroups, 3, "both promoted pairs keep a group of their own")
+	assert.Equal(t, []*CodeFragment{spokes[0], hub}, detector.cloneGroups[0].Fragments)
+	assert.Equal(t, []*CodeFragment{hub, spokes[1]}, detector.cloneGroups[1].Fragments)
+	assert.Equal(t, []*CodeFragment{hub, spokes[2]}, detector.cloneGroups[2].Fragments)
+	for _, pair := range detector.clonePairs {
+		grouped := false
+		for _, group := range detector.cloneGroups {
+			if contains(group.Fragments, pair.Fragment1) && contains(group.Fragments, pair.Fragment2) {
+				grouped = true
+				break
+			}
+		}
+		assert.True(t, grouped, "pair %s~%s reached no group",
+			fragmentLocationKey(pair.Fragment1), fragmentLocationKey(pair.Fragment2))
+	}
+}
+
+func TestDedupeCoveredCreatedGroups(t *testing.T) {
+	fragment := func(id int, path string, start, end int) *CodeFragment {
+		f := &CodeFragment{Location: &CodeLocation{FilePath: path, StartLine: start, EndLine: end}}
+		f.id = id
+		return f
+	}
+	group := func(similarity float64, members ...*CodeFragment) *coreclone.ItemGroup[*CodeFragment] {
+		return &coreclone.ItemGroup[*CodeFragment]{Items: members, Similarity: similarity}
+	}
+
+	t.Run("withdraws a created group a surviving group already covers", func(t *testing.T) {
+		baseMatrix := fragment(0, "base_matrix.py", 32, 41)
+		draw := fragment(1, "effects/posterize.py", 21, 31)
+		outline := fragment(2, "outline.py", 24, 33)
+		withBlock := fragment(3, "effects/posterize.py", 23, 31)
+
+		existing := group(0.847, baseMatrix, draw, outline)
+		created := group(0.768, baseMatrix, withBlock)
+		pair := &coreclone.ItemPair[*CodeFragment]{Item1: baseMatrix, Item2: withBlock, Similarity: 0.768}
+
+		groups, superseded := dedupeCoveredCreatedGroups(
+			[]*coreclone.ItemGroup[*CodeFragment]{existing, created},
+			[]*coreclone.ItemGroup[*CodeFragment]{created},
+		)
+
+		assert.Equal(t, []*coreclone.ItemGroup[*CodeFragment]{existing}, groups)
+		assert.Equal(t, map[string]struct{}{
+			coreclone.PairKey(baseMatrix, withBlock): {},
+		}, superseded)
+		assert.Empty(t, coreclone.FilterSuppressedPairs([]*coreclone.ItemPair[*CodeFragment]{pair}, superseded),
+			"the superseded pair is dropped along with its group")
+	})
+
+	t.Run("never withdraws a group that existed before the pass", func(t *testing.T) {
+		outerA := fragment(0, "a.py", 1, 20)
+		outerB := fragment(1, "b.py", 1, 20)
+		innerA := fragment(2, "a.py", 3, 8)
+		innerB := fragment(3, "b.py", 3, 8)
+
+		// The dedup prefers the created outer windows, but they were detected
+		// after the existing group was already vetted.
+		existing := group(0.70, innerA, innerB)
+		created := group(0.90, outerA, outerB)
+
+		groups, superseded := dedupeCoveredCreatedGroups(
+			[]*coreclone.ItemGroup[*CodeFragment]{existing, created},
+			[]*coreclone.ItemGroup[*CodeFragment]{created},
+		)
+
+		assert.Equal(t, []*coreclone.ItemGroup[*CodeFragment]{existing, created}, groups)
+		assert.Empty(t, superseded)
+	})
+}
+
+func TestFragmentComplexity(t *testing.T) {
+	source := `
+def load_user(data, strict):
+    if not data:
+        return None
+    result = {}
+    for key, value in data.items():
+        if key.startswith("_"):
+            continue
+        if strict and value is None:
+            raise ValueError(key)
+        result[key] = value
+    return result
+`
+	result, err := parser.New().Parse(context.Background(), []byte(source))
+	require.NoError(t, err)
+
+	config := DefaultCloneDetectorConfig()
+	config.MinLines = 1
+	config.MinNodes = 1
+	fragments := NewCloneDetector(config).ExtractFragmentsWithSource([]*parser.Node{result.AST}, "test.py", []byte(source))
+
+	complexities := map[parser.NodeType]int{}
+	for _, fragment := range fragments {
+		complexities[fragment.ASTNode.Type] = FragmentComplexity(fragment)
+	}
+	assert.Equal(t, 5, complexities[parser.NodeFunctionDef], "same as the complexity analyzer reports for load_user")
+	assert.Equal(t, 4, complexities[parser.NodeFor])
+
+	assert.Equal(t, 0, FragmentComplexity(nil))
+	assert.Equal(t, 0, FragmentComplexity(&CodeFragment{}))
+}
